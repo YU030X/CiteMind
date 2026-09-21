@@ -1,0 +1,70 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments and local Python tooling
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Local configuration and credentials
+/.env
+/.env.*
+!/.env.example
+*.pem
+*.key
+*.crt
+secrets/
+
+# Local services, databases, model files, and runtime state
+/.data/
+/data/
+/storage/
+/models/
+/checkpoints/
+/runtime/
+*.sqlite3
+*.db
+*.log
+
+# Node.js, package-manager caches, and frontend tooling output
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.yarnrc.yml
+.pnp.*
+.turbo/
+.vite/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

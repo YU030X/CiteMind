@@ -1,0 +1,13 @@
+{
+  "name": "citemind-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "jev": "node --env-file-if-exists=.env scripts/jev-evaluate.mjs",
+    "test:jev": "node --test scripts/jev-evaluate.test.mjs",
+    "frontend:build": "pnpm --dir frontend build"
+  },
+  "dependencies": {
+    "ai": "^7.0.107"
+  }
+}

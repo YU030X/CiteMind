@@ -1,0 +1,12 @@
+{
+  "state": {
+    "requirement": "上传成功只表示任务已经持久化，不能表示文档已经可检索。",
+    "change": "上传接口在创建任务后返回 HTTP 202 和 QUEUED 状态。"
+  },
+  "questions": {
+    "followsContract": {
+      "type": "boolean",
+      "instructions": "`change` 是否遵守 `requirement` 定义的状态语义？"
+    }
+  }
+}
