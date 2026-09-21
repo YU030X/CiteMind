@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 计划 schema，尚无 Alembic 迁移。主键拟使用 UUID，时间使用 UTC `timestamptz`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 业务 schema 仍是计划内容；当前仅有 Alembic 首迁移启用 pgvector `vector` 扩展，尚无业务表、模型或约束已落地。主键拟使用 UUID，时间使用 UTC `timestamptz`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 | 实体 | 主要字段 | 关键约束与用途 |
 | --- | --- | --- |

@@ -5,8 +5,12 @@ description = "可核对来源与版本的企业知识库"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "alembic>=1.16,<2",
   "fastapi>=0.116,<1",
+  "pgvector>=0.4,<1",
+  "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
+  "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
 
@@ -27,6 +31,9 @@ packages = ["backend/src/evidencehub"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "integration: requires a dedicated PostgreSQL/pgvector test database",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -38,4 +45,4 @@ select = ["E", "F", "I", "UP"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["backend/src", "tests"]
+files = ["backend/src", "migrations", "tests"]

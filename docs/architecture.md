@@ -1,6 +1,8 @@
 # 架构设计
 
-> 设计状态：待实现。这里定义目标边界，不描述现有可运行系统。
+> 设计状态：目标边界与当前实现状态并列记录；未实现部分仍不可据此声称可运行。
+
+当前已实现数据库基础设施的最小切片：API lifespan 创建并释放 SQLAlchemy AsyncEngine 与独立 Session 工厂，Alembic 首迁移只启用 pgvector `vector` 扩展，不创建业务表；Windows 上应用启动与在线迁移都显式使用 `SelectorEventLoop`，因为 psycopg 异步模式不兼容默认的 `ProactorEventLoop`。该切片已在真实 PostgreSQL 17.11 + pgvector 0.8.6 上完成升级、512 维字面量解析与降级的实测；业务表与向量列仍未实现，因此尚无 `chunk_embedding VECTOR(512)` 列约束验收结果。
 
 ## 组成与职责
 

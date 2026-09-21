@@ -6,7 +6,7 @@
 
 ## 当前进度
 
-仓库已进入 Phase 0 工程底座建设：当前有锁定依赖的 FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 前端骨架，以及通过 Vercel AI Gateway 调用 Jev 的开发期判断脚本。数据库、迁移、Compose、worker、inference、登录授权、入库、检索和问答均尚未实现；文档中的资源预算与质量指标仍是待测目标。实际命令与已验证范围见 [开发约定](docs/development.md)。
+仓库已进入 Phase 0 工程底座建设：当前有锁定依赖的 FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 前端骨架、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移，以及通过 Vercel AI Gateway 调用 Jev 的开发期判断脚本。业务表、Compose、worker、inference、登录授权、入库、检索和问答均尚未实现；Docker 与真实 PostgreSQL/pgvector 迁移已在 PostgreSQL 17.11 + pgvector 0.8.6 上实测通过（扩展启用、512 维字面量解析与降级），但这不等于 `chunk_embedding VECTOR(512)` 列约束验收，业务表仍未落地；文档中的资源预算与质量指标仍是待测目标。实际命令与已验证范围见 [开发约定](docs/development.md)。
 
 ## 文档入口
 
