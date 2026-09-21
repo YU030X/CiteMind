@@ -4,7 +4,7 @@
   "packageManager": "pnpm@11.22.0",
   "scripts": {
     "jev": "node --env-file-if-exists=.env scripts/jev-evaluate.mjs",
-    "test:jev": "node --test scripts/jev-evaluate.test.mjs",
+    "test:jev": "node --test tests/tooling/jev-evaluate.test.mjs",
     "frontend:build": "pnpm --dir frontend build"
   },
   "dependencies": {

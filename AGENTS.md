@@ -23,17 +23,31 @@
 
 ## Jev Decision Layer
 
-Use Jev as a lightweight semantic decision layer inside the workflow. Jev does not own execution and must not replace deterministic application logic or the primary reasoning agent.
+Use Jev through the available Jev MCP tools as a lightweight semantic decision layer inside the workflow.
+
+Jev provides bounded semantic judgments only. It does not own execution, replace deterministic application logic, or replace the primary reasoning agent.
 
 ### When to use Jev
 
 Use Jev when the workflow needs a small, structured semantic judgment, such as:
 
-- routing a task to the correct handler or subagent;
-- deciding whether a condition semantically holds;
+- routing a task to the appropriate handler or subagent;
+- deciding whether a semantic condition holds;
 - choosing one action from a bounded set;
-- scoring or ranking along a defined dimension;
-- checking whether evidence supports a claim;
+- scoring, ranking, or comparing candidates along a defined dimension;
+- checking whether supplied evidence supports a claim;
+- reviewing whether an implementation satisfies stated requirements;
 - deciding whether a task should continue, retry, escalate, or stop.
 
-Do not call Jev for deterministic rules, exact calculations, known lookups, filesystem operations, shell execution, or other tasks that ordinary code can handle reliably.
+Prefer the Jev MCP tool that most closely matches the judgment:
+
+- `jev_verify` for checking a claim against supplied evidence;
+- `jev_decide` for choosing between a small set of explicit alternatives;
+- `jev_compare` or `jev_rerank` for comparing or ordering candidates;
+- `jev_classify` for assigning an item to a predefined category;
+- `jev_review` for structured review of an implementation or result;
+- `jev_gate` for completion, continuation, retry, or escalation decisions.
+
+Do not use Jev for deterministic rules, exact calculations, known lookups, filesystem operations, shell execution, code generation, open-ended research, or tasks that ordinary code or the primary reasoning agent can handle reliably.
+
+Treat Jev output as decision evidence rather than authority. If the result is low-confidence, ambiguous, or conflicts with deterministic evidence, gather more evidence or continue reasoning instead of blindly following it.

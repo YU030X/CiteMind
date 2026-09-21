@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseRequestText, runEvaluation } from "./jev-evaluate.mjs";
+import { parseRequestText, runEvaluation } from "../../scripts/jev-evaluate.mjs";
 
 test("接受 state 与非空 questions", () => {
   const request = parseRequestText(
