@@ -4,10 +4,14 @@
 .venv
 .env
 .env.*
-!.env.example
 .pytest_cache
 .mypy_cache
 .ruff_cache
 *.pyc
 __pycache__
 tests
+# 模型只能由构建脚本从固定上游下载，禁止复用宿主模型或缓存。
+models
+.cache
+**/*.safetensors
+**/pytorch_model.bin

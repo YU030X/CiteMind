@@ -107,8 +107,19 @@ services:
       CITEMIND_ENVIRONMENT: development
       # 内部接口 Bearer token；开发占位值，生产环境使用该值会启动失败。
       CITEMIND_INFERENCE_TOKEN: ${CITEMIND_INFERENCE_TOKEN:?必须设置 CITEMIND_INFERENCE_TOKEN}
+      # 模型烘入镜像，不挂宿主模型卷、不在启动时下载。
+      CITEMIND_EMBEDDING_MODEL_PATH: /models/bge-small-zh-v1.5
+      CITEMIND_EMBEDDING_MODEL_REVISION: 7999e1d3359715c523056ef9478215996d62a620
+      CITEMIND_EMBEDDING_TORCH_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
+      TOKENIZERS_PARALLELISM: "false"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
     healthcheck:
-      # /health 只表示进程存活；embedding 未就绪也应为 healthy，由 /capabilities 如实报告。
+      # 保持 /health liveness；模型可用性另查 /ready 与 /capabilities。
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3)"]
       interval: 15s
       timeout: 5s

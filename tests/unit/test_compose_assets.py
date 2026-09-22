@@ -20,6 +20,10 @@ PINNED_IMAGES = (
     "pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f",
     "redis:7.4.9@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954",
 )
+# 与 inference 代码/构建脚本保持一致的冻结模型契约；不一致时插值会静默失配。
+INFERENCE_MODEL = "BAAI/bge-small-zh-v1.5"
+INFERENCE_REVISION = "7999e1d3359715c523056ef9478215996d62a620"
+INFERENCE_MODEL_DIR = "/models/bge-small-zh-v1.5"
 
 
 def compose_text() -> str:
@@ -202,6 +206,58 @@ def test_compose_inference_service_is_self_contained_and_token_protected() -> No
     assert "depends_on" not in block, "本切片 inference 不依赖 api 或数据服务"
     assert "CITEMIND_INFERENCE_TOKEN" in block
     assert "urlopen('http://127.0.0.1:9000/health'" in block
+
+
+def test_compose_inference_bakes_model_and_never_downloads_at_runtime() -> None:
+    block = compose_service_block("inference")
+
+    # 无模型卷：权重烘入镜像，启动时不联网下载。
+    assert "volumes:" not in block, "inference 不得挂载宿主模型卷"
+    assert f"CITEMIND_EMBEDDING_MODEL_PATH: {INFERENCE_MODEL_DIR}" in block
+    assert f"CITEMIND_EMBEDDING_MODEL_REVISION: {INFERENCE_REVISION}" in block
+    for variable in (
+        'HF_HUB_OFFLINE: "1"',
+        'TRANSFORMERS_OFFLINE: "1"',
+        'HF_HUB_DISABLE_TELEMETRY: "1"',
+        'TOKENIZERS_PARALLELISM: "false"',
+    ):
+        assert variable in block, f"inference 容器必须设置 {variable}"
+    # OMP/MKL/OpenBLAS 必须在 torch 导入前由进程环境固定，只靠 torch.set_num_threads 不够。
+    for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        assert f"{variable}: ${{CITEMIND_EMBEDDING_TORCH_THREADS:-2}}" in block, (
+            f"inference 必须固定 {variable}"
+        )
+    assert "CITEMIND_EMBEDDING_TORCH_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}" in block
+    # 健康检查仍以 /health liveness 为准，不因模型就绪与否改变。
+    assert "urlopen('http://127.0.0.1:9000/health', timeout=3)" in block
+    assert "start_period" in block
+
+
+def test_compose_inference_identity_matches_frozen_model_contract() -> None:
+    """模型路径与 revision 必须与 inference 代码及构建脚本里的冻结契约一致。"""
+
+    config = (REPO_ROOT / "inference" / "src" / "citemind_inference" / "config.py").read_text(
+        encoding="utf-8"
+    )
+    script = (REPO_ROOT / "inference" / "scripts" / "prepare_model.py").read_text(
+        encoding="utf-8"
+    )
+    block = compose_service_block("inference")
+
+    assert INFERENCE_MODEL in config and INFERENCE_MODEL in script
+    assert INFERENCE_REVISION in config and INFERENCE_REVISION in script
+    assert INFERENCE_REVISION in block
+    assert all(
+        INFERENCE_MODEL_DIR in text for text in (config, script, block)
+    ), "模型目录必须在代码、构建脚本与 Compose 中保持一致"
+
+
+def test_env_example_documents_inference_thread_budget() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    # 线程数有 Compose 默认值，.env.example 只作为可调项出现，不强制填值。
+    assert "CITEMIND_EMBEDDING_TORCH_THREADS=2" in text
+    assert "CITEMIND_INFERENCE_TOKEN=citemind-inference" in text
 
 
 def test_compose_gateway_is_the_only_app_entrypoint_depending_on_api() -> None:
