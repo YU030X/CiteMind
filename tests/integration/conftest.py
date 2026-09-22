@@ -1,5 +1,6 @@
 import os
 
+import broker_guard
 import database_roles_guard
 import pytest
 from database_guard import (
@@ -34,3 +35,13 @@ def resolve_role_test_databases_or_skip_or_fail() -> database_roles_guard.RoleTe
 @pytest.fixture(scope="session")
 def role_test_databases() -> database_roles_guard.RoleTestDatabases:
     return resolve_role_test_databases_or_skip_or_fail()
+
+
+@pytest.fixture(scope="session")
+def test_redis() -> broker_guard.RedisBrokerTarget:
+    try:
+        return broker_guard.resolve_test_redis(os.environ)
+    except broker_guard.MissingTestRedisError as error:
+        pytest.skip(str(error))
+    except broker_guard.GuardError as error:
+        pytest.fail(str(error), pytrace=False)

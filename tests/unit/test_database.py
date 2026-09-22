@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 PRODUCTION_DATABASE_URL = "postgresql+psycopg://citemind_app:strong-password@postgres:5432/citemind"
+PRODUCTION_REDIS_URL = "redis://:strong-password@redis:6379/0"
 
 
 class DisposableEngine:
@@ -84,7 +85,11 @@ def test_settings_rejects_database_echo_in_production() -> None:
 
 
 def test_settings_accepts_production_database_configuration() -> None:
-    settings = Settings(environment="production", database_url=PRODUCTION_DATABASE_URL)
+    settings = Settings(
+        environment="production",
+        database_url=PRODUCTION_DATABASE_URL,
+        redis_url=PRODUCTION_REDIS_URL,
+    )
 
     assert settings.database_echo is False
 

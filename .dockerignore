@@ -1,0 +1,26 @@
+# Docker 构建上下文排除本地环境、缓存与不属于 worker 运行面的目录，
+# 避免把 .venv、node_modules、密钥和测试数据打进镜像。
+.git
+.gitignore
+.venv
+node_modules
+frontend
+migrations
+tests
+docs
+eval
+scripts
+deploy
+.pi
+.env
+.env.*
+!.env.example
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.pyc
+__pycache__
+alembic.ini
+package.json
+pnpm-lock.yaml
+pnpm-workspace.yaml

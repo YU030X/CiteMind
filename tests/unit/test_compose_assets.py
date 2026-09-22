@@ -7,6 +7,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).parents[2]
 COMPOSE_FILE = REPO_ROOT / "deploy" / "compose" / "compose.yml"
+QUEUE_COMPOSE_FILE = REPO_ROOT / "deploy" / "compose" / "queue.yml"
+DOCKERFILE = REPO_ROOT / "deploy" / "compose" / "Dockerfile"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 INITDB_SCRIPTS = sorted((REPO_ROOT / "deploy" / "compose" / "initdb").glob("*.sh"))
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
@@ -22,6 +24,10 @@ PINNED_IMAGES = (
 
 def compose_text() -> str:
     return COMPOSE_FILE.read_text(encoding="utf-8")
+
+
+def queue_compose_text() -> str:
+    return QUEUE_COMPOSE_FILE.read_text(encoding="utf-8")
 
 
 def compose_entries(key: str) -> list[str]:
@@ -112,8 +118,8 @@ def test_compose_publishes_only_loopback_ports_by_default() -> None:
 def test_compose_keeps_declared_service_contracts() -> None:
     text = compose_text()
 
-    assert text.count("restart: unless-stopped") == 2
-    assert text.count("healthcheck:") == 2
+    assert text.count("restart: unless-stopped") == 3
+    assert text.count("healthcheck:") == 3
     assert "--locale=C.UTF-8 --data-checksums" in text
     assert text.count(".citemind-init-complete") == 1
     assert all(
@@ -125,3 +131,56 @@ def test_compose_keeps_declared_service_contracts() -> None:
     assert "everysec" in text
     assert "128mb" in text
     assert "noeviction" in text
+
+
+def test_compose_worker_service_runs_celery_and_depends_on_data_services() -> None:
+    text = compose_text()
+
+    assert "dockerfile: deploy/compose/Dockerfile" in text
+    assert "context: ../.." in text
+    assert "evidencehub.worker:celery_app" in text
+    assert "--concurrency=1" in text
+    # worker 必须等 postgres 与 redis 都 healthy 后再启动。
+    assert text.count("condition: service_healthy") == 2
+    assert "CITEMIND_REDIS_URL" in text
+    assert "@redis:6379/0" in text
+    assert "citemind_worker" in text
+
+
+def test_dockerfile_pins_base_images_and_runs_the_worker_as_non_root() -> None:
+    content = DOCKERFILE.read_text(encoding="utf-8")
+    pinned = [
+        line
+        for line in content.splitlines()
+        if line.startswith("FROM ") or line.startswith("COPY --from=")
+    ]
+
+    assert any("python:3.12-slim@sha256:" in line for line in pinned)
+    assert any("ghcr.io/astral-sh/uv:0.12.4@sha256:" in line for line in pinned)
+    assert "uv sync --frozen --no-dev" in content
+    assert "USER citemind" in content
+    # 非 root marker 目录必须在镜像里预先创建并归属运行用户，命名卷首次挂载才能继承。
+    assert "/var/lib/citemind/probe-markers" in content
+    assert "chown -R citemind:citemind /app /var/lib/citemind" in content
+
+
+def test_base_compose_does_not_run_queue_probe_or_set_marker_directory() -> None:
+    text = compose_text()
+
+    assert "queue-probe" not in text
+    assert "CITEMIND_PROBE_MARKER_DIRECTORY" not in text
+
+
+def test_queue_override_adds_shared_marker_volume_and_one_shot_probe() -> None:
+    text = queue_compose_text()
+
+    assert "queue-probe" in text
+    assert "CITEMIND_PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers" in text
+    # base worker 与 queue-probe 必须挂载同一个非 root marker 卷。
+    assert text.count("probe-markers:/var/lib/citemind/probe-markers") == 2
+    assert "evidencehub.queue_probe" in text
+    assert "restart: \"no\"" in text
+    # 确定性验收使用硬退出码，不引入 result backend。
+    assert "--abort-on-container-exit" in text
+    assert "--exit-code-from queue-probe" in text
+    assert "result_backend" not in text

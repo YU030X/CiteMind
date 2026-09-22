@@ -1,5 +1,6 @@
-# CiteMind Phase 0 本地数据服务切片：只有 PostgreSQL + pgvector 与 Redis 两个服务。
-# 这不是六服务 Compose：api、worker、inference、frontend-gateway 容器仍未实现；业务表与向量列由 Alembic 迁移创建。
+# CiteMind Phase 0 本地数据与服务切片：postgres + pgvector、Redis，以及独立 worker。
+# 这不是六服务 Compose：api、inference、frontend-gateway 容器仍未实现；业务表与向量列由 Alembic 迁移创建。
+# worker 由本仓库 deploy/compose/Dockerfile 构建，只运行 Celery worker，不是 API 进程。
 # 镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
@@ -68,6 +69,38 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  worker:
+    # 与 API 进程分离的 Celery worker；镜像由本仓库构建，基础镜像按 digest 固定。
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    restart: unless-stopped
+    environment:
+      CITEMIND_ENVIRONMENT: development
+      # broker 指向 Compose 网络内的 redis 服务，密码沿用 Redis 的认证变量。
+      CITEMIND_REDIS_URL: redis://:${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}@redis:6379/0
+      # worker 使用非特权的 citemind_worker 角色；probe 任务不写库，此 DSN 为后续入库事务预留。
+      CITEMIND_DATABASE_URL: postgresql+psycopg://citemind_worker:${CITEMIND_WORKER_DB_PASSWORD:?必须设置 CITEMIND_WORKER_DB_PASSWORD}@postgres:5432/citemind
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - celery
+      - -A
+      - evidencehub.worker:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+    healthcheck:
+      # 通过 broker 回环的 inspect ping 确认 worker 真的在消费；无回复时 grep 失败。
+      test: ["CMD-SHELL", "celery -A evidencehub.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   postgres-data:
