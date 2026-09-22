@@ -1,0 +1,2 @@
+# Compose shell 脚本在 Linux 容器内执行；CRLF 会让解释器把 \r 当成命令的一部分。
+deploy/compose/**/*.sh text eol=lf

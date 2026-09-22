@@ -21,33 +21,75 @@
 - 修改技术契约时更新其归属文档。长期有效的决策理由单独记录为 Agent Note；局部机械修改不需要记录，不把历史推理写进当前行为文档。
 - 给用户的 shell 命令保持单行。实际入口建成后才记录可执行命令，不保留占位命令。
 
-## Jev Decision Layer
+## Agent orchestration
 
-Use Jev through the available Jev MCP tools as a lightweight semantic decision layer inside the workflow.
+Use `pi-herdr-subagents` as the default execution layer for substantial repository work.
 
-Jev provides bounded semantic judgments only. It does not own execution, replace deterministic application logic, or replace the primary reasoning agent.
+The primary agent is the coordinator, reviewer, and final integrator. It should not normally perform substantial repository exploration, implementation, debugging, testing, or open-ended research directly. Delegate that work to named subagents and use the primary context for decomposition, supervision, review, reconciliation, and the final user-facing result.
 
-### When to use Jev
+The primary agent may perform small read-only checks when needed to audit a result or resolve coordination state, but it should not take over work that can reasonably be delegated.
 
-Use Jev when the workflow needs a small, structured semantic judgment, such as:
+### Herdr execution model
 
-- routing a task to the appropriate handler or subagent;
+Create subagents through the `subagent` tool provided by `pi-herdr-subagents`.
+
+- Each subagent must run in its own **new Herdr tab**. Do not create subagents by splitting the current pane.
+- Use one primary responsibility per subagent and provide a bounded objective, relevant context, ownership boundaries, and expected output.
+- Run independent tasks in parallel when their file ownership and dependencies do not conflict.
+- Do not allow multiple implementation agents to edit the same files concurrently unless ownership is explicitly partitioned.
+- Prefer named project-local agents from `.pi/agents/` so role defaults and safety constraints are applied consistently.
+
+A delegated task remains part of the parent task until it reaches a terminal outcome and its result has been reviewed. The primary agent may become idle while subagents run; it should not busy-poll them. Completion, failure, stall/recovery, and `caller_ping` notifications from `pi-herdr-subagents` should wake the parent when action is required.
+
+Do not send the final user-facing completion message while required delegated work is still active, waiting for review, or unresolved, unless the user explicitly cancels or narrows that work.
+
+### Role routing
+
+Use the narrowest role that matches the work:
+
+- `scout`: fast, read-only repository reconnaissance and dependency/control-flow mapping.
+- `researcher`: read-only technical investigation, evidence gathering, and alternative analysis.
+- `worker`: bounded implementation or refactoring; may edit files and run focused verification.
+- `tester`: reproduction, builds, tests, runtime checks, and validation; avoid unrelated implementation changes.
+- `reviewer`: independent read-only review of changes, regressions, requirements, and evidence.
+- `jev-decider`: bounded semantic decisions through Jev MCP; never implement repository changes.
+
+The `plan-scout`, `plan-researcher`, and `plan-reviewer` roles are reserved for planning sessions and remain read-only.
+
+### Parent responsibilities
+
+For substantial work, the primary agent should:
+
+1. Decompose the request into independent work units and identify dependencies.
+2. Spawn the required named subagents in separate Herdr tabs.
+3. Continue coordinating work that is not blocked on an outstanding result.
+4. Review each returned result instead of accepting subagent claims automatically.
+5. Re-dispatch missing implementation, verification, or investigation work to the appropriate subagent rather than silently completing it in the primary context.
+6. Reconcile conflicting findings and confirm the repository is in a coherent final state.
+7. Report only actions, commands, tests, and results that were actually executed or observed.
+
+If a child uses `caller_ping`, resolve deterministic questions directly from evidence. For bounded semantic questions, consult the dedicated `jev-decider` session, then use `subagent_resume` to return the decision and relevant evidence to the blocked child.
+
+## Jev decision subagent
+
+Use a dedicated `jev-decider` subagent as the repository's semantic decision layer.
+
+Maintain one logical Jev decision session for the current task or decision domain. Create it when semantic judgment is first needed, then prefer `subagent_resume` for follow-up decisions so the decision context remains coherent. Do not create competing Jev decision agents for the same decision stream unless the task intentionally requires independent judgments.
+
+The `jev-decider` may use available Jev MCP tools for bounded judgments such as:
+
+- routing a task to an appropriate handler or subagent;
 - deciding whether a semantic condition holds;
-- choosing one action from a bounded set;
-- scoring, ranking, or comparing candidates along a defined dimension;
+- choosing among a small explicit set of alternatives;
+- comparing or ordering candidates along a defined dimension;
 - checking whether supplied evidence supports a claim;
 - reviewing whether an implementation satisfies stated requirements;
-- deciding whether a task should continue, retry, escalate, or stop.
+- deciding whether work should continue, retry, escalate, or stop.
 
-Prefer the Jev MCP tool that most closely matches the judgment:
+Prefer the Jev MCP operation that most closely matches the question, such as verify, decide, compare/rerank, classify, review, or gate when those operations are available.
 
-- `jev_verify` for checking a claim against supplied evidence;
-- `jev_decide` for choosing between a small set of explicit alternatives;
-- `jev_compare` or `jev_rerank` for comparing or ordering candidates;
-- `jev_classify` for assigning an item to a predefined category;
-- `jev_review` for structured review of an implementation or result;
-- `jev_gate` for completion, continuation, retry, or escalation decisions.
+Do not use Jev for deterministic rules, exact calculations, known lookups, filesystem operations, shell execution, code generation, or open-ended repository exploration. Supply Jev with the smallest sufficient evidence and an explicit bounded question.
 
-Do not use Jev for deterministic rules, exact calculations, known lookups, filesystem operations, shell execution, code generation, open-ended research, or tasks that ordinary code or the primary reasoning agent can handle reliably.
+Jev output is decision evidence, not authority. The primary agent must review the evidence and result before using it. If the result is low-confidence, ambiguous, or conflicts with deterministic evidence, gather more evidence or delegate further investigation rather than following it blindly.
 
-Treat Jev output as decision evidence rather than authority. If the result is low-confidence, ambiguous, or conflicts with deterministic evidence, gather more evidence or continue reasoning instead of blindly following it.
+The `jev-decider` must not edit repository files or perform implementation work. Implementation remains the responsibility of `worker`; verification remains the responsibility of `tester` and `reviewer`.

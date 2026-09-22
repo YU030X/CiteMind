@@ -29,6 +29,9 @@ pip-wheel-metadata/
 /.env
 /.env.*
 !/.env.example
+**/.env
+**/.env.*
+!**/.env.example
 *.pem
 *.key
 *.crt

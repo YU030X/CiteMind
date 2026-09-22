@@ -1,6 +1,6 @@
 # 开发约定
 
-> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。业务表、Compose、worker、inference 和产品功能仍未实现，因此尚未达到 Phase 0 退出条件。
+> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。本地数据服务切片已建立（只有 PostgreSQL + pgvector 与 Redis 两个服务），其静态插值、真实容器启动、initdb 角色/ACL、迁移和 Redis 配置（`PING` 与参数）验收均已通过，但无鉴权 `PING` 的 `NOAUTH` 分支尚未实测；它不是六服务 Compose：api、worker、inference、frontend-gateway 容器都未实现，worker 未运行，业务表与 `chunk_embedding VECTOR(512)` 列都未落地，因此尚未达到 Phase 0 退出条件。
 
 ## 数据库验收实测结果
 
@@ -13,6 +13,9 @@
 | upgrade | 在线 `uv run alembic upgrade head` 应用 `20260921_0001`，`alembic_version.version_num` 与该 revision 一致，`pg_extension` 中出现 `vector` 0.8.6 |
 | 512 维字面量 | `SELECT vector_dims(CAST('[0,...0]' AS vector))`（512 个元素）返回 512 |
 | downgrade | `uv run alembic downgrade base` 后 `pg_extension` 无 `vector` 行，且 `CAST(... AS vector)` 报 `type "vector" does not exist` |
+| Compose 数据服务 | Docker Compose 5.1.4 的隔离项目中，postgres 与 redis 均进入 healthy；端口只绑定 `127.0.0.1`，验收后容器、网络与卷均已删除 |
+| 角色与 ACL | `uv run pytest -m integration -q` 在 Compose 测试库上为 9 passed：迁移 upgrade/downgrade 以及 migrator/api/worker 角色、主库/测试库 PUBLIC ACL 和运行角色权限均通过 |
+| Redis | 容器内 `PING` 返回 `PONG`；`appendonly=yes`、`appendfsync=everysec`、`maxmemory=134217728`、`maxmemory-policy=noeviction`。该 `redis-cli` 继承 Compose 注入的 `REDISCLI_AUTH`，所以这条 `PONG` 不覆盖无鉴权分支；`NOAUTH` 需按验证规则单独实测 |
 
 这轮验收只覆盖 `vector` 扩展的启用与回收、512 维字面量的解析和迁移的降级，不是 `chunk_embedding VECTOR(512)` 列约束验收：业务表、`Vector(512)` 列和 pgvector-python 的类型绑定都尚未落地，因此不能据此声称向量列维度契约已通过。
 
@@ -26,6 +29,7 @@
 - 开发期 Jev 判断使用 Node 脚本、Vercel AI SDK 和 `typesafe-ai/jev`，只从服务端 `AI_GATEWAY_API_KEY` 读取凭据，不进入前端产物或产品运行时。
 - 文档处理计划在 MVP 加入 markdown-it-py、pypdf、jieba；完整范围再加 pdfplumber、python-docx、BeautifulSoup4/lxml 和受限网页抓取。
 - 数据服务：PostgreSQL 17 + pgvector 0.8.x、Redis；云生成默认选 DeepSeek API 的 `deepseek-flash` 非思考模式，模型名保持配置化。迁移验收已实测 PostgreSQL 17.11 + pgvector 0.8.6（镜像 `pgvector/pgvector:pg17`）；其余版本、接口行为与镜像 digest 在 Phase 0 验证后固定，不使用浮动 `latest`。
+- 本地数据服务用 `deploy/compose/compose.yml` 起，只有 `postgres` 与 `redis` 两个服务。镜像按 digest 固定（`pgvector/pgvector:pg17`、`redis:7.4.9`），宿主端口默认只绑定 `127.0.0.1:55432` 与 `127.0.0.1:56379`，可用 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT` 覆盖；数据放命名卷。Redis 使用 AOF `everysec`、`maxmemory 128mb`、`noeviction`，密码由环境注入，healthcheck 通过 `REDISCLI_AUTH` 读取。PostgreSQL 集群以超级用户 `citemind_migrator` 初始化并固定 `--encoding=UTF8 --locale=C.UTF-8 --data-checksums`；initdb 脚本创建非特权角色 `citemind_api`、`citemind_worker` 与测试库 `citemind_test`，并收回 `citemind`、`citemind_test` 中 PUBLIC 的数据库权限与 `public` schema 权限，只给两个运行角色 CONNECT 与 schema USAGE。除这两项数据服务以外的容器与功能仍未实现。
 
 ## 目录
 
@@ -34,11 +38,11 @@ backend/src/evidencehub/   # 已建立：API、配置与数据库会话入口
 frontend/                  # 已建立：Vue 控制台骨架
 scripts/                   # 已建立：开发辅助和质量门禁实现
 tests/tooling/             # 已建立：开发工具的 Node 测试
-tests/unit/                # 已建立：后端纯逻辑和 API 骨架测试
+tests/unit/                # 已建立：后端纯逻辑、API 骨架与部署文件静态测试
 inference/                 # 待建：独立模型服务，仅共享协议
 migrations/                # 已建立：pgvector 扩展迁移；业务迁移待建
-deploy/compose/            # 待建：单机服务配置
-tests/integration/         # 已建立：迁移测试与不连库的破坏性守卫测试；broker 与 worker 测试待建
+deploy/compose/            # 已建立：本地 postgres+redis 切片；六服务编排与业务容器待建
+tests/integration/         # 已建立：迁移测试、不连库的破坏性/角色 DSN 守卫测试与角色权限测试；broker 与 worker 测试待建
 fixtures/documents/        # 待建：无敏感样本
 eval/datasets/             # 待建：固定题集及版本
 eval/results/              # 待建：可复算的评估产物
@@ -61,6 +65,15 @@ eval/results/              # 待建：可复算的评估产物
 - 当前可执行 `uv sync --frozen`、Ruff、mypy、非集成 pytest、Jev 脚本测试、Alembic 离线 SQL 检查和前端构建。真实 PostgreSQL/pgvector 集成测试需要 `CITEMIND_TEST_DATABASE_URL`（`postgresql+psycopg` 驱动、数据库名以 `_test` 结尾）并显式确认 `CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB=1`，因为测试会执行 upgrade 和 downgrade；测试数据库必须由 CiteMind 独占、不能与其他应用共享，迁移账号必须拥有 `CREATE EXTENSION` 权限。运行前测试先断言 `current_database()` 与 URL 中的库名一致、`vector` 扩展不存在且 Alembic 处于 base，任何一项不满足都会失败而不是继续。未设置测试 DSN 时仅明确跳过。分角色镜像、依赖扫描、SBOM、GHCR 发布与恢复演练仍是后续计划。
 - 在线迁移只接受显式 DSN：Alembic 配置项 `sqlalchemy.url` 优先，否则必须设置 `CITEMIND_MIGRATION_DATABASE_URL`，缺失或不符合 SQLAlchemy URL 规则时直接以非零状态失败，不会回退到 `CITEMIND_DATABASE_URL` 或开发默认 URL。该 DSN 需要 `CREATE EXTENSION` 权限，只用于迁移进程，不进入 API 与 worker 的运行配置。
 - 离线 `uv run alembic upgrade head --sql` 只生成 SQL、不连接数据库，仍可使用开发默认 URL。
+- 本地数据服务切片用 `docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet` 做权威静态插值检查：不需要 Docker daemon，也不启动容器；pytest 中的部署文件测试只补充检查 digest、回环端口、初始化标记、必填变量在 `.env.example` 中以非空值提供和 LF 等源码不变量，不能替代 Compose CLI。首次真实启动前配置已忽略的根 `.env`，分两种情况：根 `.env` 不存在时用 `Copy-Item .env.example .env` 创建它并替换四个开发密码；根 `.env` 已存在时不得覆盖，只把 `.env.example` 中 Compose 需要的 `CITEMIND_MIGRATION_DB_PASSWORD`、`CITEMIND_API_DB_PASSWORD`、`CITEMIND_WORKER_DB_PASSWORD`、`CITEMIND_REDIS_PASSWORD` 四个密码变量与可选的 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT` 追加进去，已保存的 `AI_GATEWAY_API_KEY` 等本地配置保持原样。
+- 根 `.env` 就绪后必须逐个核对连接串与 Compose 变量的完整一致性，任一项不符都会导致连接失败：`CITEMIND_DATABASE_URL` 以及所有已启用的 migration/test DSN（`CITEMIND_MIGRATION_DATABASE_URL`、`CITEMIND_TEST_DATABASE_URL`、`CITEMIND_TEST_MIGRATOR_DATABASE_URL`、`CITEMIND_TEST_API_DATABASE_URL`、`CITEMIND_TEST_WORKER_DATABASE_URL`）都要检查对应用户名、数据库名、host=`127.0.0.1`、端口=`CITEMIND_POSTGRES_PORT` 与对应角色的密码，只有全部一致才能保持原样。允许在本地安全比对，但不得把真实密码输出到终端、日志或命令历史，只报告是否一致。
+- `CITEMIND_POSTGRES_PORT` 变化只改变 PostgreSQL 的宿主端口，因此只需把上述每个 DSN 的端口同步为新值，用户名、数据库名和密码无需改动。同步后重新执行已有单行 `docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait` 以重建容器；命名卷保留数据，不需要 `down -v`。
+- PostgreSQL 初始化流程写入 `CITEMIND_MIGRATION_DB_PASSWORD`、`CITEMIND_API_DB_PASSWORD`、`CITEMIND_WORKER_DB_PASSWORD` 三个角色密码（分别对应 `citemind_migrator`、`citemind_api`、`citemind_worker`）。initdb 脚本只在空命名卷上执行一次，所以卷已初始化后再改动其中任一密码，重启不会更新已有角色：必须先执行会删除本地数据库数据的 `docker compose --env-file .env -f deploy/compose/compose.yml down -v`，再执行 `docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait`，让 initdb 重建角色、密码与 ACL。角色或 ACL 需要重建时同样先跑 `down -v`。
+- Redis 密码 `CITEMIND_REDIS_PASSWORD` 不进入任何 PostgreSQL DSN，也不参与上面的 DSN 同步：它只需在 Compose 的 redis 环境变量与 `--requirepass` 之间保持一致，重建 redis 容器即可生效，不需要 `down -v`。
+- 缺少任一密码变量时 `docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait` 会以 `required variable ... is missing a value` 退出，这是必填插值的预期快速失败，不是 Compose 故障。
+- `docker compose config` 会把插值后的密码明文打印，Redis 密码也会出现在容器命令中；不要分享这些输出，生产部署必须改用独立密钥方案。
+- 验证 Redis 是否真的要求鉴权时必须临时移除 `REDISCLI_AUTH`：该变量由 Compose 注入 redis 容器，容器内 `redis-cli` 会继承它并自动完成 AUTH，继承环境下 `PING` 返回 `PONG` 不能证明 Redis 没有密码。在 PowerShell 中执行 `docker compose --env-file .env -f deploy/compose/compose.yml exec -T redis env -u REDISCLI_AUTH redis-cli -e ping`，`env -u` 只对这一次 `redis-cli` 子进程取消 `REDISCLI_AUTH`（不要把变量设为空值），`-e` 让 `redis-cli` 在收到错误回复时以非零状态退出；预期 `NOAUTH Authentication required.` 文本写入 stderr（不是 stdout）且退出码非零，只有观察到二者才能确认鉴权生效。
+- 角色权限集成测试是只读的，但要求三个角色 DSN 同时提供并指向同一个 `_test` 库：`CITEMIND_TEST_MIGRATOR_DATABASE_URL`、`CITEMIND_TEST_API_DATABASE_URL`、`CITEMIND_TEST_WORKER_DATABASE_URL`，用户名固定为 `citemind_migrator`、`citemind_api`、`citemind_worker`。若测试库名为 `<app>_test`，验收同时要求对应的 `<app>` 应用库存在并核对两个库的 ACL，避免范围静默缩小。三者都未设置时明确跳过；只设置部分、或驱动、用户名、host、port、database 任一项不符时在连接前失败，不尝试连接。
 
 ## 当前命令
 
@@ -75,6 +88,9 @@ uv run pytest -m "not integration"
 uv run alembic heads
 uv run alembic upgrade head --sql
 uv run pytest -m integration
+docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
+docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait
+docker compose --env-file .env -f deploy/compose/compose.yml down
 pnpm install --frozen-lockfile
 pnpm test:jev
 pnpm jev -- scripts/jev-request.example.json

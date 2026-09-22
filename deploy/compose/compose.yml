@@ -1,0 +1,74 @@
+# CiteMind Phase 0 本地数据服务切片：只有 PostgreSQL + pgvector 与 Redis 两个服务。
+# 这不是六服务 Compose：api、worker、inference、frontend-gateway 容器、业务表与向量列都尚未实现。
+# 镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
+# 命令（均从仓库根目录执行，单行）：
+#   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
+#   docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait
+#   docker compose --env-file .env -f deploy/compose/compose.yml down
+#   docker compose --env-file .env -f deploy/compose/compose.yml down -v
+# `down -v` 删除数据卷；initdb 脚本只在空卷上执行，角色或 ACL 需要重建时必须用它。
+# `docker compose config` 会把插值后的密码明文打印出来，不要分享该输出。
+# 首次真实启动前按 docs/development.md 配置已忽略的根 .env；根 .env 已存在时不要覆盖，只补齐 Compose 需要的密码与端口变量。
+
+name: citemind
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    restart: unless-stopped
+    environment:
+      # 迁移账号（也是集群超级用户）：vector.control 没有 trusted=true，
+      # 安装与升级 vector 扩展需要超级用户，因此本地高权限账号只交给迁移进程。
+      POSTGRES_USER: citemind_migrator
+      POSTGRES_DB: citemind
+      POSTGRES_PASSWORD: ${CITEMIND_MIGRATION_DB_PASSWORD:?必须设置 CITEMIND_MIGRATION_DB_PASSWORD}
+      # 固定集群编码、locale 与 data checksums；官方入口把该值原样拼进 initdb 参数。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      # initdb 脚本只在空数据卷执行，用它创建 api/worker 运行角色与测试库。
+      CITEMIND_API_DB_PASSWORD: ${CITEMIND_API_DB_PASSWORD:?必须设置 CITEMIND_API_DB_PASSWORD}
+      CITEMIND_WORKER_DB_PASSWORD: ${CITEMIND_WORKER_DB_PASSWORD:?必须设置 CITEMIND_WORKER_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:${CITEMIND_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 完成标记只在角色、测试库与 ACL 全部初始化成功后写入；半初始化卷不能变为 healthy。
+      test: ["CMD-SHELL", "test -f \"$${PGDATA}/.citemind-init-complete\" && pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7.4.9@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
+    restart: unless-stopped
+    environment:
+      # redis-cli 从该变量读取密码，healthcheck 因此不需要把密码写进命令行。
+      REDISCLI_AUTH: ${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${CITEMIND_REDIS_PORT:-56379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  redis-data:

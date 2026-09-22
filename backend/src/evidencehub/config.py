@@ -6,7 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
-DEFAULT_DATABASE_URL = "postgresql+psycopg://citemind:citemind@localhost:5432/citemind"
+# 与 deploy/compose/compose.yml 默认暴露的本机端口一致；用户名是运行时 api 角色，
+# 密码是开发占位值，生产环境会被下面的校验拒绝。
+DEFAULT_DATABASE_URL = "postgresql+psycopg://citemind_api:citemind@127.0.0.1:55432/citemind"
 
 
 def validate_database_url(database_url: str) -> URL:
