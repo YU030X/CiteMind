@@ -1,6 +1,6 @@
 # 开发约定
 
-> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。本地数据服务切片已建立（只有 PostgreSQL + pgvector 与 Redis 两个服务），其静态插值、真实容器启动、initdb 角色/ACL、迁移和 Redis 配置（`PING` 与参数）验收均已通过，但无鉴权 `PING` 的 `NOAUTH` 分支尚未实测；它不是六服务 Compose：api、worker、inference、frontend-gateway 容器都未实现，worker 未运行，业务表与 `chunk_embedding VECTOR(512)` 列都未落地，因此尚未达到 Phase 0 退出条件。
+> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移与两片业务表迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。本地数据服务切片已建立（只有 PostgreSQL + pgvector 与 Redis 两个服务），其静态插值、真实容器启动、initdb 角色/ACL、迁移和 Redis 配置（`PING` 与参数）验收均已通过，但无鉴权 `PING` 的 `NOAUTH` 分支尚未实测；它不是六服务 Compose：api、worker、inference、frontend-gateway 容器都未实现，worker 未运行。两片业务表已落地并在专用测试库上通过真实迁移验收：第一片（`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job`、`outbox_event`）由 `20260922_0002` 创建，第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）由 `20260922_0003` 创建，但 worker 写入事务、认证授权、检索与问答仍未实现，因此尚未达到 Phase 0 退出条件。
 
 ## 数据库验收实测结果
 
@@ -10,20 +10,22 @@
 | --- | --- |
 | 环境 | Windows 11 + Docker 29.4.3；镜像 `pgvector/pgvector:pg17`（digest `sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f`） |
 | 服务端 | PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2)，pgvector 0.8.6 |
-| upgrade | 在线 `uv run alembic upgrade head` 应用 `20260921_0001`，`alembic_version.version_num` 与该 revision 一致，`pg_extension` 中出现 `vector` 0.8.6 |
+| upgrade | 在线 `uv run alembic upgrade head` 当时应用 `20260921_0001`，`alembic_version.version_num` 与该 revision 一致，`pg_extension` 中出现 `vector` 0.8.6 |
 | 512 维字面量 | `SELECT vector_dims(CAST('[0,...0]' AS vector))`（512 个元素）返回 512 |
 | downgrade | `uv run alembic downgrade base` 后 `pg_extension` 无 `vector` 行，且 `CAST(... AS vector)` 报 `type "vector" does not exist` |
 | Compose 数据服务 | Docker Compose 5.1.4 的隔离项目中，postgres 与 redis 均进入 healthy；端口只绑定 `127.0.0.1`，验收后容器、网络与卷均已删除 |
 | 角色与 ACL | `uv run pytest -m integration -q` 在 Compose 测试库上为 9 passed：迁移 upgrade/downgrade 以及 migrator/api/worker 角色、主库/测试库 PUBLIC ACL 和运行角色权限均通过 |
+| 第一切片业务迁移 | 在 PostgreSQL 17.11 (Debian 17.11-1.pgdg12+2) + pgvector 0.8.6 的独立专用测试库（`127.0.0.1:55433`）上，`uv run pytest tests/integration/test_core_migration.py -q` 为 7 passed，随后 `uv run pytest -m integration -q` 为 16 passed（0 failed/0 skipped）。核对 6 张业务表、13 个具名 CHECK、独立索引、无 sequence、PUBLIC 无授权、api/worker 授权差异与 `document.active_version_id` 的 `SET NULL`；finally 降级回 base 后 `citemind_test` 仅剩空的 `alembic_version`，无业务表、无 sequence、无 `vector` 扩展 |
+| 第二切片业务迁移 | 在同一专用测试库上，`uv run pytest tests/integration/test_second_slice_migration.py -q` 为 9 passed，随后 `uv run pytest -m integration -q` 为 25 passed（0 failed/0 skipped）。从 `20260922_0002` 升级到 `20260922_0003`，核对 9 张表、`ingest_job.generation_id` 外键、具名约束、GIN 与部分唯一索引、无 sequence/ENUM/ANN、PUBLIC 收权、api/worker 精确授权、512 维可插入与非 512 维被拒、同 chunk 第二条向量被主键拒绝、同 version/profile 第二个 READY 被部分唯一索引拒绝且非 READY 可并存；finally 降级回 `20260922_0002` 后第一切片 6 表仍完整、新表/新列/授权无残留，再降回 base |
 | Redis | 容器内 `PING` 返回 `PONG`；`appendonly=yes`、`appendfsync=everysec`、`maxmemory=134217728`、`maxmemory-policy=noeviction`。该 `redis-cli` 继承 Compose 注入的 `REDISCLI_AUTH`，所以这条 `PONG` 不覆盖无鉴权分支；`NOAUTH` 需按验证规则单独实测 |
 
-这轮验收只覆盖 `vector` 扩展的启用与回收、512 维字面量的解析和迁移的降级，不是 `chunk_embedding VECTOR(512)` 列约束验收：业务表、`Vector(512)` 列和 pgvector-python 的类型绑定都尚未落地，因此不能据此声称向量列维度契约已通过。
+早期这轮验收只覆盖 `vector` 扩展的启用与回收、512 维字面量的解析和迁移的降级；`chunk_embedding VECTOR(512)` 列约束已由第二切片迁移的真实插入（512 维成功、非 512 维失败）另行验收，但 ANN 索引、向量检索与授权过滤仍未实现，因此不能据此声称检索维度契约已经端到端通过。
 
 ## 环境和依赖
 
 当前骨架已在 Windows 11、Node.js 24.16.0、pnpm 11.22.0、uv 0.12.4 和由 uv 管理的 CPython 3.12.13 上验证。完整队列运行仍以 Linux 容器或 Windows WSL2 为验收环境。
 
-- 后端使用 Python 3.12、`uv`、`pyproject.toml` 和 `uv.lock`。当前已锁定 FastAPI、Pydantic v2、pydantic-settings、Uvicorn、SQLAlchemy 2.x、psycopg 3、Alembic 和 pgvector-python；HTTPX 当前仅用于 ASGI 接口测试。psycopg 只安装 `[binary]` extra，连接池使用 SQLAlchemy 自带实现，`psycopg_pool` 未被使用；pgvector-python 已锁定，但业务的 `Vector` 类型与向量列尚未落地，当前迁移只创建 `vector` 扩展。worker 计划使用独立同步 Session；推理进程计划单独安装 sentence-transformers/PyTorch CPU。
+- 后端使用 Python 3.12、`uv`、`pyproject.toml` 和 `uv.lock`。当前已锁定 FastAPI、Pydantic v2、pydantic-settings、Uvicorn、SQLAlchemy 2.x、psycopg 3、Alembic 和 pgvector-python；HTTPX 当前仅用于 ASGI 接口测试。psycopg 只安装 `[binary]` extra，连接池使用 SQLAlchemy 自带实现，`psycopg_pool` 未被使用；pgvector-python 与业务的 `Vector(512)` 已在 `chunk_embedding` 落地；当前迁移创建 `vector` 扩展、第一片六张事实表和第二片三张索引表。worker 计划使用独立同步 Session；推理进程计划单独安装 sentence-transformers/PyTorch CPU。
 - Windows 上 psycopg 异步模式不能使用默认的 `ProactorEventLoop`：应用启动用 `--loop evidencehub.event_loop:create_event_loop` 提供自定义事件循环工厂（Windows 返回 `SelectorEventLoop`，其他平台返回 `asyncio.new_event_loop`），不修改全局事件循环 policy；Alembic 在线迁移在 Windows 内部同样切换到 `SelectorEventLoop`。
 - 前端已使用 Vue 3、Vite 和 TypeScript，并由根目录 pnpm workspace 管理。Element Plus 在出现实际组件需求后再加入，不为骨架预装。
 - 开发期 Jev 判断使用 Node 脚本、Vercel AI SDK 和 `typesafe-ai/jev`，只从服务端 `AI_GATEWAY_API_KEY` 读取凭据，不进入前端产物或产品运行时。
@@ -40,9 +42,9 @@ scripts/                   # 已建立：开发辅助和质量门禁实现
 tests/tooling/             # 已建立：开发工具的 Node 测试
 tests/unit/                # 已建立：后端纯逻辑、API 骨架与部署文件静态测试
 inference/                 # 待建：独立模型服务，仅共享协议
-migrations/                # 已建立：pgvector 扩展迁移；业务迁移待建
+migrations/                # 已建立：pgvector 扩展迁移与两片业务表迁移（`20260921_0001`…`20260922_0003`）
 deploy/compose/            # 已建立：本地 postgres+redis 切片；六服务编排与业务容器待建
-tests/integration/         # 已建立：迁移测试、不连库的破坏性/角色 DSN 守卫测试与角色权限测试；broker 与 worker 测试待建
+tests/integration/         # 已建立：两片迁移测试、不连库的破坏性/角色 DSN 守卫测试与角色权限测试；broker 与 worker 测试待建
 fixtures/documents/        # 待建：无敏感样本
 eval/datasets/             # 待建：固定题集及版本
 eval/results/              # 待建：可复算的评估产物

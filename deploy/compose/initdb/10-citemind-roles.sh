@@ -5,7 +5,7 @@
 # 并收紧 citemind 与 citemind_test 的 ACL：收回 PUBLIC 的数据库权限与 public schema 权限，
 # 只给两个运行角色 CONNECT 与 schema USAGE；不授 CREATE、不授表权限，也不设置 ALTER DEFAULT PRIVILEGES。
 #
-# 这里不建扩展、不建业务表：vector 扩展由 Alembic 迁移创建，业务表仍未实现。
+# 这里不建扩展、不建业务表：vector 扩展与业务表均由 Alembic 迁移创建。
 #
 # 官方入口可能 exec（脚本有执行位）或 source（无执行位）本文件，因此不使用 set -e，
 # 每条关键命令都显式检查退出状态；失败会中止容器初始化，需要 `down -v` 重建数据卷。

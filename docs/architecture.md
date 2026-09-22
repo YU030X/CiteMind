@@ -2,7 +2,7 @@
 
 > 设计状态：目标边界与当前实现状态并列记录；未实现部分仍不可据此声称可运行。
 
-当前已实现数据库基础设施的最小切片：API lifespan 创建并释放 SQLAlchemy AsyncEngine 与独立 Session 工厂，Alembic 首迁移只启用 pgvector `vector` 扩展，不创建业务表；Windows 上应用启动与在线迁移都显式使用 `SelectorEventLoop`，因为 psycopg 异步模式不兼容默认的 `ProactorEventLoop`。该切片已在真实 PostgreSQL 17.11 + pgvector 0.8.6 上完成升级、512 维字面量解析与降级的实测；业务表与向量列仍未实现，因此尚无 `chunk_embedding VECTOR(512)` 列约束验收结果。本地数据服务的部署切片已建立并完成真实启动验收：`deploy/compose/compose.yml` 只编排 postgres 与 redis，镜像按 digest 固定、宿主端口只绑定回环地址；PostgreSQL 官方入口创建 `citemind_migrator` 迁移超级用户，initdb 脚本再创建 `citemind_api`、`citemind_worker` 与 `citemind_test` 并收紧 ACL。容器健康、迁移、角色 ACL 与 Redis 配置已在隔离 Compose 项目中核对，api、worker、inference、frontend-gateway 进程仍不存在。
+当前已实现数据库基础设施与两片业务表：API lifespan 创建并释放 SQLAlchemy AsyncEngine 与独立 Session 工厂，Alembic 迁移 `20260921_0001` 只启用 pgvector `vector` 扩展，`20260922_0002` 创建 `index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job`、`outbox_event` 六张业务表，`20260922_0003` 创建 `index_generation`、`chunk`、`chunk_embedding` 并给 `ingest_job` 补可空 `generation_id`，逐表配置 api/worker 的 DML 授权；Windows 上应用启动与在线迁移都显式使用 `SelectorEventLoop`，因为 psycopg 异步模式不兼容默认的 `ProactorEventLoop`。首迁移已在真实 PostgreSQL 17.11 + pgvector 0.8.6 上完成升级、512 维字面量解析与降级的实测；两片业务表也已在同一版本的专用测试库上完成真实迁移验收（`uv run pytest -m integration -q` 为 25 passed，核对 9 表、具名约束、GIN 与部分唯一索引、无 sequence/ENUM/ANN、api/worker 授权差异、512 维列约束与降级无残留）；但尚无 worker 写入事务、认证授权、检索和问答实现，`chunk` 跨表冗余一致性与 `chunk_embedding.profile_id` 一致性也尚未由数据库强制。本地数据服务的部署切片已建立并完成真实启动验收：`deploy/compose/compose.yml` 只编排 postgres 与 redis，镜像按 digest 固定、宿主端口只绑定回环地址；PostgreSQL 官方入口创建 `citemind_migrator` 迁移超级用户，initdb 脚本再创建 `citemind_api`、`citemind_worker` 与 `citemind_test` 并收紧 ACL。容器健康、迁移、角色 ACL 与 Redis 配置已在隔离 Compose 项目中核对，api、worker、inference、frontend-gateway 进程仍不存在。
 
 ## 组成与职责
 

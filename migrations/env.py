@@ -6,6 +6,7 @@ from logging.config import fileConfig
 from alembic import context
 from alembic.util import CommandError
 from evidencehub.config import Settings, validate_database_url
+from evidencehub.models import metadata
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -15,7 +16,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = None
+# 共享声明式 metadata；迁移仍手写，这里只让 Alembic 能看到模型的约束命名。
+target_metadata = metadata
 
 
 def get_configured_database_url() -> str | None:

@@ -1,5 +1,5 @@
 # CiteMind Phase 0 本地数据服务切片：只有 PostgreSQL + pgvector 与 Redis 两个服务。
-# 这不是六服务 Compose：api、worker、inference、frontend-gateway 容器、业务表与向量列都尚未实现。
+# 这不是六服务 Compose：api、worker、inference、frontend-gateway 容器仍未实现；业务表与向量列由 Alembic 迁移创建。
 # 镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
