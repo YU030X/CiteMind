@@ -1,15 +1,20 @@
-# CiteMind Phase 0 本地数据与服务切片：postgres + pgvector、Redis，以及独立 worker。
-# 这不是六服务 Compose：api、inference、frontend-gateway 容器仍未实现；业务表与向量列由 Alembic 迁移创建。
-# worker 由本仓库 deploy/compose/Dockerfile 构建，只运行 Celery worker，不是 API 进程。
-# 镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
+# CiteMind 六服务本地切片：postgres + pgvector、Redis、独立 Celery worker，以及 api、
+# inference、frontend-gateway 三个进程容器。业务表与向量列由 Alembic 迁移创建。
+# api 与 worker 复用 deploy/compose/Dockerfile 的 runtime 基础 stage，只覆盖 target 与命令；
+# inference 用 inference/ 独立上下文构建；frontend-gateway 用 deploy/compose/frontend.Dockerfile
+# 构建（Node 构建 + 非 root nginx）。自建服务不写 image:，镜像由本仓库 Dockerfile 固定。
+# 第三方镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
+# 本切片 inference 只有进程/能力边界：embedding.ready=false，受保护 embed 返回 503 且无 vectors；
+# 真实 embedding、worker 写入事务与 dispatcher/业务 API 仍未实现。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
-#   docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait
+#   docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait
 #   docker compose --env-file .env -f deploy/compose/compose.yml down
 #   docker compose --env-file .env -f deploy/compose/compose.yml down -v
 # `down -v` 删除数据卷；initdb 脚本只在空卷上执行，角色或 ACL 需要重建时必须用它。
 # `docker compose config` 会把插值后的密码明文打印出来，不要分享该输出。
-# 首次真实启动前按 docs/development.md 配置已忽略的根 .env；根 .env 已存在时不要覆盖，只补齐 Compose 需要的密码与端口变量。
+# 首次真实启动前按 docs/development.md 配置已忽略的根 .env；根 .env 已存在时不要覆盖，
+# 只补齐 Compose 需要的密码、端口与 inference 令牌变量。
 
 name: citemind
 
@@ -70,11 +75,53 @@ services:
       retries: 5
       start_period: 10s
 
-  worker:
-    # 与 API 进程分离的 Celery worker；镜像由本仓库构建，基础镜像按 digest 固定。
+  api:
+    # 与 worker 共用 runtime stage，只覆盖 target 与启动命令。
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+      target: api
+    restart: unless-stopped
+    environment:
+      CITEMIND_ENVIRONMENT: development
+      # 容器内用服务名与内部端口；绝不透传宿主 127.0.0.1 DSN，避免容器访问宿主回环。
+      CITEMIND_DATABASE_URL: postgresql+psycopg://citemind_api:${CITEMIND_API_DB_PASSWORD:?必须设置 CITEMIND_API_DB_PASSWORD}@postgres:5432/citemind
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # 用容器内 Python 走 HTTP 探针；非 200 会抛异常，退出码非零。
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  inference:
+    # inference 有独立 pyproject/uv.lock，用 inference/ 目录作为构建上下文。
+    build:
+      context: ../../inference
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CITEMIND_ENVIRONMENT: development
+      # 内部接口 Bearer token；开发占位值，生产环境使用该值会启动失败。
+      CITEMIND_INFERENCE_TOKEN: ${CITEMIND_INFERENCE_TOKEN:?必须设置 CITEMIND_INFERENCE_TOKEN}
+    healthcheck:
+      # /health 只表示进程存活；embedding 未就绪也应为 healthy，由 /capabilities 如实报告。
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    # 与 API 进程分离的 Celery worker；镜像由本仓库构建，基础镜像按 digest 固定。
+    # worker 不依赖 inference：本切片没有 embedding 任务。
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+      target: worker
     restart: unless-stopped
     environment:
       CITEMIND_ENVIRONMENT: development
@@ -101,6 +148,26 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  frontend-gateway:
+    # 应用唯一入口：同源提供 SPA 静态资源并代理 /api 到内部 api:8000。
+    build:
+      context: ../..
+      dockerfile: deploy/compose/frontend.Dockerfile
+    restart: unless-stopped
+    # 唯一对外发布的端口，且只绑定回环；api/inference/worker 不发布宿主端口。
+    ports:
+      - "127.0.0.1:${CITEMIND_GATEWAY_PORT:-58080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # 网关自身探针不经过 api，api 故障不回退 SPA。
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   postgres-data:

@@ -1,6 +1,8 @@
-# CiteMind Phase 0 Linux Compose 确定性验收 override：postgres+redis+worker 之外增加一次性 queue-probe。
+# CiteMind Phase 0 Linux Compose 确定性验收 override：在共享 marker 卷上运行一次性 queue-probe。
+# 验收只显式启动 queue-probe service；Compose 会自动带上它依赖的 worker/redis/postgres，
+# 从而避免六服务里其余容器干扰 `--abort-on-container-exit`。
 # 用法（从仓库根目录，单行）：
-#   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --abort-on-container-exit --exit-code-from queue-probe
+#   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe queue-probe
 # 清理（单行）：保留 postgres/redis/marker 命名卷，不用 `down -v`：
 #   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml down --remove-orphans
 # 如需单独删除 queue-probe 的 marker 卷，用 `docker volume rm citemind_probe-markers`；不要用 `down -v`，它会一并删除数据库与 Redis 数据。
@@ -20,6 +22,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
+      target: worker
     restart: "no"
     environment:
       CITEMIND_ENVIRONMENT: development

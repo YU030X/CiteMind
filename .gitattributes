@@ -1,2 +1,10 @@
 # Compose shell 脚本在 Linux 容器内执行；CRLF 会让解释器把 \r 当成命令的一部分。
 deploy/compose/**/*.sh text eol=lf
+
+# 进镜像的 Dockerfile、nginx 配置与 ignore 文件统一用 LF，避免 CRLF 破坏构建或容器行为。
+deploy/compose/Dockerfile text eol=lf
+deploy/compose/frontend.Dockerfile text eol=lf
+deploy/compose/frontend.Dockerfile.dockerignore text eol=lf
+deploy/compose/gateway/nginx.conf text eol=lf
+inference/Dockerfile text eol=lf
+inference/.dockerignore text eol=lf

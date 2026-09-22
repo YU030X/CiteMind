@@ -54,6 +54,43 @@ def compose_entries(key: str) -> list[str]:
     return entries
 
 
+SERVICE_HEADER = re.compile(r"^  ([a-zA-Z0-9_-]+):\s*$")
+
+
+def compose_service_names() -> list[str]:
+    """返回 services: 块下的顶层服务名（两空格缩进）。"""
+
+    names: list[str] = []
+    in_services = False
+    for line in compose_text().splitlines():
+        if line.startswith("services:"):
+            in_services = True
+            continue
+        if not in_services:
+            continue
+        if line and not line.startswith(" "):
+            break
+        match = SERVICE_HEADER.match(line)
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def compose_service_block(service: str) -> str:
+    """返回单个 service 的缩进块文本，用于按服务断言而不是全局字符串计数。"""
+
+    block: list[str] = []
+    capturing = False
+    for line in compose_text().splitlines():
+        if capturing and (SERVICE_HEADER.match(line) or line.startswith("volumes:")):
+            break
+        if line.startswith(f"  {service}:"):
+            capturing = True
+        if capturing:
+            block.append(line)
+    return "\n".join(block)
+
+
 def test_initdb_scripts_exist() -> None:
     assert INITDB_SCRIPTS, "deploy/compose/initdb 下缺少 *.sh 初始化脚本"
 
@@ -94,10 +131,16 @@ def test_env_example_provides_non_empty_values_for_required_compose_variables() 
     assert not empty, f".env.example 中必填变量为空值：{empty}"
 
 
-def test_compose_pins_the_two_data_service_images_by_digest() -> None:
+def test_compose_declares_the_six_expected_services() -> None:
+    assert sorted(compose_service_names()) == sorted(
+        ["api", "frontend-gateway", "inference", "postgres", "redis", "worker"]
+    )
+
+
+def test_compose_pins_the_two_third_party_images_by_digest() -> None:
     images = compose_entries("image")
 
-    assert len(images) == 2, "本地数据服务切片只应有 postgres 与 redis 两个镜像"
+    assert len(images) == 2, "只有 postgres 与 redis 是第三方镜像，自建服务不得写 image:"
     assert sorted(images) == sorted(PINNED_IMAGES)
     for image in images:
         assert "@sha256:" in image, f"{image} 未固定 digest"
@@ -106,20 +149,26 @@ def test_compose_pins_the_two_data_service_images_by_digest() -> None:
 def test_compose_publishes_only_loopback_ports_by_default() -> None:
     published_ports = compose_entries("ports")
 
-    assert len(published_ports) == 2
+    assert len(published_ports) == 3, "只有 postgres、redis 与 frontend-gateway 发布宿主端口"
     for mapping in published_ports:
         assert mapping.startswith("127.0.0.1:"), f"{mapping} 必须只绑定回环地址"
 
     text = compose_text()
     assert "CITEMIND_POSTGRES_PORT:-55432" in text
     assert "CITEMIND_REDIS_PORT:-56379" in text
+    assert "CITEMIND_GATEWAY_PORT:-58080" in text
+
+
+def test_compose_keeps_internal_services_unpublished() -> None:
+    for service in ("api", "inference", "worker"):
+        assert "ports:" not in compose_service_block(service), f"{service} 不应发布宿主端口"
 
 
 def test_compose_keeps_declared_service_contracts() -> None:
     text = compose_text()
 
-    assert text.count("restart: unless-stopped") == 3
-    assert text.count("healthcheck:") == 3
+    assert text.count("restart: unless-stopped") == 6
+    assert text.count("healthcheck:") == 6
     assert "--locale=C.UTF-8 --data-checksums" in text
     assert text.count(".citemind-init-complete") == 1
     assert all(
@@ -133,18 +182,49 @@ def test_compose_keeps_declared_service_contracts() -> None:
     assert "noeviction" in text
 
 
+def test_compose_builds_api_and_worker_from_shared_dockerfile_targets() -> None:
+    assert "target: api" in compose_service_block("api")
+    assert "target: worker" in compose_service_block("worker")
+
+    api_block = compose_service_block("api")
+    assert "context: ../.." in api_block
+    assert "dockerfile: deploy/compose/Dockerfile" in api_block
+    # api 在容器网络内使用服务名 DSN，绝不透传宿主 127.0.0.1 DSN。
+    assert "@postgres:5432/citemind" in api_block
+    assert "127.0.0.1:55432" not in api_block
+    assert "urlopen('http://127.0.0.1:8000/api/v1/health'" in api_block
+
+
+def test_compose_inference_service_is_self_contained_and_token_protected() -> None:
+    block = compose_service_block("inference")
+
+    assert "context: ../../inference" in block
+    assert "depends_on" not in block, "本切片 inference 不依赖 api 或数据服务"
+    assert "CITEMIND_INFERENCE_TOKEN" in block
+    assert "urlopen('http://127.0.0.1:9000/health'" in block
+
+
+def test_compose_gateway_is_the_only_app_entrypoint_depending_on_api() -> None:
+    block = compose_service_block("frontend-gateway")
+
+    assert "dockerfile: deploy/compose/frontend.Dockerfile" in block
+    assert "127.0.0.1:${CITEMIND_GATEWAY_PORT:-58080}:8080" in block
+    assert "condition: service_healthy" in block
+    assert "healthz" in block
+
+
 def test_compose_worker_service_runs_celery_and_depends_on_data_services() -> None:
     text = compose_text()
 
-    assert "dockerfile: deploy/compose/Dockerfile" in text
-    assert "context: ../.." in text
     assert "evidencehub.worker:celery_app" in text
     assert "--concurrency=1" in text
-    # worker 必须等 postgres 与 redis 都 healthy 后再启动。
-    assert text.count("condition: service_healthy") == 2
+    # 四个 service_healthy：worker 等 postgres/redis，api 等 postgres，gateway 等 api。
+    assert text.count("condition: service_healthy") == 4
     assert "CITEMIND_REDIS_URL" in text
     assert "@redis:6379/0" in text
     assert "citemind_worker" in text
+    # worker 不应因 inference 未就绪而被阻塞（注释里的全角冒号不算依赖键）。
+    assert "inference:" not in compose_service_block("worker")
 
 
 def test_dockerfile_pins_base_images_and_runs_the_worker_as_non_root() -> None:
@@ -182,5 +262,6 @@ def test_queue_override_adds_shared_marker_volume_and_one_shot_probe() -> None:
     assert "restart: \"no\"" in text
     # 确定性验收使用硬退出码，不引入 result backend。
     assert "--abort-on-container-exit" in text
-    assert "--exit-code-from queue-probe" in text
+    # 验收命令必须显式只启动 queue-probe service，避免六服务其它容器干扰退出码。
+    assert "--exit-code-from queue-probe queue-probe" in text
     assert "result_backend" not in text

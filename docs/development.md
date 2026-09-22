@@ -1,6 +1,6 @@
 # 开发约定
 
-> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移与两片业务表迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。本地数据与服务切片已建立：`deploy/compose/compose.yml` 除 PostgreSQL + pgvector 与 Redis 外增加了独立 Celery worker；其静态插值、真实容器启动、initdb 角色/ACL、迁移、Redis 配置（`PING` 与参数）与无鉴权 `PING` 的 `NOAUTH` 分支均已实测。worker 只注册无业务副作用的诊断任务 `evidencehub.probe`，使用带认证的 Redis broker 且不配置 result backend；probe 默认只回显，只有显式设置受信目录 `CITEMIND_PROBE_MARKER_DIRECTORY` 时才原子写入诊断 marker，作为执行的确定性证据（`deploy/compose/queue.yml` 的 queue-probe 验收即按退出码判定）。它仍不是六服务 Compose：api、inference、frontend-gateway 容器未实现，认证、入库、检索与问答均未实现。两片业务表已落地并在专用测试库上通过真实迁移验收：第一片（`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job`、`outbox_event`）由 `20260922_0002` 创建，第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）由 `20260922_0003` 创建，但 worker 写入事务、认证授权、检索与问答仍未实现，因此尚未达到 Phase 0 退出条件。
+> 当前仓库已建立 Phase 0 工程骨架：FastAPI 健康检查与 OpenAPI、Vue 3/Vite/TypeScript 页面、SQLAlchemy 异步数据库会话、Alembic 的 pgvector 扩展迁移与两片业务表迁移、Jev 开发期判断脚本及对应聚焦检查已经可运行，Docker 与真实 PostgreSQL/pgvector 迁移也已完成实测。本地数据与服务切片已建立：`deploy/compose/compose.yml` 除 PostgreSQL + pgvector 与 Redis 外增加了独立 Celery worker；其静态插值、真实容器启动、initdb 角色/ACL、迁移、Redis 配置（`PING` 与参数）与无鉴权 `PING` 的 `NOAUTH` 分支均已实测。worker 只注册无业务副作用的诊断任务 `evidencehub.probe`，使用带认证的 Redis broker 且不配置 result backend；probe 默认只回显，只有显式设置受信目录 `CITEMIND_PROBE_MARKER_DIRECTORY` 时才原子写入诊断 marker，作为执行的确定性证据（`deploy/compose/queue.yml` 的 queue-probe 验收即按退出码判定）。它仍不是可用的业务系统：六服务 Compose 已补齐（api、inference、frontend-gateway 容器已建立并完成一次真实启动验收），但推理进程目前只有能力边界，认证、入库、检索与问答仍未实现。两片业务表已落地并在专用测试库上通过真实迁移验收：第一片（`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job`、`outbox_event`）由 `20260922_0002` 创建，第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）由 `20260922_0003` 创建，但 worker 写入事务、认证授权、检索与问答仍未实现，因此尚未达到 Phase 0 退出条件。
 
 ## 验收实测结果
 
@@ -20,10 +20,14 @@
 | Redis 鉴权 | 容器内移除 `REDISCLI_AUTH` 后执行 `redis-cli -e ping`，stderr 输出 `NOAUTH Authentication required.` 且退出码为 1，确认 `--requirepass` 生效 |
 | 独立 worker（Linux Compose） | `up -d --wait` 后 postgres、redis、worker 三个容器均 healthy；worker 以 prefork、concurrency 1 启动，日志显示 `results: disabled://`、`[tasks] . evidencehub.probe` 与 `celery@<container> ready.` |
 | worker 接收并执行 probe | worker 配置 `CITEMIND_PROBE_MARKER_DIRECTORY` 并挂载共享 marker 卷后，从宿主机派发 `evidencehub.probe` 会在卷内生成与本次 task id 同名的 `<taskId>.json`，可解析出 `taskId`/`hostname`/`pid`/`payload`；不写业务表、不改 job 状态 |
-| Linux Compose 确定性验收 | `docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe` 退出码为 0：queue-probe 派发唯一 probe、等待并校验 marker 后打印 `queue-probe 成功: taskId=... hostname=celery@<container> pid=...`；未引入 result backend |
+| Linux Compose 确定性验收 | `docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe queue-probe` 退出码为 0：只显式启动 queue-probe 与自动依赖（redis/worker/postgres），queue-probe 派发唯一 probe、等待并校验 marker 后打印 `queue-probe 成功: taskId=... hostname=celery@<container> pid=...`；未引入 result backend |
 | broker 集成测试 | `uv run --env-file .env pytest tests/integration/test_worker_broker.py -q` 为 2 passed：真实 Redis db 15 上独立 worker 子进程在超时内响应 `inspect ping`、注册 probe，并按本次 `async_result.id` 生成通过校验的 marker（日志仅用于诊断）；同一 Redis 无密码连接被拒 |
 | 本切片全量集成 | `uv run --env-file .env pytest -m integration -q` 为 27 passed（25 个迁移/角色 + 2 个 broker）、0 failed/0 skipped |
 | 本切片静态检查 | `uv run ruff check backend/src tests`、`uv run mypy`、`uv run pytest -m "not integration"` 与 `docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet` 均通过 |
+| 六服务 Compose 启动 | `docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait` 退出码 0：postgres、redis、api、inference、worker、frontend-gateway 六个容器全部 `running (healthy)`；`ps` 显示只有 gateway（`127.0.0.1:58080->8080`）、postgres（`127.0.0.1:55432->5432`）、redis（`127.0.0.1:56379->6379`）发布宿主端口，api/inference/worker 无 published ports |
+| 网关同源入口 | `curl.exe --noproxy "*" -fsS http://127.0.0.1:58080/api/v1/health` 返回 `{"status":"ok","service":"api","environment":"development"}`；`/` 与 `/kb/1/documents` 均 200（SPA fallback），`/healthz` 返回 `ok`；assets 返回 `Cache-Control: public, max-age=31536000, immutable`，index 返回 `no-store`，CSP/nosniff/X-Frame/Referrer 安全头齐备；在网关运行镜像内 `nginx -t` successful；停止 api 后 `/api/v1/health` 为 502 而 `/healthz` 仍 200，重启 api 后恢复 200 |
+| 容器身份与推理边界 | `exec -T api id -u`=10001、`inference id -u`=10002、`frontend-gateway id -u`=101；inference `find_spec('torch')` 为 None（无 torch）；`/capabilities` 返回 embedding.ready=false、dimension/modelRevision 为 null；`/internal/embed` 无 token/错 token 为 401，正确 token 为 503 `EMBEDDING_NOT_READY` 且响应体不含 vectors |
+| 六服务静态检查 | 两个 Compose `config --quiet`（base 与 queue override）均通过；`uv run ruff check backend/src tests`、`uv run mypy`、`uv run pytest -m "not integration"`（238 passed）、inference 的 `uv run --frozen pytest`（14 passed）与 `pnpm frontend:build` 均通过 |
 
 早期这轮验收只覆盖 `vector` 扩展的启用与回收、512 维字面量的解析和迁移的降级；`chunk_embedding VECTOR(512)` 列约束已由第二切片迁移的真实插入（512 维成功、非 512 维失败）另行验收，但 ANN 索引、向量检索与授权过滤仍未实现，因此不能据此声称检索维度契约已经端到端通过。
 
@@ -37,7 +41,7 @@
 - 开发期 Jev 判断使用 Node 脚本、Vercel AI SDK 和 `typesafe-ai/jev`，只从服务端 `AI_GATEWAY_API_KEY` 读取凭据，不进入前端产物或产品运行时。
 - 文档处理计划在 MVP 加入 markdown-it-py、pypdf、jieba；完整范围再加 pdfplumber、python-docx、BeautifulSoup4/lxml 和受限网页抓取。
 - 数据服务：PostgreSQL 17 + pgvector 0.8.x、Redis；云生成默认选 DeepSeek API 的 `deepseek-flash` 非思考模式，模型名保持配置化。迁移验收已实测 PostgreSQL 17.11 + pgvector 0.8.6（镜像 `pgvector/pgvector:pg17`）；其余版本、接口行为与镜像 digest 在 Phase 0 验证后固定，不使用浮动 `latest`。
-- 本地数据与服务用 `deploy/compose/compose.yml` 起：`postgres`、`redis` 与独立 `worker` 三个服务。数据服务镜像按 digest 固定（`pgvector/pgvector:pg17`、`redis:7.4.9`），宿主端口默认只绑定 `127.0.0.1:55432` 与 `127.0.0.1:56379`，可用 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT` 覆盖；数据放命名卷。worker 由 `deploy/compose/Dockerfile` 构建（基础镜像与 uv 按 digest 固定，非 root 运行），只运行 Celery worker，依赖 postgres 与 redis 的 `service_healthy` 后启动。Redis 使用 AOF `everysec`、`maxmemory 128mb`、`noeviction`，密码由环境注入，healthcheck 通过 `REDISCLI_AUTH` 读取。PostgreSQL 集群以超级用户 `citemind_migrator` 初始化并固定 `--encoding=UTF8 --locale=C.UTF-8 --data-checksums`；initdb 脚本创建非特权角色 `citemind_api`、`citemind_worker` 与测试库 `citemind_test`，并收回 `citemind`、`citemind_test` 中 PUBLIC 的数据库权限与 `public` schema 权限，只给两个运行角色 CONNECT 与 schema USAGE。api、inference、frontend-gateway 容器与认证、入库、检索、问答仍未实现。
+- 本地数据与服务用 `deploy/compose/compose.yml` 起六服务：`postgres`、`redis`、`api`、`inference`、`worker` 与 `frontend-gateway`。第三方镜像按 digest 固定（`pgvector/pgvector:pg17`、`redis:7.4.9`），宿主端口默认只绑定 `127.0.0.1:55432`、`127.0.0.1:56379` 与 `127.0.0.1:58080`，可分别用 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT`、`CITEMIND_GATEWAY_PORT` 覆盖，且只有 gateway 是应用入口；数据放命名卷。`api` 与 `worker` 由 `deploy/compose/Dockerfile` 构建（基础镜像与 uv 按 digest 固定，非 root 10001，用 target `api`/`worker` 区分入口；api 容器内 DSN 用 `postgres:5432`，不透传宿主回环 DSN）。`inference` 用 `inference/` 独立项目构建（非 root 10002，内部 9000 不发布，`CITEMIND_INFERENCE_TOKEN` 必填）。`frontend-gateway` 用 `deploy/compose/frontend.Dockerfile`（Node 24 构建静态产物，运行镜像 `nginxinc/nginx-unprivileged` 非 root 101，内部 8080）并把 `/api/` 动态代理到 `api:8000`。Redis 使用 AOF `everysec`、`maxmemory 128mb`、`noeviction`，密码由环境注入，healthcheck 通过 `REDISCLI_AUTH` 读取。PostgreSQL 集群以超级用户 `citemind_migrator` 初始化并固定 `--encoding=UTF8 --locale=C.UTF-8 --data-checksums`；initdb 脚本创建非特权角色 `citemind_api`、`citemind_worker` 与测试库 `citemind_test`，并收回 `citemind`、`citemind_test` 中 PUBLIC 的数据库权限与 `public` schema 权限，只给两个运行角色 CONNECT 与 schema USAGE。本切片 inference 只有进程/能力边界（无模型权重与 torch，embedding.ready=false），真实 embedding、worker 写入事务与认证、入库、检索、问答仍未实现。
 
 ## 目录
 
@@ -47,11 +51,14 @@ frontend/                  # 已建立：Vue 控制台骨架
 scripts/                   # 已建立：开发辅助和质量门禁实现
 tests/tooling/             # 已建立：开发工具的 Node 测试
 tests/unit/                # 已建立：后端纯逻辑、API 骨架与部署文件静态测试
-inference/                 # 待建：独立模型服务，仅共享协议
+inference/                 # 已建立：独立推理进程（能力边界，无模型权重/torch，自带 pyproject/uv.lock/Dockerfile）
 migrations/                # 已建立：pgvector 扩展迁移与两片业务表迁移（`20260921_0001`…`20260922_0003`）
-deploy/compose/            # 已建立：本地 postgres+redis+worker 切片；api/inference/gateway 容器待建
-  Dockerfile               # 已建立：worker 镜像（python:3.12 + uv，非 root）
-  queue.yml                # 已建立：Linux Compose 确定性验收 override（共享 marker 卷 + 一次性 queue-probe）
+deploy/compose/            # 已建立：本地六服务 Compose 切片（postgres/redis/api/inference/worker/frontend-gateway）
+  Dockerfile               # 已建立：api/worker 共享 runtime stage + api/worker final target（python:3.12 + uv，非 root）
+  frontend.Dockerfile      # 已建立：Node 24 构建前端 + 非 root nginx 网关运行镜像
+  frontend.Dockerfile.dockerignore # 已建立：网关构建上下文白名单（放行根 workspace 与 frontend 源）
+  gateway/nginx.conf       # 已建立：SPA fallback + /api 动态代理 + 安全头 + /healthz
+  queue.yml                # 已建立：Linux Compose 确定性验收 override（显式限定 queue-probe service）
 tests/integration/         # 已建立：迁移、角色 DSN、broker guard 与真实 Redis worker 测试
 fixtures/documents/        # 待建：无敏感样本
 eval/datasets/             # 待建：固定题集及版本
@@ -75,7 +82,7 @@ eval/results/              # 待建：可复算的评估产物
 - 当前可执行 `uv sync --frozen`、Ruff、mypy、非集成 pytest、Jev 脚本测试、Alembic 离线 SQL 检查和前端构建。真实 PostgreSQL/pgvector 集成测试需要 `CITEMIND_TEST_DATABASE_URL`（`postgresql+psycopg` 驱动、数据库名以 `_test` 结尾）并显式确认 `CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB=1`，因为测试会执行 upgrade 和 downgrade；测试数据库必须由 CiteMind 独占、不能与其他应用共享，迁移账号必须拥有 `CREATE EXTENSION` 权限。运行前测试先断言 `current_database()` 与 URL 中的库名一致、`vector` 扩展不存在且 Alembic 处于 base，任何一项不满足都会失败而不是继续。未设置测试 DSN 时仅明确跳过。分角色镜像、依赖扫描、SBOM、GHCR 发布与恢复演练仍是后续计划。
 - 在线迁移只接受显式 DSN：Alembic 配置项 `sqlalchemy.url` 优先，否则必须设置 `CITEMIND_MIGRATION_DATABASE_URL`，缺失或不符合 SQLAlchemy URL 规则时直接以非零状态失败，不会回退到 `CITEMIND_DATABASE_URL` 或开发默认 URL。该 DSN 需要 `CREATE EXTENSION` 权限，只用于迁移进程，不进入 API 与 worker 的运行配置。
 - 离线 `uv run alembic upgrade head --sql` 只生成 SQL、不连接数据库，仍可使用开发默认 URL。
-- 本地数据与服务切片用 `docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet` 做权威静态插值检查：不需要 Docker daemon，也不启动容器；pytest 中的部署文件测试只补充检查 digest、回环端口、初始化标记、必填变量在 `.env.example` 中以非空值提供和 LF 等源码不变量，不能替代 Compose CLI。首次真实启动前配置已忽略的根 `.env`，分两种情况：根 `.env` 不存在时用 `Copy-Item .env.example .env` 创建它并替换四个开发密码；根 `.env` 已存在时不得覆盖，只把 `.env.example` 中 Compose 需要的 `CITEMIND_MIGRATION_DB_PASSWORD`、`CITEMIND_API_DB_PASSWORD`、`CITEMIND_WORKER_DB_PASSWORD`、`CITEMIND_REDIS_PASSWORD` 四个密码变量、本地 worker/派发需要的 `CITEMIND_REDIS_URL` 与可选的 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT` 追加进去，已保存的 `AI_GATEWAY_API_KEY` 等本地配置保持原样。
+- 本地数据与服务切片用 `docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet` 做权威静态插值检查：不需要 Docker daemon，也不启动容器；pytest 中的部署文件测试只补充检查 digest、回环端口、初始化标记、必填变量在 `.env.example` 中以非空值提供和 LF 等源码不变量，不能替代 Compose CLI。首次真实启动前配置已忽略的根 `.env`，分两种情况：根 `.env` 不存在时用 `Copy-Item .env.example .env` 创建它并替换四个数据库/Redis 开发密码；根 `.env` 已存在时不得覆盖，只把 `.env.example` 中 Compose 需要的 `CITEMIND_MIGRATION_DB_PASSWORD`、`CITEMIND_API_DB_PASSWORD`、`CITEMIND_WORKER_DB_PASSWORD`、`CITEMIND_REDIS_PASSWORD` 四个密码变量、本地 worker/派发需要的 `CITEMIND_REDIS_URL`、inference 需要的开发占位 `CITEMIND_INFERENCE_TOKEN` 与可选的 `CITEMIND_POSTGRES_PORT`、`CITEMIND_REDIS_PORT`、`CITEMIND_GATEWAY_PORT` 追加进去，已保存的 `AI_GATEWAY_API_KEY` 等本地配置保持原样。
 - 根 `.env` 就绪后必须逐个核对连接串与 Compose 变量的完整一致性，任一项不符都会导致连接失败：`CITEMIND_DATABASE_URL` 以及所有已启用的 migration/test DSN（`CITEMIND_MIGRATION_DATABASE_URL`、`CITEMIND_TEST_DATABASE_URL`、`CITEMIND_TEST_MIGRATOR_DATABASE_URL`、`CITEMIND_TEST_API_DATABASE_URL`、`CITEMIND_TEST_WORKER_DATABASE_URL`）都要检查对应用户名、数据库名、host=`127.0.0.1`、端口=`CITEMIND_POSTGRES_PORT` 与对应角色的密码，只有全部一致才能保持原样。允许在本地安全比对，但不得把真实密码输出到终端、日志或命令历史，只报告是否一致。
 - `CITEMIND_POSTGRES_PORT` 变化只改变 PostgreSQL 的宿主端口，因此只需把上述每个 DSN 的端口同步为新值，用户名、数据库名和密码无需改动。同步后重新执行已有单行 `docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait` 以重建容器；命名卷保留数据，不需要 `down -v`。
 - PostgreSQL 初始化流程写入 `CITEMIND_MIGRATION_DB_PASSWORD`、`CITEMIND_API_DB_PASSWORD`、`CITEMIND_WORKER_DB_PASSWORD` 三个角色密码（分别对应 `citemind_migrator`、`citemind_api`、`citemind_worker`）。initdb 脚本只在空命名卷上执行一次，所以卷已初始化后再改动其中任一密码，重启不会更新已有角色：必须先执行会删除本地数据库数据的 `docker compose --env-file .env -f deploy/compose/compose.yml down -v`，再执行 `docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait`，让 initdb 重建角色、密码与 ACL。角色或 ACL 需要重建时同样先跑 `down -v`。
@@ -85,7 +92,8 @@ eval/results/              # 待建：可复算的评估产物
 - 验证 Redis 是否真的要求鉴权时必须临时移除 `REDISCLI_AUTH`：该变量由 Compose 注入 redis 容器，容器内 `redis-cli` 会继承它并自动完成 AUTH，继承环境下 `PING` 返回 `PONG` 不能证明 Redis 没有密码。在 PowerShell 中执行 `docker compose --env-file .env -f deploy/compose/compose.yml exec -T redis env -u REDISCLI_AUTH redis-cli -e ping`，`env -u` 只对这一次 `redis-cli` 子进程取消 `REDISCLI_AUTH`（不要把变量设为空值），`-e` 让 `redis-cli` 在收到错误回复时以非零状态退出；预期 `NOAUTH Authentication required.` 文本写入 stderr（不是 stdout）且退出码非零，只有观察到二者才能确认鉴权生效。
 - 角色权限集成测试是只读的，但要求三个角色 DSN 同时提供并指向同一个 `_test` 库：`CITEMIND_TEST_MIGRATOR_DATABASE_URL`、`CITEMIND_TEST_API_DATABASE_URL`、`CITEMIND_TEST_WORKER_DATABASE_URL`，用户名固定为 `citemind_migrator`、`citemind_api`、`citemind_worker`。若测试库名为 `<app>_test`，验收同时要求对应的 `<app>` 应用库存在并核对两个库的 ACL，避免范围静默缩小。三者都未设置时明确跳过；只设置部分、或驱动、用户名、host、port、database 任一项不符时在连接前失败，不尝试连接。
 - 真实 Redis broker 集成测试需要 `CITEMIND_TEST_REDIS_URL`（`redis`/`rediss` scheme、host 必须是回环地址、必须带密码、必须显式指定非 0 逻辑库如 `.../15`）并显式设置 `CITEMIND_ALLOW_TEST_REDIS=1`。未设置 DSN 时明确跳过；DSN 非法或缺少 opt-in 时在连接前失败，不尝试连接。测试以唯一队列名派发 `evidencehub.probe`，把临时 marker 目录传给 worker 子进程，只在 `finally` 删除该队列 key 及其 `_kombu.binding.<queue>`、不 `FLUSHDB`，并回收 worker 子进程。执行证据来自与本次 `async_result.id` 对应的 marker 文件；worker 日志与 `inspect` 只用于 readiness 与失败诊断，不使用 Celery result backend。
-- Linux Compose 的确定性 worker 验收走 override：`docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe`。它给 base worker 与一次性 `queue-probe` 挂载同一个非 root marker 卷并设置 `CITEMIND_PROBE_MARKER_DIRECTORY`；`queue-probe` 派发唯一 probe 后只在受信目录里等待并校验 marker，成功退出 0、失败/超时退出非 0，因此可用 `--exit-code-from queue-probe` 得到硬证据。该 override 不引入 result backend，base compose 默认不运行 queue-probe。验收后回收容器与网络（保留所有命名卷）：`docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml down --remove-orphans`；如需单独删除 queue-probe 的 marker 卷，用 `docker volume rm citemind_probe-markers`，不要用 `down -v`，它会一并删除数据库与 Redis 数据。
+- Linux Compose 的确定性 worker 验收走 override：`docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe queue-probe`。命令显式只启动 `queue-probe` service，Compose 自动带上它依赖的 worker/redis/postgres，避免六服务里其它容器干扰 `--abort-on-container-exit`。它给 base worker 与一次性 `queue-probe` 挂载同一个非 root marker 卷并设置 `CITEMIND_PROBE_MARKER_DIRECTORY`；`queue-probe` 派发唯一 probe 后只在受信目录里等待并校验 marker，成功退出 0、失败/超时退出非 0，因此可用 `--exit-code-from queue-probe` 得到硬证据。该 override 不引入 result backend，base compose 默认不运行 queue-probe。验收后回收容器与网络（保留所有命名卷）：`docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml down --remove-orphans`；如需单独删除 queue-probe 的 marker 卷，用 `docker volume rm citemind_probe-markers`，不要用 `down -v`，它会一并删除数据库与 Redis 数据。
+- 宿主上验收回环地址（如 `http://127.0.0.1:58080/api/v1/health`）的 HTTP 命令必须绕过代理：PowerShell 用 `curl.exe --noproxy "*" -fsS http://127.0.0.1:58080/api/v1/health`。若 shell 设置了 `HTTP_PROXY`/`HTTPS_PROXY`，回环请求可能被送到代理并返回代理自身的 502，形成伪证据；用 `curl.exe` 而不是 `curl`，因为 PowerShell 的 `curl` 是 `Invoke-WebRequest` 别名。
 
 ## 当前命令
 
@@ -103,9 +111,9 @@ uv run --env-file .env pytest -m integration
 uv run --env-file .env celery -A evidencehub.worker:celery_app worker --pool=solo --loglevel=INFO
 docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml config --quiet
 docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
-docker compose --env-file .env -f deploy/compose/compose.yml up -d --wait
+docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait
 docker compose --env-file .env -f deploy/compose/compose.yml exec -T worker celery -A evidencehub.worker:celery_app inspect ping
-docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe
+docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe queue-probe
 docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml down --remove-orphans
 pnpm install --frozen-lockfile
 pnpm test:jev

@@ -30,6 +30,8 @@ Session Cookie 使用 HttpOnly、SameSite，并在生产环境启用 HTTPS；状
 | `POST /evaluation-runs`、`GET /evaluation-runs/{id}` | 后续受控评估与脱敏结果；不用管理员 bypass 验证权限 |
 | `GET /usage`、`GET /audit-events` | 本人或可管理范围的用量与审计记录 |
 
-内部 inference 接口：`POST /internal/embed` 返回 vectors、dimension、modelRevision、tokenCounts；`POST /internal/rerank`（后续）返回 candidateId 与 score；`GET /health` 检查模型加载。内部接口有凭证、输入条数、字节、token、超时和并发限制，不开放公网，不接受任意模型路径，也不处理用户文档授权。
+当前已实现的 `GET /api/v1/health` 只是 HTTP liveness：返回 `status`、`service`、`environment`，不访问数据库也不代表依赖可用。postgres 自身的 healthcheck 与人工/集成 DSN 验收不能替代未来数据路由的 DB readiness；后续数据路由落地时应新增独立 readiness 探针，不修改现有 health 契约，也不引入 `SELECT 1` 之类探活查询。
+
+内部 inference 接口：`POST /internal/embed` 返回 vectors、dimension、modelRevision、tokenCounts；`POST /internal/rerank`（后续）返回 candidateId 与 score；`GET /health` 检查进程存活，`GET /capabilities` 报告各能力是否就绪。内部接口有凭证、输入条数、字节、token、超时和并发限制，不开放公网，不接受任意模型路径，也不处理用户文档授权。当前实现只有进程/能力边界：`/health` 返回 `modelLoaded=false`，`/capabilities` 返回 `embedding.ready=false`、dimension 与 modelRevision 为 null，`/internal/embed` 缺少或错误 Bearer token 返回 401，token 正确时仍返回 503 `EMBEDDING_NOT_READY` 且响应体不含 vectors；本切片没有真实 embedding、模型权重、torch 或 rerank 路由。
 
 问答 citation 至少含 `citationId`、`displayLabel`、`documentTitle`、`version`、`locator`、`quote`，全部由服务端映射。本次模型只可返回临时引用 ID。`get_current_user` 从数据库会话生成 AuthContext，`require_kb_role` 验证库角色，repository 继续施加文档 ACL；路由层登录校验不能代替资源级授权。

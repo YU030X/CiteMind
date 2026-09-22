@@ -1,0 +1,20 @@
+# frontend.Dockerfile 专用的构建上下文过滤：根 .dockerignore 会排除 frontend/deploy，
+# 这里改为白名单，只放行网关构建需要的根 workspace 清单、frontend 源与 nginx 配置。
+*
+!package.json
+!pnpm-workspace.yaml
+!pnpm-lock.yaml
+!frontend
+!frontend/**
+!deploy
+!deploy/compose
+!deploy/compose/gateway
+!deploy/compose/gateway/nginx.conf
+
+# 运行产物、缓存、构建标记与本地配置不进入构建上下文。
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+**/node_modules
+**/.env
+**/.env.*
