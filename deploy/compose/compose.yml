@@ -6,8 +6,8 @@
 # 第三方镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
 # inference 已能离线编码 kind=document 文本（query 与 rerank 未实现）；worker 写入事务与
 # dispatcher/业务 API 仍未实现。云 LLM 用量账本 llm_usage 由迁移 20260923_0004 落地；
-# 一次性真实探针 evidencehub.llm_probe 默认关闭、不随容器启动，Phase 0 未完全退出的唯一
-# 已知原因是尚未执行一次真实计费探针。
+# 一次性真实探针 evidencehub.llm_probe 默认关闭、不随容器启动，已由用户执行一次真实
+# DeepSeek 成功调用并与 llm_usage 落账回读；Phase 0 工程底座退出条件据此达成。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
 #   docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait

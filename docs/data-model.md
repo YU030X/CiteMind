@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收。认证、会话、文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。认证、会话、文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -37,7 +37,7 @@
 | --- | --- | --- |
 | `llm_usage` | id, provider, model, stage, status, error_code, usage_source, attempt, prompt_tokens, completion_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens, latency_ms, price_snapshot, price_source, price_currency, cost_amount, created_at | `status IN (SUCCEEDED, FAILED, TIMEOUT)`；`usage_source IN (PROVIDER_REPORTED, UNKNOWN)`；`attempt >= 1`；所有 token、`latency_ms`、`cost_amount` 非负；成功行必须 `usage_source = PROVIDER_REPORTED` 且 prompt/completion tokens 非空；非成功行必须带 `error_code`；`price_source`、`price_currency`、`cost_amount` 三者必须同时为空或同时非空。api SELECT+INSERT，worker 无权限 |
 
-一次 provider attempt 恰好一行：失败、超时与凭据错误也必须追加事实，provider 未报告 usage 时不得伪造 token，该行只能是 `FAILED`/`TIMEOUT` 且 token 与费用为 NULL。表按应用语义不可变：api 没有 UPDATE/DELETE 权限，也没有对应触发器提供更新。`price_snapshot`、`price_source`、`price_currency`、`cost_amount` 为将来显式价目快照预留，本切片的一次性探针始终写 NULL，因此该表当前不承担费用核算。真实 PostgreSQL 迁移与授权验收由 `tests/integration/test_llm_usage_migration.py` 承担，未配置测试 DSN 时按守卫跳过。
+一次 provider attempt 恰好一行：失败、超时与凭据错误也必须追加事实，provider 未报告 usage 时不得伪造 token，该行只能是 `FAILED`/`TIMEOUT` 且 token 与费用为 NULL。表按应用语义不可变：api 没有 UPDATE/DELETE 权限，也没有对应触发器提供更新。`price_snapshot`、`price_source`、`price_currency`、`cost_amount` 为将来显式价目快照预留，一次性探针写入的这次真实成功行的四个价目/费用字段同样为 NULL，因此该表当前只承载 provider 报告的 token 事实，不承担费用核算。真实 PostgreSQL 迁移与授权验收由 `tests/integration/test_llm_usage_migration.py` 承担，未配置测试 DSN 时按守卫跳过。
 
 ## 计划中：后续切片
 

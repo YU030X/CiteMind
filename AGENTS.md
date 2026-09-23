@@ -20,6 +20,7 @@
 - 先运行与改动对应的聚焦检查；跨进程任务、权限、数据库和模型行为按 [开发约定](docs/development.md)与[评估计划](docs/evaluation.md)进行真实环境验收。只报告实际运行的命令与结果。
 - 修改技术契约时更新其归属文档。长期有效的决策理由单独记录为 Agent Note；局部机械修改不需要记录，不把历史推理写进当前行为文档。
 - 给用户的 shell 命令保持单行。实际入口建成后才记录可执行命令，不保留占位命令。
+- 准备提交前先加载仓库内的 Git 工作流 skill（[.agents/skills/git-workflow/SKILL.md](.agents/skills/git-workflow/SKILL.md)），按其提交信息格式、提交粒度与提交前检查执行。
 
 ## Agent orchestration
 
@@ -30,6 +31,8 @@ The primary agent is the coordinator, reviewer, and final integrator. It should 
 The primary agent may perform small read-only checks when needed to audit a result or resolve coordination state, but it should not take over work that can reasonably be delegated.
 
 ### Herdr execution model
+
+use deepseek model
 
 Create subagents through the `subagent` tool provided by `pi-herdr-subagents`.
 
