@@ -35,3 +35,5 @@ Session Cookie 使用 HttpOnly、SameSite，并在生产环境启用 HTTPS；状
 内部 inference 接口：`POST /internal/embed` 返回 vectors、dimension、modelRevision、tokenCounts；`POST /internal/rerank`（后续）返回 candidateId 与 score；`GET /health` 检查进程存活，`GET /capabilities` 报告各能力是否就绪。内部接口有凭证、输入条数、字节、token、超时和并发限制，不开放公网，不接受任意模型路径，也不处理用户文档授权。当前实现会在启动时从本地目录加载构建期烘入的固定 revision 模型（缺失或不符即启动失败）：`/health` 返回 `modelLoaded=true`，`/ready` 与 `/capabilities` 报告 `embedding.ready=true`、dimension=512 与冻结 modelRevision，`/internal/embed` 缺少或错误 Bearer token 返回 401、`kind=document` 返回 512 维 L2 归一化向量与 tokenCounts、`kind=query` 因 Literal 校验返回 422；rerank 路由未实现，`/capabilities` 如实报告 rerank.ready=false。
 
 问答 citation 至少含 `citationId`、`displayLabel`、`documentTitle`、`version`、`locator`、`quote`，全部由服务端映射。本次模型只可返回临时引用 ID。`get_current_user` 从数据库会话生成 AuthContext，`require_kb_role` 验证库角色，repository 继续施加文档 ACL；路由层登录校验不能代替资源级授权。
+
+云 LLM 一次性探针是命令行入口 `evidencehub.llm_probe`，不是 HTTP API：本切片未新增或默认启用任何路由，也未开放文档正文；`GET /usage` 仍属计划接口。探针只向固定供应商 endpoint 发一次请求，并只把 provider 报告的 usage 事实写入 `llm_usage`。

@@ -12,6 +12,7 @@ ALEMBIC_INI = REPO_ROOT / "alembic.ini"
 PGVECTOR_REVISION = "20260921_0001"
 CORE_REVISION = "20260922_0002"
 SECOND_SLICE_REVISION = "20260922_0003"
+LLM_USAGE_REVISION = "20260923_0004"
 
 CORE_TABLES = (
     "index_profile",
@@ -22,7 +23,8 @@ CORE_TABLES = (
     "outbox_event",
 )
 SECOND_SLICE_TABLES = ("index_generation", "chunk", "chunk_embedding")
-ALL_TABLES = CORE_TABLES + SECOND_SLICE_TABLES
+LLM_USAGE_TABLES = ("llm_usage",)
+ALL_TABLES = CORE_TABLES + SECOND_SLICE_TABLES + LLM_USAGE_TABLES
 
 EXPECTED_CHECK_CONSTRAINTS = (
     "ck_index_profile_dimension_is_512",
@@ -45,6 +47,18 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_chunk_chunk_index_non_negative",
     "ck_chunk_text_non_empty",
     "ck_chunk_token_count_non_negative",
+    "ck_llm_usage_status",
+    "ck_llm_usage_usage_source",
+    "ck_llm_usage_attempt_positive",
+    "ck_llm_usage_prompt_tokens_non_negative",
+    "ck_llm_usage_completion_tokens_non_negative",
+    "ck_llm_usage_cache_hit_tokens_non_negative",
+    "ck_llm_usage_cache_miss_tokens_non_negative",
+    "ck_llm_usage_latency_ms_non_negative",
+    "ck_llm_usage_cost_amount_non_negative",
+    "ck_llm_usage_succeeded_requires_provider_usage",
+    "ck_llm_usage_failure_has_error_code",
+    "ck_llm_usage_price_consistent",
 )
 
 SECOND_SLICE_GRANTS = (
@@ -56,6 +70,7 @@ SECOND_SLICE_GRANTS = (
     "GRANT SELECT, INSERT ON TABLE chunk_embedding TO citemind_worker;",
 )
 FIRST_SLICE_GRANT_COUNT = 11
+LLM_USAGE_GRANTS = ("GRANT SELECT, INSERT ON TABLE llm_usage TO citemind_api;",)
 
 
 def alembic_config() -> Config:
@@ -68,14 +83,17 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [SECOND_SLICE_REVISION]
+    assert script_directory.get_heads() == [LLM_USAGE_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
-    core = script_directory.get_revision(CORE_REVISION)
+    llm_usage = script_directory.get_revision(LLM_USAGE_REVISION)
     second_slice = script_directory.get_revision(SECOND_SLICE_REVISION)
+    core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert llm_usage.down_revision == SECOND_SLICE_REVISION
     assert second_slice.down_revision == CORE_REVISION
+    assert second_slice.nextrev == {LLM_USAGE_REVISION}
     assert core.down_revision == PGVECTOR_REVISION
     assert core.nextrev == {SECOND_SLICE_REVISION}
     assert legacy.down_revision is None
@@ -90,7 +108,7 @@ def test_legacy_pgvector_migration_test_still_only_covers_its_own_revision() -> 
     assert f'PGVECTOR_REVISION = "{PGVECTOR_REVISION}"' in source
 
 
-def test_offline_upgrade_sql_covers_the_nine_business_tables(
+def test_offline_upgrade_sql_covers_the_business_tables(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     command.upgrade(alembic_config(), "head", sql=True)
@@ -137,7 +155,7 @@ def test_offline_upgrade_sql_has_vector_gin_partial_unique_and_ingest_job_fk(
     )
 
 
-def test_offline_upgrade_sql_grants_the_second_slice_exactly(
+def test_offline_upgrade_sql_grants_the_business_tables_exactly(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     command.upgrade(alembic_config(), "head", sql=True)
@@ -147,9 +165,35 @@ def test_offline_upgrade_sql_grants_the_second_slice_exactly(
         assert f"REVOKE ALL ON TABLE {table} FROM PUBLIC;" in output
         for statement in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
             assert f"GRANT {statement} ON TABLE {table}" not in output
-    assert output.count("GRANT ") == FIRST_SLICE_GRANT_COUNT + len(SECOND_SLICE_GRANTS)
+    assert output.count("GRANT ") == (
+        FIRST_SLICE_GRANT_COUNT + len(SECOND_SLICE_GRANTS) + len(LLM_USAGE_GRANTS)
+    )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
+
+
+def test_offline_upgrade_sql_grants_llm_usage_only_to_api(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(alembic_config(), "head", sql=True)
+    output = capsys.readouterr().out
+
+    assert "REVOKE ALL ON TABLE llm_usage FROM PUBLIC;" in output
+    for grant in LLM_USAGE_GRANTS:
+        assert grant in output
+    for statement in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "UPDATE"):
+        assert f"GRANT {statement} ON TABLE llm_usage" not in output
+    assert "llm_usage TO citemind_worker" not in output
+    assert "ON llm_usage" not in output
+
+
+def test_offline_downgrade_sql_removes_llm_usage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(alembic_config(), f"{LLM_USAGE_REVISION}:{SECOND_SLICE_REVISION}", sql=True)
+    output = capsys.readouterr().out
+
+    assert "DROP TABLE llm_usage;" in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(

@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二切片的 `index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)` 列约束已由迁移 `20260922_0003` 落地并在真实 PostgreSQL 上验收；认证、会话、文档 ACL、缓存和问答表仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收。认证、会话、文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -29,6 +29,16 @@
 
 `ingest_job.generation_id` 可空并 `ON DELETE/UPDATE RESTRICT`；既有 API/worker 授权不扩大。`chunk` 的 `organization_id`、`kb_id`、`document_id`、`version_id` 是来源冗余字段（来自 [入库](ingestion.md) 要求），本切片没有 worker 写路径，因此**数据库尚未强制** `generation → version → document → KB/organization` 的跨表一致性，也没有在结构上强制 `chunk_embedding.profile_id` 与所属 generation 的 profile 一致；这两项不变量必须由未来的 worker 写入事务及其集成测试核对，检索不得信任客户端提交的来源字段。`chunk_embedding` 的 512 维列约束已用真实插入（512 维成功、非 512 维失败）验收，但不代表 ANN 检索或权限过滤下的召回已经实现。
 
+## 已实现：第三切片（迁移 20260923_0004）
+
+迁移 `20260923_0004_llm_usage` 紧接 `20260922_0003`，创建 append-only 的 `llm_usage` 用量账本。表由迁移账号创建，`REVOKE ALL ... FROM PUBLIC` 后显式 GRANT：api 只有 SELECT+INSERT，worker 无任何权限，不授权 UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER。不使用 PostgreSQL ENUM、serial/identity/sequence、触发器或 ANN 索引；本表也不建二级索引。
+
+| 表 | 主要字段 | 关键约束与 ACL |
+| --- | --- | --- |
+| `llm_usage` | id, provider, model, stage, status, error_code, usage_source, attempt, prompt_tokens, completion_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens, latency_ms, price_snapshot, price_source, price_currency, cost_amount, created_at | `status IN (SUCCEEDED, FAILED, TIMEOUT)`；`usage_source IN (PROVIDER_REPORTED, UNKNOWN)`；`attempt >= 1`；所有 token、`latency_ms`、`cost_amount` 非负；成功行必须 `usage_source = PROVIDER_REPORTED` 且 prompt/completion tokens 非空；非成功行必须带 `error_code`；`price_source`、`price_currency`、`cost_amount` 三者必须同时为空或同时非空。api SELECT+INSERT，worker 无权限 |
+
+一次 provider attempt 恰好一行：失败、超时与凭据错误也必须追加事实，provider 未报告 usage 时不得伪造 token，该行只能是 `FAILED`/`TIMEOUT` 且 token 与费用为 NULL。表按应用语义不可变：api 没有 UPDATE/DELETE 权限，也没有对应触发器提供更新。`price_snapshot`、`price_source`、`price_currency`、`cost_amount` 为将来显式价目快照预留，本切片的一次性探针始终写 NULL，因此该表当前不承担费用核算。真实 PostgreSQL 迁移与授权验收由 `tests/integration/test_llm_usage_migration.py` 承担，未配置测试 DSN 时按守卫跳过。
+
 ## 计划中：后续切片
 
 以下实体与字段仍未实现。
@@ -52,8 +62,8 @@
 
 第一切片已实现的索引与唯一约束：`document(kb_id,lifecycle_status)`、`ingest_job(status,next_run_at)`、`outbox_event(status,next_send_at)` 三个二级索引，以及 `index_profile(config_hash)`、`document_version(document_id,version_no)`、`ingest_job(dedupe_key)` 三个唯一约束。所有表的主键都是 `pk_<table>`，全部具名 CHECK、外键与索引遵循同一命名规则。
 
-第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。其中部分唯一索引是并发发布的最后约束。以下仍是计划，尚未实现：`auth_session(token_hash)` 唯一索引、`kb_member(user_id,kb_id)` 和 `query_run(user_id,created_at)`。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
+第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。其中部分唯一索引是并发发布的最后约束。以下仍是计划，尚未实现：`auth_session(token_hash)` 唯一索引、`kb_member(user_id,kb_id)` 和 `query_run(user_id,created_at)`。第三切片的 `llm_usage` 不建二级索引与唯一约束，只有主键与具名 CHECK。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
 
 文件、向量、聊天与审计按用途分开保留，保留策略尚未实现。演示环境计划保留原文及最近 3 版索引、查询明细 30 天、脱敏汇总 90 天；删除文档先禁止访问，再按保留策略清理文件、chunk、向量缓存和引用正文。保留期限和清理作业须在实现时由配置与测试固定，不能仅靠本页文字生效。
 
-第一切片与第二切片的真实 PostgreSQL 迁移验收分别由 `tests/integration/test_core_migration.py` 与 `tests/integration/test_second_slice_migration.py` 承担，并已在 PostgreSQL 17.11 + pgvector 0.8.6 的专用测试库（`127.0.0.1:55433`）上通过：第二切片聚焦测试 9 passed，全部 integration 为 25 passed。覆盖 9 张表、具名约束、GIN 与部分唯一索引、无 sequence/ENUM/ANN、PUBLIC 收权、api/worker 差异、512 维可插入与非 512 维被拒、主键与部分唯一冲突，finally 降级回 `20260922_0002` 与 base 后第一切片 6 表仍完整、新对象与授权无残留；未配置 `CITEMIND_TEST_DATABASE_URL` 与 `CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB=1` 时按守卫跳过，跳过不代表通过。
+第一切片与第二切片的真实 PostgreSQL 迁移验收分别由 `tests/integration/test_core_migration.py` 与 `tests/integration/test_second_slice_migration.py` 承担：第二切片聚焦测试 9 passed、当时全部 integration 为 25 passed，覆盖 9 张表、具名约束、GIN 与部分唯一索引、无 sequence/ENUM/ANN、PUBLIC 收权、api/worker 差异、512 维可插入与非 512 维被拒、主键与部分唯一冲突，finally 降级回 `20260922_0002` 与 base 后第一切片 6 表仍完整、新对象与授权无残留。第三切片由 `tests/integration/test_llm_usage_migration.py` 承担，核对 append-only 表、具名约束、PUBLIC 收权、api 仅 SELECT+INSERT、worker 无权限、成功/失败/超时事实与非负约束，已在用 `.env.example` 开发占位密码启动的隔离 Compose 专用测试库上运行：聚焦 13 passed，全部 integration 38 passed、2 skipped（跳过的 2 个是未配置 Redis 的 broker 用例）；该测试在 finally 降级回 `20260922_0003` 与 base 后确认无残留。未配置 `CITEMIND_TEST_DATABASE_URL` 与 `CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB=1` 时按守卫跳过，跳过不代表通过。

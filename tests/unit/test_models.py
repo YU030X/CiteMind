@@ -18,7 +18,8 @@ FIRST_SLICE_TABLES = {
     "outbox_event",
 }
 SECOND_SLICE_TABLES = {"index_generation", "chunk", "chunk_embedding"}
-EXPECTED_TABLES = FIRST_SLICE_TABLES | SECOND_SLICE_TABLES
+LLM_USAGE_TABLES = {"llm_usage"}
+EXPECTED_TABLES = FIRST_SLICE_TABLES | SECOND_SLICE_TABLES | LLM_USAGE_TABLES
 
 # chunk_embedding 的主键来自 chunk，不是应用新生成的 UUID。
 UUID_PK_TABLES = EXPECTED_TABLES - {"chunk_embedding"}
@@ -100,6 +101,21 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "fk_chunk_embedding_chunk_id_chunk",
         "fk_chunk_embedding_profile_id_index_profile",
     },
+    "llm_usage": {
+        "pk_llm_usage",
+        "ck_llm_usage_status",
+        "ck_llm_usage_usage_source",
+        "ck_llm_usage_attempt_positive",
+        "ck_llm_usage_prompt_tokens_non_negative",
+        "ck_llm_usage_completion_tokens_non_negative",
+        "ck_llm_usage_cache_hit_tokens_non_negative",
+        "ck_llm_usage_cache_miss_tokens_non_negative",
+        "ck_llm_usage_latency_ms_non_negative",
+        "ck_llm_usage_cost_amount_non_negative",
+        "ck_llm_usage_succeeded_requires_provider_usage",
+        "ck_llm_usage_failure_has_error_code",
+        "ck_llm_usage_price_consistent",
+    },
 }
 
 EXPECTED_INDEXES = {
@@ -114,7 +130,7 @@ EXPECTED_INDEXES = {
 }
 
 
-def test_metadata_contains_the_nine_business_tables() -> None:
+def test_metadata_contains_the_expected_business_tables() -> None:
     assert set(metadata.tables) == EXPECTED_TABLES
 
 
@@ -302,3 +318,101 @@ def test_no_ann_indexes_are_defined() -> None:
 def test_chunk_business_columns_are_not_nullable() -> None:
     for column in metadata.tables["chunk"].columns:
         assert column.nullable is False, column.name
+
+
+def test_llm_usage_has_only_the_frozen_columns() -> None:
+    table = metadata.tables["llm_usage"]
+
+    assert [column.name for column in table.columns] == [
+        "id",
+        "provider",
+        "model",
+        "stage",
+        "status",
+        "error_code",
+        "usage_source",
+        "attempt",
+        "prompt_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "latency_ms",
+        "price_snapshot",
+        "price_source",
+        "price_currency",
+        "cost_amount",
+        "created_at",
+    ]
+
+
+def test_llm_usage_optional_columns_are_nullable() -> None:
+    table = metadata.tables["llm_usage"]
+
+    for name in (
+        "error_code",
+        "prompt_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "latency_ms",
+        "price_snapshot",
+        "price_source",
+        "price_currency",
+        "cost_amount",
+    ):
+        assert table.columns[name].nullable is True, name
+
+    for name in ("provider", "model", "stage", "status", "usage_source", "attempt"):
+        assert table.columns[name].nullable is False, name
+
+
+def test_llm_usage_cost_amount_is_fixed_precision_numeric() -> None:
+    column = metadata.tables["llm_usage"].columns["cost_amount"]
+
+    assert isinstance(column.type, sa.Numeric)
+    assert column.type.precision == 18
+    assert column.type.scale == 8
+
+
+def _llm_usage_check(name: str) -> sa.CheckConstraint:
+    (check,) = [
+        constraint
+        for constraint in metadata.tables["llm_usage"].constraints
+        if constraint.name == f"ck_llm_usage_{name}"
+    ]
+    assert isinstance(check, sa.CheckConstraint)
+    return check
+
+
+def test_llm_usage_success_requires_provider_reported_usage() -> None:
+    sql_text = str(_llm_usage_check("succeeded_requires_provider_usage").sqltext)
+
+    assert "SUCCEEDED" in sql_text
+    assert "PROVIDER_REPORTED" in sql_text
+    assert "prompt_tokens IS NOT NULL" in sql_text
+    assert "completion_tokens IS NOT NULL" in sql_text
+
+
+def test_llm_usage_failure_requires_an_error_code() -> None:
+    sql_text = str(_llm_usage_check("failure_has_error_code").sqltext)
+
+    assert "SUCCEEDED" in sql_text
+    assert "error_code IS NOT NULL" in sql_text
+
+
+def test_llm_usage_price_snapshot_fields_are_all_or_none() -> None:
+    sql_text = str(_llm_usage_check("price_consistent").sqltext)
+
+    for column in ("price_source", "price_currency", "cost_amount"):
+        assert column in sql_text
+
+
+def test_llm_usage_status_and_usage_source_are_enumerated() -> None:
+    status_sql = str(_llm_usage_check("status").sqltext)
+    source_sql = str(_llm_usage_check("usage_source").sqltext)
+
+    assert "SUCCEEDED" in status_sql
+    assert "FAILED" in status_sql
+    assert "TIMEOUT" in status_sql
+    assert "PROVIDER_REPORTED" in source_sql
+    assert "UNKNOWN" in source_sql

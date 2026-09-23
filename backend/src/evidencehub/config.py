@@ -2,7 +2,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import SplitResult, urlsplit
 
-from pydantic import model_validator
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -55,7 +55,7 @@ def validate_database_url(database_url: str) -> URL:
 
 
 class Settings(BaseSettings):
-    """API 进程的启动配置。"""
+    """API 进程与一次性云 LLM 探针共享的启动配置。"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     probe_marker_directory: str | None = None
     # queue-probe 一次性验收入口等待 marker 的时限；只用于 Linux Compose 验收。
     queue_probe_timeout_seconds: float = 60.0
+    # 产品专用 DeepSeek 密钥；仅由显式 opt-in 的一次性探针读取，默认不配置。
+    # 与开发期 Node Jev 专用的 AI_GATEWAY_API_KEY 无关，后者没有 CITEMIND_ 前缀，
+    # 不会进入本配置或 api/worker 运行时。
+    llm_api_key: SecretStr | None = None
+    # 一次性真实探针必须显式开启；默认关闭，避免启动或测试自动发起收费调用。
+    allow_llm_probe: bool = False
+    # 云生成模型名保持配置化；默认值来自供应商文档，实际可用性由真实探针核对。
+    llm_model: str = "deepseek-flash"
 
     @model_validator(mode="after")
     def validate_configuration(self) -> "Settings":
@@ -103,6 +111,11 @@ class Settings(BaseSettings):
             raise ValueError("probe_marker_directory 不能为空字符串；应留空或提供受信目录")
         if self.queue_probe_timeout_seconds <= 0:
             raise ValueError("queue_probe_timeout_seconds 必须为正数")
+        if self.llm_api_key is not None and not self.llm_api_key.get_secret_value().strip():
+            # 空白值等于未配置密钥，避免探针把空字符串当成凭据。
+            self.llm_api_key = None
+        if not self.llm_model.strip():
+            raise ValueError("llm_model 不能为空字符串")
         return self
 
 
