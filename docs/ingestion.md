@@ -1,14 +1,15 @@
 # 文档入库、索引与版本
 
-> 本文描述完整的 Markdown 与可提取文本 PDF 入库契约。当前只实现了 Markdown 上传受理（`POST /api/v1/knowledge-bases/{kb_id}/documents`）：校验、KB 私有内容寻址保存，以及单事务写入 `document`/`document_version`/`ingest_job`/`outbox_event` 并返回 `202`。outbox dispatcher 与 worker 接收壳代码已写：API 单进程 lifespan 可按配置运行 dispatcher，Compose 的 api 服务显式启用而宿主 Settings 默认关闭；真实 PostgreSQL/Redis 投递、worker 接收标记与重复投递、应用层故障注入、物理 Redis 停启后同一 publisher 退避再 SENT，以及 worker 被 kill 后的补偿补投与幂等收敛由仓库外隔离手工探针实测（不在 pytest 自动用例内；见 [开发约定](development.md)），但 Linux 容器 prefork 下的业务故障恢复、自然 3600 秒 visibility 重投、多 worker 并发、手工恢复 `DELIVERY_UNCONFIRMED` SQL 与 API 日志超过 12 轮仍未验收。接收壳只校验 job 状态、版本归属与文档 tombstone，并写 job 级接收标记（`lease_owner=event:<id>`、heartbeat、`error_code=HANDLER_NOT_READY`），job 状态仍为 `QUEUED`；outbox `SENT` 只表示 broker 投递，不等于 worker 解析或入库。解析、切分、编码、索引发布、检索与文件回收均未实现，不能据此声称任何文档可被检索。第二切片的 `index_generation`、`chunk` 与 `chunk_embedding` 存储 schema（含 512 维向量列、`GIN(fts)` 与部分唯一索引）已由迁移 `20260922_0003` 落地，但 worker 写入路径、跨表来源一致性核对和发布事务仍未实现。MVP 目标格式为 Markdown 与可提取文本的 PDF；DOCX 与静态网页属于后续完整范围，PDF 与下文其余格式当前均未实现。
+> 本文描述完整的 Markdown 与可提取文本 PDF 入库契约。当前已实现的入库能力是 Markdown 上传受理（`POST /api/v1/knowledge-bases/{kb_id}/documents`：校验、KB 私有内容寻址保存，以及单事务写入 `document`/`document_version`/`ingest_job`/`outbox_event` 并返回 `202`）与纯 Markdown 解析/切分（纯内存，未落库，见“来源定位与切分”）。outbox dispatcher 与 worker 接收壳代码已写：API 单进程 lifespan 可按配置运行 dispatcher，Compose 的 api 服务显式启用而宿主 Settings 默认关闭；真实 PostgreSQL/Redis 投递、worker 接收标记与重复投递、应用层故障注入为 pytest 自动集成，物理 Redis 停启后同一 publisher 退避再 SENT、worker 被 kill 后的补偿补投与幂等收敛由仓库外隔离手工探针实测（见 [开发约定](development.md)），但 Linux 容器 prefork 下的业务故障恢复、自然 3600 秒 visibility 重投、多 worker 并发、手工恢复 `DELIVERY_UNCONFIRMED` SQL 与 API 日志超过 12 轮仍未验收。接收壳只校验 job 状态、版本归属与文档 tombstone，并写 job 级接收标记（`lease_owner=event:<id>`、heartbeat、`error_code=HANDLER_NOT_READY`），job 状态仍为 `QUEUED`；outbox `SENT` 只表示 broker 投递，不等于 worker 解析或入库。纯 Markdown 解析与切分已实现并独立验收（见下文），但尚未接入 worker、未读 blob、未写入 `generation`/`chunk`/`chunk_embedding`，也未接入真实模型 tokenizer；编码、索引发布、检索与文件回收仍未实现，不能据此声称任何文档可被检索。第二切片的 `index_generation`、`chunk` 与 `chunk_embedding` 存储 schema（含 512 维向量列、`GIN(fts)` 与部分唯一索引）已由迁移 `20260922_0003` 落地，但 worker 写入路径、跨表来源一致性核对和发布事务仍未实现。MVP 目标格式为 Markdown 与可提取文本的 PDF；DOCX 与静态网页属于后续完整范围，PDF 与下文其余格式当前均未实现。
 
 ## 入库状态与流程
 
 1. 已实现：API 校验 KB `EDITOR` 角色、`Origin`、CSRF、必填 `Idempotency-Key`、`.md`/`.markdown` 后缀、有效 UTF-8 文本与 20,000,000 字节单文件上限；授权、CSRF、Origin 与接收阶段体积上限都在读取 multipart 正文之前完成。原文件存入 api 进程私有的 `api-documents` 命名卷（容器路径 `/var/lib/citemind/documents`，由可选配置 `DOCUMENT_STORAGE_DIRECTORY` 指定），相对路径只由服务端 `knowledge_base.id` 与内容 SHA-256 派生（`{kb_id}/{sha256}`），不拼接用户文件名。真实 MIME/PDF 页数校验、PDF 支持与 KB 配额未实现（KB 配额没有对应存储字段或实体）。
-2. 已实现：同一 KB、同一 `Idempotency-Key`、同内容且同标题的重复上传复用已有任务并返回同一组 id；内容或标题任一不同返回 409，跨 KB 的去重键互相独立且不通过冲突响应暴露其他 KB 的 key 使用情况。去重键是组织+KB+规范化 key 的 SHA-256，不保存也不回显原始 key。并发同 key 由唯一约束拒绝后回滚重读，再按复用/冲突规则处理。上传事务一并写入 `document`（`CREATED`、`active_version_id=NULL`、`source_type=markdown`）、`document_version`（`version_no=1`、`PENDING`、`parser_version=markdown-v1`，该版本仅登记契约、本切片不解析正文）、`ingest_job`（`QUEUED`、`attempt=0`）与 `outbox_event`（`ingest.requested`、`PENDING`），提交后返回 `202`；这时文档仍不可检索。
+2. 已实现：同一 KB、同一 `Idempotency-Key`、同内容且同标题的重复上传复用已有任务并返回同一组 id；内容或标题任一不同返回 409，跨 KB 的去重键互相独立且不通过冲突响应暴露其他 KB 的 key 使用情况。去重键是组织+KB+规范化 key 的 SHA-256，不保存也不回显原始 key。并发同 key 由唯一约束拒绝后回滚重读，再按复用/冲突规则处理。上传事务一并写入 `document`（`CREATED`、`active_version_id=NULL`、`source_type=markdown`）、`document_version`（`version_no=1`、`PENDING`、`parser_version=markdown-v1`，该版本是占位登记值、上传事务不调用解析器）、`ingest_job`（`QUEUED`、`attempt=0`）与 `outbox_event`（`ingest.requested`、`PENDING`），提交后返回 `202`；这时文档仍不可检索。
 3. 目标（未实现）：worker 按 `QUEUED → PARSING → CHUNKING → EMBEDDING → INDEXING → READY` 执行，记录阶段、进度、错误码与尝试次数。解析限制为单次 60 秒，超时要终止实际解析子进程。永久格式错误进入 FAILED；临时故障最多重试 3 次。dispatcher 与 worker 接收壳已在隔离 PostgreSQL/Redis/Celery 上验收（投递与应用层故障注入为 pytest 自动集成，物理 Redis 停启与 worker 被 kill 后补投由仓库外隔离手工探针实测）；接收壳只写接收标记，不进入 PARSING，`QUEUED` 任务尚未真正处理。
-4. 目标（未实现）：解析器生成有位置映射的结构块；切分后保存 chunk 文本、token 数、hash、来源 locator、解析器与切分器版本。对缓存未命中的模型输入批量编码，将向量、FTS 与 locator 写入不可见的 staging generation。
-5. 目标（未实现）：校验 chunk 数、非空文本、向量维度、映射和预期文档版本后，在锁定文档的事务中发布 READY generation 并切换 `active_version_id`。首次导入失败不可检索；更新失败时旧版继续服务。
+4. 已实现（纯内存解析与切分，未落库）：Markdown 解析器（`markdown-it-py==4.2.0`，实现版本 `markdown-it-py-4.2.0-v1`）把原始 UTF-8 字节解析成带来源位置的块：`token.map` 的 0-based 且结束不含边界统一转成 1-based 闭区间；标题按层级维护，进入引用块/列表容器时快照、退出时恢复；段落、列表与 fence/缩进代码块各自成块；原始 HTML 只识别、从不渲染且被排除在正文之外；图片只保留 alt，绝不抓取 URL。`source_sha256` 只按原始 bytes 计算（CRLF 与 Unicode 变化都会反映），解码用 `utf-8-sig` 只忽略文件开头 BOM、不改变行号。切分器把 `heading_path` 与正文拼成完整模型输入后交给注入的 token 计数器，按约 360 目标、约 60 重叠、512 硬上限打包；单块超硬上限时先在 `max_tokens` 处按字符确定性硬拆并保留重叠，短段落不强制重叠，chunk 内容不伪造。`source_locator` 是 `locator_version=1` 的 JSON：含 `source_type`、`parser_version`、`source_sha256`、所跨块的 1-based `start_line`/`end_line`（块级粗粒度行范围，不是精确片段行）、`block_ordinals`，以及每个 piece 在其规范化块正文内的 `block_char_start`/`block_char_end` 字符区间。上传事务目前仍写占位版本 `markdown-v1`（`validation.MARKDOWN_PARSER_VERSION`），与真实解析器版本不一致；本切片不改上传事务。
+5. 目标（未实现）：worker 读取 blob、调用上述纯解析/切分，把 chunk 文本、token 数、hash、来源 locator、解析器与切分器版本写入 `chunk`，对缓存未命中的模型输入批量编码，并把向量、FTS 与 locator 写入不可见的 staging generation；接线前必须统一上传事务登记的解析器版本，并把假计数器换成实际模型 tokenizer 与服务预算。
+6. 目标（未实现）：校验 chunk 数、非空文本、向量维度、映射和预期文档版本后，在锁定文档的事务中发布 READY generation 并切换 `active_version_id`。首次导入失败不可检索；更新失败时旧版继续服务。
 
 已发布的最终 blob 在事务回滚或后续数据库异常时不删除，因为并发事务可能已引用它；这会产生无引用的孤儿文件窗口，本切片不实现 GC，回收与一致性核对留待后续作业。
 
@@ -16,14 +17,14 @@
 
 | 格式 | 解析方式 | 引用位置 | 降级边界 |
 | --- | --- | --- | --- |
-| Markdown | markdown-it-py，保留标题、段落、列表和代码块 | 版本、heading_path、1-based 起止行、原文 hash | token.map 起点是 0-based，结束不含边界；统一转换并测试；展示 HTML 要消毒 |
+| Markdown（纯解析/切分已实现，未落库） | markdown-it-py 4.2.0，保留标题、段落、列表与 fence 代码块；原始 HTML 不渲染且不进正文，图片只取 alt | 解析器版本、heading_path、所跨块的 1-based 块级起止行、`source_sha256`（原始 bytes）、块 ordinal 与块内规范化正文的字符区间 | token.map 起点 0-based、结束不含边界，统一转 1-based 闭区间；行号是块级粗粒度而非精确片段行；展示层必须转义，不能当 HTML |
 | 文本 PDF | pypdf 逐页抽取 | 版本、页码、规范化文本偏移 | MVP 只保证页定位；扫描件标 `NEEDS_OCR`，不把空提取当成功；复杂版面标记质量警告 |
 | DOCX（后续） | python-docx 按原顺序遍历段落和表格 | 版本、heading_path、段落或表格单元格索引 | 不推测 Word 页码；嵌套、合并表格单独验收 |
 | 静态网页（后续） | 受限 HTTPX 抓取，BeautifulSoup4/lxml 清洗正文 | 原 URL、抓取时间、快照 hash、标题路径和 block ID | 不执行 JS、不登录、不递归抓取；保留结构快照与原 HTML |
 
-初始目标为每 chunk 约 360 个实际 tokenizer token、约 60 token 重叠，优先在标题和段落边界切分；短段落不强加重叠。标题、正文与特殊 token 合计不能超过 embedding 模型的 512 长度。PDF 可按页切以保留明确页码；表格序列化时继承表头并记录行范围。复杂跨页表格标低质量，不承诺准确表格推理。
+初始目标为每 chunk 约 360 个实际 tokenizer token、约 60 token 重叠，优先在标题和段落边界切分；短段落不强加重叠。标题、正文与特殊 token 合计不能超过 embedding 模型的 512 长度。已实现的切分器用可注入的假 `TokenCounter` 验证这套预算（target 360 / overlap 60 / max 512），**512 上限目前只对假计数器成立**；真实模型 tokenizer 与服务预算尚未接入，接线前必须统一解析器版本并换成实际推理 tokenizer。PDF 可按页切以保留明确页码；表格序列化时继承表头并记录行范围。复杂跨页表格标低质量，不承诺准确表格推理。
 
-每个 chunk 至少带 `organization_id`、`kb_id`、`document_id`、`version_id`、`generation_id`、`chunk_index`、`heading_path`、`source_locator`、`text_hash`、`token_count`、`parser_version`、`chunker_version`。来源在解析时固定，生成模型不能补猜。
+每个 chunk 至少带 `organization_id`、`kb_id`、`document_id`、`version_id`、`generation_id`、`chunk_index`、`heading_path`、`source_locator`、`text_hash`、`token_count`、`parser_version`、`chunker_version`。来源在解析时固定，生成模型不能补猜。当前纯切分产出的内存 `Chunk` 只含 `chunk_index`、正文、`heading_path`、`token_count`、`text_hash`、`model_input_hash`、`source_locator`、`parser_version`、`chunker_version`；`organization_id`/`kb_id`/`document_id`/`version_id`/`generation_id` 等落库字段尚未接线。定位可用同版本解析器重放加 `segments` 的块内字符区间还原规范化块正文，而不是对原始文件的字节偏移。
 
 ## outbox、租约与恢复
 
