@@ -10,6 +10,8 @@ dependencies = [
   "celery[redis]>=5.6,<6",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  # 中文关键词检索固定使用 jieba 0.42.1：检索切分契约的一部分，不与 PG 分词解耦。
+  "jieba==0.42.1",
   "markdown-it-py==4.2.0",
   "pgvector>=0.4,<1",
   "psycopg[binary]>=3.2,<4",
@@ -59,7 +61,7 @@ python_version = "3.12"
 strict = true
 files = ["backend/src", "migrations", "tests"]
 
-# Celery 与 kombu 尚未发布 py.typed，生产代码中的导入需要显式豁免；redis 客户端自带类型。
+# Celery、kombu 与 jieba 尚未发布 py.typed，生产代码中的导入需要显式豁免；redis 客户端自带类型。
 [[tool.mypy.overrides]]
-module = ["celery", "celery.*", "kombu", "kombu.*"]
+module = ["celery", "celery.*", "kombu", "kombu.*", "jieba"]
 ignore_missing_imports = true

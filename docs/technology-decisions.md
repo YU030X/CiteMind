@@ -11,7 +11,7 @@
 | 向量索引 | 512 维余弦、MVP exact search | 小规模和强权限过滤下优先验证正确性；HNSW 必须与 exact 比较召回、过滤和延迟 |
 | Embedding | 固定 revision 的 BAAI/bge-small-zh-v1.5，CPU | 512 维中文模型作为起点；模型输入、tokenizer、pooling/normalize 与预处理一起版本化。Phase 0 已按 revision `7999e1d3359715c523056ef9478215996d62a620` 在构建期烘入镜像，并以 CLS pooling + L2 归一化离线编码实测通过；加载端在导入 torch 前按包内钉死摘要与 `model-manifest.json` 复核六个产物，覆盖路径也走同一可信字节校验 |
 | 重排 | 后续本地 bge-reranker-base | 只重排融合后 top-10，测质量增益与 CPU 延迟；vps-lite 可明确跳过 |
-| 中文关键词 | jieba 搜索模式 + 版本化领域词典 + tsvector/GIN | 显式保留错误码、简称和代码标识；文档与查询共用管线；需求超过本方案时再评估独立搜索引擎 |
+| 中文关键词 | 固定 `jieba==0.42.1` 搜索模式（私有 `Tokenizer` + `cut_for_search`）+ 版本化领域词典 + tsvector/GIN | 显式保留错误码、简称和代码标识；文档与查询共用同一分析器并参数绑定 `to_tsvector('simple', …)`；分析器标识同时钉死 jieba 基础 `dict.txt` 与领域词典摘要，分词缓存只写构造期私有临时目录（不回退共享 `jieba.cache`，运行时需可写 tmpfs）；词典 v1 为空且按原始字节 SHA-256 冻结，扩词典必须新建 index profile 并重索引，freq=0 词条改动需单独安全评估；需求超过本方案时再评估独立搜索引擎 |
 | 文件和解析 | 鉴权本地卷；按格式保留源位置的轻量解析器 | 小文档集无需自建对象存储集群；OCR 或复杂版面有样本与质量问题后再评估增强解析器 |
 | 推理服务 | 独立单进程 transformers + PyTorch CPU（不使用 sentence-transformers） | 避免 API 与 worker 复制模型内存；模型烘入镜像且运行期离线；同一内部服务按需增加 rerank，先测峰值再扩并发 |
 | 前端 | Vue 3、Vite、TypeScript、Element Plus | 登录后 SPA，无 SSR 需求；PDF.js 与图表只在对应页面需要时引入 |
