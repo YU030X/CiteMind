@@ -157,11 +157,15 @@ services:
 
   worker:
     # 与 API 进程分离的 Celery worker；镜像由本仓库构建，基础镜像按 digest 固定。
-    # worker 不依赖 inference：本切片没有 embedding 任务。
+    # worker 运行时不依赖 inference：embedding 任务仍未实现。构建期只借用 inference
+    # 镜像里已校验的 tokenizer 四件产物做本地真实计数，不使用共享模型卷。
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
       target: worker
+      additional_contexts:
+        # 产物只在 inference 构建期生成；作为具名上下文提供给 Dockerfile 的 COPY --from。
+        model_assets: service:inference
     restart: unless-stopped
     environment:
       ENVIRONMENT: development

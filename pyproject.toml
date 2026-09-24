@@ -25,6 +25,12 @@ dev = [
   "mypy>=1.17,<2",
   "pytest>=8.4,<10",
   "ruff>=0.12,<1",
+  # 本地 dev 组供单测构造 fixture 并对照计数；生产镜像仅 worker stage 安装。
+  "tokenizers==0.23.2",
+]
+worker = [
+  # worker 本地真实 token 计数依赖；api stage 不安装该依赖，也不复制 tokenizer 产物。
+  "tokenizers==0.23.2",
 ]
 
 [build-system]

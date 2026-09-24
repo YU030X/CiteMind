@@ -38,4 +38,14 @@ CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0", "--port", "8000", "
 
 # worker final target：必须是最后一个 stage，未指定 --target 时默认构建它。
 FROM runtime AS worker
+# 只有 worker 需要本地真实 token 计数：tokenizers 依赖只装在 worker stage，api stage 不安装。
+RUN --mount=type=cache,target=/home/citemind/.cache/uv,uid=10001,gid=10001 uv sync --frozen --no-dev --group worker
+# tokenizer 产物只在 inference 构建期生成，通过 Compose 具名构建上下文 model_assets 复制。
+# 只取计数所需的四个文件，使目录内恰为这四个，不含 config.json 与 model.safetensors。
+COPY --from=model_assets /models/bge-small-zh-v1.5/tokenizer.json /models/bge-small-zh-v1.5/tokenizer.json
+COPY --from=model_assets /models/bge-small-zh-v1.5/vocab.txt /models/bge-small-zh-v1.5/vocab.txt
+COPY --from=model_assets /models/bge-small-zh-v1.5/tokenizer_config.json /models/bge-small-zh-v1.5/tokenizer_config.json
+COPY --from=model_assets /models/bge-small-zh-v1.5/special_tokens_map.json /models/bge-small-zh-v1.5/special_tokens_map.json
+# 构建期用标准库逐字节复核四个产物；失败即构建失败，运行期不联网、不重新下载模型。
+RUN python -c "from pathlib import Path; from rag_backend.ingestion.token_counting import verify_tokenizer_directory; verify_tokenizer_directory(Path('/models/bge-small-zh-v1.5'))"
 CMD ["celery", "-A", "rag_backend.worker:celery_app", "worker", "--loglevel=INFO"]

@@ -24,6 +24,10 @@ services:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
       target: worker
+      # worker target 依赖 inference 构建产物里的 tokenizer 四件；queue-probe 复用同一 target，
+      # 因此需要同样的具名构建上下文，否则构建会因缺少 model_assets 直接失败。
+      additional_contexts:
+        model_assets: service:inference
     restart: "no"
     environment:
       ENVIRONMENT: development
