@@ -10,16 +10,45 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
+import stat
 import tempfile
 import uuid
 from pathlib import Path
 
-from rag_backend.ingestion.errors import IngestionError
+from rag_backend.ingestion.errors import (
+    BlobCorrupt,
+    BlobNotFound,
+    BlobTooLarge,
+    BlobUnsafe,
+    DocumentEmpty,
+    DocumentNotText,
+    IngestionError,
+)
+from rag_backend.ingestion.validation import MAX_MARKDOWN_BYTES, decode_markdown_content
 
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
+# 单次读取块大小；只影响内存占用与系统调用次数，不影响 20,000,000 字节上限判定。
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _is_link_like(path: Path) -> bool:
+    """符号链接或 Windows 目录联接点（reparse point）都视为不可信路径。"""
+
+    if os.path.islink(path):
+        return True
+    # ``os.path.isjunction`` 在 Python 3.12+ 可用；缺失的平台按不可信处理。
+    is_junction = getattr(os.path, "isjunction", None)
+    if is_junction is None:
+        return False
+    try:
+        return bool(is_junction(path))
+    except (OSError, ValueError):
+        # 类型无法确认时宁拒绝不放过。
+        return True
 
 
 class InvalidBlobReference(IngestionError):
@@ -66,6 +95,122 @@ class DocumentBlobStore:
 
     def exists(self, file_ref: str) -> bool:
         return self.path_for(file_ref).is_file()
+
+    def read_verified_markdown(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> str:
+        """校验式有限读取：只读取由该 KB 与摘要派生的 blob，返回已校验文本。
+
+        调用方必须同时传入数据库登记的 ``kb_id``、``file_ref`` 与 ``file_hash``。本方法
+        先要求 ``file_ref`` 严格等于服务端由二者派生的路径（含摘要格式校验），再以有界
+        方式读取，最后核对内容摘要并复用上传侧同一套 UTF-8/控制字节校验。除非法
+        ``file_ref`` 抛 ``InvalidBlobReference``（调用方需单独映射）外，缺失、非常规文件、
+        超限、IO 失败与内容损坏都抛出 ``BlobReadError`` 子类，使未来 worker 能单 catch
+        处理所有读失败；错误信息静态，且底层携带路径的 ``OSError`` 用 ``from None`` 抑制。
+        本方法不写数据库，也不决定 job 状态。
+
+        符号链接与联接点防护：只要平台提供 ``os.O_NOFOLLOW`` 就用于打开，随后对同一个
+        已打开文件描述符 ``fstat``；所有平台在打开前还会 ``lstat`` 叶节点并逐段检查存储
+        根到目标之间的父目录是否为符号链接或 Windows 目录联接点（reparse point，不是
+        ``islink``）。但父目录检查与打开之间仍存在 TOCTOU 窗口，纯标准库无法在 Windows
+        上完全消除；该窗口只能通过独占文件系统权限或 ``openat``/句柄相对打开进一步收紧。
+        无论成功、超限还是校验失败，文件描述符都在 ``finally`` 中关闭。
+        """
+
+        # 先做纯字符串级校验：blob_ref 会拒绝非法摘要，file_ref 必须与之完全一致，
+        # 从而拒绝跨 KB、跨摘要或用户构造的任意路径。
+        if file_ref != self.blob_ref(kb_id, file_hash):
+            raise InvalidBlobReference("file_ref 与 kb_id/内容摘要不匹配")
+        target = self.path_for(file_ref)
+        data = self._read_bounded_regular_file(target)
+        if content_hash(data) != file_hash:
+            raise BlobCorrupt("blob 内容摘要与登记值不一致")
+        try:
+            return decode_markdown_content(data)
+        except (DocumentEmpty, DocumentNotText):
+            # 空内容、非法 UTF-8 或二进制控制字节统一按内容损坏处理。
+            raise BlobCorrupt("blob 内容不是有效的 Markdown 文本") from None
+
+    def _read_bounded_regular_file(self, target: Path) -> bytes:
+        """以有界读取返回字节；拒绝符号链接/联接点、非常规文件、缺失与超限。"""
+
+        self._reject_symlinked_parents(target)
+        descriptor = self._open_no_follow(target)
+        try:
+            try:
+                info = os.fstat(descriptor)
+            except OSError:
+                raise BlobUnsafe("无法读取 blob 文件状态") from None
+            if not stat.S_ISREG(info.st_mode):
+                raise BlobUnsafe("blob 不是普通文件")
+            if info.st_size > MAX_MARKDOWN_BYTES:
+                raise BlobTooLarge("blob 超过单文件字节上限")
+            try:
+                return self._read_bytes(descriptor)
+            except OSError:
+                raise BlobUnsafe("读取 blob 文件失败") from None
+        finally:
+            # 只读描述符关闭失败不改变已获得的结果，也不得掩盖前面的领域错误。
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+    def _reject_symlinked_parents(self, target: Path) -> None:
+        """逐段拒绝到目标的符号链接/联接点目录；无法完全消除父目录 TOCTOU。"""
+
+        try:
+            parts = target.relative_to(self._root).parts[:-1]
+        except ValueError:
+            raise BlobUnsafe("blob 路径不在存储根内") from None
+        current = self._root
+        for part in parts:
+            current = current / part
+            if _is_link_like(current):
+                raise BlobUnsafe("blob 所在目录是符号链接或联接点")
+
+    @staticmethod
+    def _open_no_follow(target: Path) -> int:
+        """打开目标文件；可用时带 ``O_NOFOLLOW``，缺失时返回可读文件描述符。"""
+
+        # Windows 没有 O_NOFOLLOW：先 lstat 叶节点，符号链接/联接点在此拒绝；Linux 上
+        # O_NOFOLLOW 让内核在打开的同一时刻拒绝叶符号链接。
+        try:
+            leaf = os.lstat(target)
+        except FileNotFoundError:
+            raise BlobNotFound("blob 文件不存在") from None
+        except OSError:
+            raise BlobUnsafe("无法读取 blob 文件状态") from None
+        if stat.S_ISLNK(leaf.st_mode) or _is_link_like(target):
+            raise BlobUnsafe("blob 文件是符号链接或联接点")
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        # FIFO 上带 O_NONBLOCK 的只读打开不会阻塞；普通文件不受影响。
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            return os.open(target, flags)
+        except FileNotFoundError:
+            raise BlobNotFound("blob 文件不存在") from None
+        except OSError:
+            raise BlobUnsafe("无法以只读方式打开 blob 文件") from None
+
+    @staticmethod
+    def _read_bytes(descriptor: int) -> bytes:
+        """从已校验的文件描述符有界读取；读取中超出上限时立即失败。"""
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor, min(_READ_CHUNK_BYTES, MAX_MARKDOWN_BYTES - total + 1)
+            )
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_MARKDOWN_BYTES:
+                raise BlobTooLarge("blob 超过单文件字节上限")
+            chunks.append(chunk)
 
     def publish(self, kb_id: uuid.UUID, file_hash: str, content: bytes) -> str:
         """原子发布内容到 KB 作用域 blob；已存在同内容普通文件时复用，不重写。

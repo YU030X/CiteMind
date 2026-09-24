@@ -22,7 +22,7 @@ flowchart LR
   API --> LLM[云 LLM]
 ```
 
-单仓库、Python 模块化单体，按 API、worker、inference 三种进程角色运行。PostgreSQL 是用户、文档、任务、版本、向量与关键词索引的事实来源；Redis 仅用于消息投递和短期限流。文件保存在项目专用卷，由 API 鉴权后读取，不提供永久公开 URL。前端作为静态资源由网关提供。低配实例的 outbox dispatcher 由唯一 API 进程的 lifespan 按配置承载（`DISPATCHER_ENABLED`，宿主默认关闭、Compose 显式开启）；多 API 实例时拆成单独进程，领取事件必须依赖数据库租约。
+单仓库、Python 模块化单体，按 API、worker、inference 三种进程角色运行。PostgreSQL 是用户、文档、任务、版本、向量与关键词索引的事实来源；Redis 仅用于消息投递和短期限流。文件保存在 `api-documents` 专用卷：API 写入，API 读取前先鉴权；worker 以只读方式挂载同一卷供未来入库读取（`read_verified_markdown` 已实现，但尚未接线），inference 不挂载；不提供永久公开 URL。前端作为静态资源由网关提供。低配实例的 outbox dispatcher 由唯一 API 进程的 lifespan 按配置承载（`DISPATCHER_ENABLED`，宿主默认关闭、Compose 显式开启）；多 API 实例时拆成单独进程，领取事件必须依赖数据库租约。
 
 建议后端包边界：`api` 处理 HTTP 和依赖注入，`schemas` 负责输入输出契约，`auth` 产生服务端授权上下文，`knowledge`/`ingestion`/`retrieval`/`conversation`/`generation`/`evaluation` 承担用例，`parsing`/`indexing` 负责离线处理，repository 负责参数化 SQL。inference 仅暴露受限的内部 embedding/rerank 接口，不判断用户权限。
 

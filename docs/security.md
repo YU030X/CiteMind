@@ -14,7 +14,7 @@ KB 成员授权的服务端判定已实现：`require_kb_role` 每次请求都�
 
 ## 输入与文件
 
-Markdown 上传（`POST /api/v1/knowledge-bases/{id}/documents`）已实现输入校验与文件隔离：服务端在读取 multipart 正文之前先完成会话鉴权（对目标 KB 至少 `EDITOR`）、`Origin` 白名单与 `X-CSRF-Token` 校验，以及接收阶段的请求体字节上限；未授权请求不会把正文落盘。只按客户端字节判定，不信任声明的 MIME：后缀必须是 `.md`/`.markdown`，内容必须是有效 UTF-8 且不含二进制控制字符，单文件最多 20,000,000 字节，空内容与伪装成文本的二进制都拒绝。原文件存入 api 进程私有的 `api-documents` 命名卷，相对路径只由服务端 KB id 与内容 SHA-256 派生，不拼接用户文件名；写入先落同目录临时文件、`fsync` 后原子替换，失败只清理本次临时文件。事务冲突时已发布的最终 blob 不删除（并发事务可能已引用），因此数据库异常等路径可能留下孤儿文件，本切片没有 GC 作业。
+Markdown 上传（`POST /api/v1/knowledge-bases/{id}/documents`）已实现输入校验与文件隔离：服务端在读取 multipart 正文之前先完成会话鉴权（对目标 KB 至少 `EDITOR`）、`Origin` 白名单与 `X-CSRF-Token` 校验，以及接收阶段的请求体字节上限；未授权请求不会把正文落盘。只按客户端字节判定，不信任声明的 MIME：后缀必须是 `.md`/`.markdown`，内容必须是有效 UTF-8 且不含二进制控制字符，单文件最多 20,000,000 字节，空内容与伪装成文本的二进制都拒绝。原文件由 API 写入 `api-documents` 命名卷，相对路径只由服务端 KB id 与内容 SHA-256 派生，不拼接用户文件名；Compose 中 worker 以同一 `DOCUMENT_STORAGE_DIRECTORY` 只读（`:ro`，uid 10001）挂载同一命名卷，inference 不挂载；写入先落同目录临时文件、`fsync` 后原子替换，失败只清理本次临时文件。`DocumentBlobStore.read_verified_markdown` 要求 `file_ref` 严格等于由 KB id 与摘要派生的路径（拒绝跨 KB、跨摘要或任意路径），打开前逐段 `lstat` 检查父目录与叶节点是否为符号链接或 Windows 联接点，可用时用 `O_NOFOLLOW` 打开并对已打开 fd `fstat`，只接受常规文件且不超过 20,000,000 字节，读取后核对内容摘要并复用上传侧 UTF-8/控制字节校验；读失败一律为 `BlobReadError` 子类、非法 `file_ref` 为 `InvalidBlobReference`，错误信息静态且抑制底层含路径的 `OSError`。父目录 `lstat` 与 open 之间仍有 TOCTOU 窗口、联接点检查是尽力而为，本切片不声称已根除。当前 `worker.py` 尚未调用该读取器，job 仍 `QUEUED`/`HANDLER_NOT_READY`，不读 blob、不写 `error_code`、无 tokenizer 与发布。事务冲突时已发布的最终 blob 不删除（并发事务可能已引用），因此数据库异常等路径可能留下孤儿文件，本切片没有 GC 作业。
 
 纯 Markdown 解析与切分已实现且不渲染 HTML：`html_block`/`html_inline` 被排除在正文之外，图片只取 alt，解析与切分绝不抓取或执行 URL。但解码后的 HTML 实体仍可能还原出字面 `<script>` 等文本，图片/链接里的危险 scheme URL 也可能作为字面原文留在 chunk 文本中；任何存储数据的展示必须按文本转义、绝不当作 HTML 执行，未来的原文预览与 HTML 输出必须消毒。
 

@@ -187,16 +187,26 @@ def test_compose_keeps_internal_services_unpublished() -> None:
 
 
 def test_compose_mounts_api_private_document_volume() -> None:
-    """上传原文件只落在 api 专用命名卷，且存储根由服务端配置固定。"""
+    """上传原文件只落在 api 专用命名卷；worker 只读同一卷，inference 无权访问。"""
 
     api_block = compose_service_block("api")
     assert "DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents" in api_block
+    # api 是唯一写入者：挂载不带 `:ro`。
     assert "- api-documents:/var/lib/citemind/documents" in api_block
+    assert "api-documents:/var/lib/citemind/documents:ro" not in api_block
     # 顶层必须声明该命名卷，否则 compose config 会因未定义卷失败。
     assert "\n  api-documents:\n" in compose_text()
-    # worker 与 inference 不需要也不得访问上传文档卷。
-    for service in ("worker", "inference"):
-        assert "api-documents" not in compose_service_block(service)
+
+    worker_block = compose_service_block("worker")
+    # worker 读同一容器路径且必须只读；仍由服务端配置固定存储根。
+    assert "DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents" in worker_block
+    assert "- api-documents:/var/lib/citemind/documents:ro" in worker_block
+    assert "- api-documents:/var/lib/citemind/documents\n" not in worker_block
+
+    # inference 不需要也不得访问上传文档卷。
+    assert "api-documents" not in compose_service_block("inference")
+    # 只有 worker 以上述只读形式挂载该卷；api 保持读写。
+    assert compose_text().count("api-documents:/var/lib/citemind/documents:ro") == 1
 
 
 def test_compose_keeps_declared_service_contracts() -> None:

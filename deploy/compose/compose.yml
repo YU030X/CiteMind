@@ -106,7 +106,7 @@ services:
       DISPATCHER_ENABLED: "true"
     volumes:
       # api 专用命名卷：镜像内该目录已归属 uid 10001，新建卷会继承该所有权。
-      # 不挂宿主目录，也不与其他进程共享；worker/inference 无权访问。
+      # api 是唯一写入者；worker 只读同卷；inference 不可见。
       - api-documents:/var/lib/citemind/documents
     networks:
       # default 用于访问 postgres/redis；gateway 是网关到 api 的专用入口网段。
@@ -169,6 +169,11 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}@redis:6379/0
       # worker 使用非特权的 citemind_worker 角色；probe 任务不写库，此 DSN 为后续入库事务预留。
       DATABASE_URL: postgresql+psycopg://citemind_worker:${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}@postgres:5432/citemind
+      # worker 只读同容器路径的 api 存储卷来读取已登记原始文件；路径由服务端配置固定。
+      DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
+    volumes:
+      # 与 api 共用同一命名卷，但以只读方式挂载；worker 绝不写入或替换原文件。
+      - api-documents:/var/lib/citemind/documents:ro
     depends_on:
       postgres:
         condition: service_healthy
