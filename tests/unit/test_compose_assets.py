@@ -346,6 +346,20 @@ def test_compose_worker_consumes_ingest_and_default_probe_queues() -> None:
     assert "--queues=celery,ingest" in worker_block
 
 
+def test_compose_worker_gets_the_internal_inference_token_without_depending_on_inference() -> None:
+    worker_block = compose_service_block("worker")
+    inference_block = compose_service_block("inference")
+    required = "INFERENCE_TOKEN: ${INFERENCE_TOKEN:?必须设置 INFERENCE_TOKEN}"
+
+    # worker 与 inference 共用同一内部 Bearer token；Settings 里可选，但 Compose 启动前必填。
+    assert required in worker_block
+    assert required in inference_block
+    # 基址由代码默认推导，不额外声明 INFERENCE_BASE_URL。
+    assert "INFERENCE_BASE_URL" not in worker_block
+    # 本切片不向 inference 建立依赖：inference 故障时 worker 仍应能启动与消费。
+    assert "inference:" not in worker_block
+
+
 def test_compose_api_enables_dispatcher_without_blocking_on_redis_health() -> None:
     api_block = compose_service_block("api")
 

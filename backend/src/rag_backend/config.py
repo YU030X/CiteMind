@@ -1,4 +1,5 @@
 import ipaddress
+import math
 import uuid
 from collections.abc import Mapping
 from functools import lru_cache
@@ -39,6 +40,10 @@ DEFAULT_LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300
 
 # 只有一个受信代理（网关）才能设置这个单值头；网关必须用 $remote_addr 覆盖它。
 DEFAULT_CLIENT_IP_HEADER = "X-Real-IP"
+
+# 内部 inference 的受限基址与默认超时；客户端只接受该 host 或回环测试地址。
+DEFAULT_INFERENCE_BASE_URL = "http://inference:9000"
+DEFAULT_INFERENCE_TIMEOUT_SECONDS = 60.0
 
 # 旧版所有项目自有变量都带 CITEMIND_ 前缀；重命名为裸名后，任何残留旧键都必须在启动时
 # 显式失败，避免静默读到旧值或误以为新配置已生效。这里只检查键名，不读取也不回显值。
@@ -201,6 +206,14 @@ class Settings(BaseSettings):
     allow_llm_probe: bool = False
     # 云生成模型名保持配置化；默认值来自供应商文档，实际可用性由真实探针核对。
     llm_model: str = "deepseek-flash"
+    # 内部 embedding 服务的受限基址与单请求超时；只有 worker 侧受限客户端会读取它们。
+    # 三项都不加 CITEMIND_ 前缀。非 Compose 直接使用 Settings 时可不配置 token，进程仍能
+    # 正常启动；deploy/compose/compose.yml 的两个服务（inference、worker）已按既有插值把
+    # INFERENCE_TOKEN 声明为必填，因此 Compose 启动前必须提供该变量。无论哪种方式，只有真正
+    # 构造受限客户端时才会因 token 缺失或不合法而 failfast。
+    inference_base_url: str = DEFAULT_INFERENCE_BASE_URL
+    inference_timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS
+    inference_token: SecretStr | None = None
 
     # 单组织标识；来自服务端配置，客户端请求体与查询参数都不能覆盖它。
     organization_id: uuid.UUID = DEFAULT_ORGANIZATION_ID
@@ -272,6 +285,16 @@ class Settings(BaseSettings):
             self.llm_api_key = None
         if not self.llm_model.strip():
             raise ValueError("llm_model 不能为空字符串")
+        if not self.inference_base_url.strip():
+            raise ValueError("inference_base_url 不能为空字符串")
+        if (
+            not math.isfinite(self.inference_timeout_seconds)
+            or self.inference_timeout_seconds <= 0
+        ):
+            raise ValueError("inference_timeout_seconds 必须是有限正数")
+        if self.inference_token is not None and not self.inference_token.get_secret_value().strip():
+            # 空白值等于未配置；API 仍能启动，客户端构造时才失败。
+            self.inference_token = None
 
         origins = parse_allowed_origins(self.allowed_origins)
         trusted_proxies = parse_trusted_proxy_networks(self.trusted_proxy_cidrs)

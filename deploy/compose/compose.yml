@@ -175,6 +175,9 @@ services:
       DATABASE_URL: postgresql+psycopg://citemind_worker:${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}@postgres:5432/citemind
       # worker 只读同容器路径的 api 存储卷来读取已登记原始文件；路径由服务端配置固定。
       DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
+      # 内部 embedding 受限客户端使用同一 INFERENCE_TOKEN；基址默认为内部服务 9000 端口。
+      # 本切片不向 inference 建立 depends_on：inference 故障时 worker 仍应能启动与消费。
+      INFERENCE_TOKEN: ${INFERENCE_TOKEN:?必须设置 INFERENCE_TOKEN}
     volumes:
       # 与 api 共用同一命名卷，但以只读方式挂载；worker 绝不写入或替换原文件。
       - api-documents:/var/lib/citemind/documents:ro
