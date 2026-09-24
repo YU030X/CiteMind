@@ -7,8 +7,8 @@ from uuid import UUID
 
 import httpx
 import pytest
-from evidencehub.config import Settings
-from evidencehub.llm_probe import (
+from rag_backend.config import Settings
+from rag_backend.llm_probe import (
     DEEPSEEK_BASE_URL,
     EXIT_LEDGER_FAILURE,
     EXIT_OK,
@@ -142,15 +142,15 @@ def test_settings_does_not_render_the_llm_key() -> None:
 
 
 def test_settings_defaults_to_probe_disabled(monkeypatch: Any) -> None:
-    monkeypatch.delenv("CITEMIND_ALLOW_LLM_PROBE", raising=False)
+    monkeypatch.delenv("ALLOW_LLM_PROBE", raising=False)
 
     assert settings().allow_llm_probe is False
     assert settings().llm_api_key is None
 
 
 def test_settings_parses_probe_opt_in_and_key(monkeypatch: Any) -> None:
-    monkeypatch.setenv("CITEMIND_ALLOW_LLM_PROBE", "1")
-    monkeypatch.setenv("CITEMIND_LLM_API_KEY", SECRET_KEY)
+    monkeypatch.setenv("ALLOW_LLM_PROBE", "1")
+    monkeypatch.setenv("LLM_API_KEY", SECRET_KEY)
     resolved = settings()
 
     assert resolved.allow_llm_probe is True
@@ -161,7 +161,7 @@ def test_ai_gateway_dev_key_does_not_enter_product_settings(monkeypatch: Any) ->
     monkeypatch.setenv("AI_GATEWAY_API_KEY", "dev-only-jev-key")
     resolved = settings()
 
-    # 开发期 Node Jev 的密钥没有 CITEMIND_ 前缀，不会进入产品配置。
+    # 开发期 Node Jev 的密钥不是本配置字段，不会进入产品配置。
     assert resolved.llm_api_key is None
     assert "dev-only-jev-key" not in repr(resolved)
 
@@ -544,7 +544,7 @@ def test_probe_ledger_engine_sets_a_bounded_connect_timeout(monkeypatch: Any) ->
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("evidencehub.llm_probe.create_engine", fake_create_engine)
+    monkeypatch.setattr("rag_backend.llm_probe.create_engine", fake_create_engine)
     SqlAlchemyUsageLedger("postgresql+psycopg://citemind_api:secret@127.0.0.1:55432/citemind")
 
     assert PROBE_DB_CONNECT_TIMEOUT_SECONDS > 0

@@ -5,12 +5,12 @@ from logging.config import fileConfig
 
 from alembic import context
 from alembic.util import CommandError
-from evidencehub.config import Settings, validate_database_url
-from evidencehub.models import metadata
+from rag_backend.config import Settings, validate_database_url
+from rag_backend.models import metadata
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-MIGRATION_DATABASE_URL_ENV = "CITEMIND_MIGRATION_DATABASE_URL"
+MIGRATION_DATABASE_URL_ENV = "MIGRATION_DATABASE_URL"
 
 config = context.config
 if config.config_file_name is not None:
@@ -41,7 +41,7 @@ def get_online_database_url() -> str:
     if not migration_url:
         raise CommandError(
             f"在线迁移必须设置 {MIGRATION_DATABASE_URL_ENV}（高权限迁移 DSN）；"
-            "在线模式不会回退到 CITEMIND_DATABASE_URL 或开发默认 URL。"
+            "在线模式不会回退到 DATABASE_URL 或开发默认 URL。"
         )
 
     try:

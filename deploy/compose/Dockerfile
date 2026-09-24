@@ -21,18 +21,21 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY backend ./backend
 RUN uv sync --frozen --no-dev
 
-# api 与 worker 都不需要 root；marker 目录先在镜像内创建并归属 citemind，
-# 这样首次挂载命名卷时会继承非 root 所有权。USER 会被下面的 final stage 继承。
+# api 与 worker 都不需要 root；marker 与文档存储目录先在镜像内创建并归属 citemind，
+# 这样首次挂载命名卷时会继承非 root 所有权（uid 10001 可直接写入）。
+# USER 会被下面的 final stage 继承。
 RUN useradd --create-home --uid 10001 citemind \
-    && mkdir -p /var/lib/citemind/probe-markers \
+    && mkdir -p /var/lib/citemind/probe-markers /var/lib/citemind/documents \
     && chown -R citemind:citemind /app /var/lib/citemind
 USER citemind
 
 # api final target：只提供 HTTP 入口，不运行 Celery worker。
+# --no-proxy-headers：由应用自己按 TRUSTED_PROXY_CIDRS 解析 X-Real-IP，
+# 不让 uvicorn 改写 request.client，避免两套代理信任规则并存。
 FROM runtime AS api
 EXPOSE 8000
-CMD ["uvicorn", "evidencehub.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
 
 # worker final target：必须是最后一个 stage，未指定 --target 时默认构建它。
 FROM runtime AS worker
-CMD ["celery", "-A", "evidencehub.worker:celery_app", "worker", "--loglevel=INFO"]
+CMD ["celery", "-A", "rag_backend.worker:celery_app", "worker", "--loglevel=INFO"]

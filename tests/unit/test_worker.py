@@ -6,8 +6,10 @@ from typing import Any
 
 import pytest
 from celery import Celery
-from evidencehub.config import DEFAULT_REDIS_PASSWORD, Settings
-from evidencehub.worker import (
+from kombu.exceptions import OperationalError
+from pydantic import ValidationError
+from rag_backend.config import DEFAULT_REDIS_PASSWORD, Settings
+from rag_backend.worker import (
     BROKER_VISIBILITY_TIMEOUT_SECONDS,
     PROBE_TASK_NAME,
     create_celery_app,
@@ -15,8 +17,6 @@ from evidencehub.worker import (
     require_redis_url,
     write_probe_marker,
 )
-from kombu.exceptions import OperationalError
-from pydantic import ValidationError
 
 REDIS_URL = "redis://:secret@127.0.0.1:56379/0"
 PRODUCTION_DATABASE_URL = "postgresql+psycopg://citemind_app:strong-password@postgres:5432/citemind"
@@ -88,12 +88,12 @@ def test_settings_requires_redis_password_in_production() -> None:
 
 
 def test_require_redis_url_fails_explicitly_without_configuration() -> None:
-    with pytest.raises(ValueError, match="CITEMIND_REDIS_URL"):
+    with pytest.raises(ValueError, match="REDIS_URL"):
         require_redis_url(settings())
 
 
 def test_create_celery_app_rejects_missing_broker_configuration() -> None:
-    with pytest.raises(ValueError, match="CITEMIND_REDIS_URL"):
+    with pytest.raises(ValueError, match="REDIS_URL"):
         create_celery_app(settings())
 
 

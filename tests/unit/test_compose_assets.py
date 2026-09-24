@@ -13,7 +13,21 @@ ENV_EXAMPLE = REPO_ROOT / ".env.example"
 INITDB_SCRIPTS = sorted((REPO_ROOT / "deploy" / "compose" / "initdb").glob("*.sh"))
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
 
-REQUIRED_VARIABLE_PATTERN = re.compile(r"\$\{(CITEMIND_[A-Z0-9_]+):\?")
+# 项目自有变量去前缀后不再有统一前缀，正则只能按形态抓取，因此显式排除第三方环境变量名，
+# 避免未来第三方必填插值被误判成项目变量；当前 compose 的必填插值全部是项目变量。
+THIRD_PARTY_ENV_VARIABLES = frozenset(
+    {
+        "POSTGRES_USER",
+        "POSTGRES_DB",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_INITDB_ARGS",
+        "REDISCLI_AUTH",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+    }
+)
+REQUIRED_VARIABLE_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*):\?")
 
 LF_ATTRIBUTE_LINE = "deploy/compose/**/*.sh text eol=lf"
 PINNED_IMAGES = (
@@ -118,8 +132,12 @@ def test_gitattributes_pins_initdb_scripts_to_lf() -> None:
 def test_env_example_provides_non_empty_values_for_required_compose_variables() -> None:
     """compose 的必填插值变量必须在 .env.example 中以未注释的非空值提供，否则首次启动直接失败。"""
 
-    required = set(REQUIRED_VARIABLE_PATTERN.findall(compose_text()))
-    assert required, "compose 未声明必填的 CITEMIND 变量时该检查失去意义"
+    captured = set(REQUIRED_VARIABLE_PATTERN.findall(compose_text()))
+    assert not (captured & THIRD_PARTY_ENV_VARIABLES), (
+        "第三方变量不应以必填插值出现，否则会污染该检查"
+    )
+    required = captured - THIRD_PARTY_ENV_VARIABLES
+    assert required, "compose 未声明必填的项目变量时该检查失去意义"
 
     values: dict[str, str] = {}
     for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
@@ -158,14 +176,27 @@ def test_compose_publishes_only_loopback_ports_by_default() -> None:
         assert mapping.startswith("127.0.0.1:"), f"{mapping} 必须只绑定回环地址"
 
     text = compose_text()
-    assert "CITEMIND_POSTGRES_PORT:-55432" in text
-    assert "CITEMIND_REDIS_PORT:-56379" in text
-    assert "CITEMIND_GATEWAY_PORT:-58080" in text
+    assert "POSTGRES_PORT:-55432" in text
+    assert "REDIS_PORT:-56379" in text
+    assert "GATEWAY_PORT:-58080" in text
 
 
 def test_compose_keeps_internal_services_unpublished() -> None:
     for service in ("api", "inference", "worker"):
         assert "ports:" not in compose_service_block(service), f"{service} 不应发布宿主端口"
+
+
+def test_compose_mounts_api_private_document_volume() -> None:
+    """上传原文件只落在 api 专用命名卷，且存储根由服务端配置固定。"""
+
+    api_block = compose_service_block("api")
+    assert "DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents" in api_block
+    assert "- api-documents:/var/lib/citemind/documents" in api_block
+    # 顶层必须声明该命名卷，否则 compose config 会因未定义卷失败。
+    assert "\n  api-documents:\n" in compose_text()
+    # worker 与 inference 不需要也不得访问上传文档卷。
+    for service in ("worker", "inference"):
+        assert "api-documents" not in compose_service_block(service)
 
 
 def test_compose_keeps_declared_service_contracts() -> None:
@@ -204,7 +235,7 @@ def test_compose_inference_service_is_self_contained_and_token_protected() -> No
 
     assert "context: ../../inference" in block
     assert "depends_on" not in block, "本切片 inference 不依赖 api 或数据服务"
-    assert "CITEMIND_INFERENCE_TOKEN" in block
+    assert "INFERENCE_TOKEN" in block
     assert "urlopen('http://127.0.0.1:9000/health'" in block
 
 
@@ -213,8 +244,8 @@ def test_compose_inference_bakes_model_and_never_downloads_at_runtime() -> None:
 
     # 无模型卷：权重烘入镜像，启动时不联网下载。
     assert "volumes:" not in block, "inference 不得挂载宿主模型卷"
-    assert f"CITEMIND_EMBEDDING_MODEL_PATH: {INFERENCE_MODEL_DIR}" in block
-    assert f"CITEMIND_EMBEDDING_MODEL_REVISION: {INFERENCE_REVISION}" in block
+    assert f"EMBEDDING_MODEL_PATH: {INFERENCE_MODEL_DIR}" in block
+    assert f"EMBEDDING_MODEL_REVISION: {INFERENCE_REVISION}" in block
     for variable in (
         'HF_HUB_OFFLINE: "1"',
         'TRANSFORMERS_OFFLINE: "1"',
@@ -224,10 +255,10 @@ def test_compose_inference_bakes_model_and_never_downloads_at_runtime() -> None:
         assert variable in block, f"inference 容器必须设置 {variable}"
     # OMP/MKL/OpenBLAS 必须在 torch 导入前由进程环境固定，只靠 torch.set_num_threads 不够。
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        assert f"{variable}: ${{CITEMIND_EMBEDDING_TORCH_THREADS:-2}}" in block, (
+        assert f"{variable}: ${{EMBEDDING_TORCH_THREADS:-2}}" in block, (
             f"inference 必须固定 {variable}"
         )
-    assert "CITEMIND_EMBEDDING_TORCH_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}" in block
+    assert "EMBEDDING_TORCH_THREADS: ${EMBEDDING_TORCH_THREADS:-2}" in block
     # 健康检查仍以 /health liveness 为准，不因模型就绪与否改变。
     assert "urlopen('http://127.0.0.1:9000/health', timeout=3)" in block
     assert "start_period" in block
@@ -256,27 +287,42 @@ def test_env_example_documents_inference_thread_budget() -> None:
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
 
     # 线程数有 Compose 默认值，.env.example 只作为可调项出现，不强制填值。
-    assert "CITEMIND_EMBEDDING_TORCH_THREADS=2" in text
-    assert "CITEMIND_INFERENCE_TOKEN=citemind-inference" in text
+    assert "EMBEDDING_TORCH_THREADS=2" in text
+    assert "INFERENCE_TOKEN=citemind-inference" in text
 
 
 def test_compose_gateway_is_the_only_app_entrypoint_depending_on_api() -> None:
     block = compose_service_block("frontend-gateway")
 
     assert "dockerfile: deploy/compose/frontend.Dockerfile" in block
-    assert "127.0.0.1:${CITEMIND_GATEWAY_PORT:-58080}:8080" in block
+    assert "127.0.0.1:${GATEWAY_PORT:-58080}:8080" in block
     assert "condition: service_healthy" in block
     assert "healthz" in block
+
+
+def test_compose_wires_the_gateway_proxy_trust_boundary() -> None:
+    api_block = compose_service_block("api")
+    gateway_block = compose_service_block("frontend-gateway")
+
+    # api 只信任 gateway 专用网段，且默认值与顶层网络子网一致。
+    trust_setting = (
+        "TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.28.10.0/24}"
+    )
+    assert trust_setting in api_block
+    assert "      - gateway" in api_block
+    # 网关只接 gateway 网络，因此它到 api 的连接一定来自可信网段。
+    assert "      - gateway" in gateway_block
+    assert "subnet: 172.28.10.0/24" in compose_text()
 
 
 def test_compose_worker_service_runs_celery_and_depends_on_data_services() -> None:
     text = compose_text()
 
-    assert "evidencehub.worker:celery_app" in text
+    assert "rag_backend.worker:celery_app" in text
     assert "--concurrency=1" in text
     # 四个 service_healthy：worker 等 postgres/redis，api 等 postgres，gateway 等 api。
     assert text.count("condition: service_healthy") == 4
-    assert "CITEMIND_REDIS_URL" in text
+    assert "REDIS_URL" in text
     assert "@redis:6379/0" in text
     assert "citemind_worker" in text
     # worker 不应因 inference 未就绪而被阻塞（注释里的全角冒号不算依赖键）。
@@ -297,6 +343,8 @@ def test_dockerfile_pins_base_images_and_runs_the_worker_as_non_root() -> None:
     assert "USER citemind" in content
     # 非 root marker 目录必须在镜像里预先创建并归属运行用户，命名卷首次挂载才能继承。
     assert "/var/lib/citemind/probe-markers" in content
+    # 上传文档目录同理，必须预先创建并归属 uid 10001。
+    assert "/var/lib/citemind/documents" in content
     assert "chown -R citemind:citemind /app /var/lib/citemind" in content
 
 
@@ -304,17 +352,17 @@ def test_base_compose_does_not_run_queue_probe_or_set_marker_directory() -> None
     text = compose_text()
 
     assert "queue-probe" not in text
-    assert "CITEMIND_PROBE_MARKER_DIRECTORY" not in text
+    assert "PROBE_MARKER_DIRECTORY" not in text
 
 
 def test_queue_override_adds_shared_marker_volume_and_one_shot_probe() -> None:
     text = queue_compose_text()
 
     assert "queue-probe" in text
-    assert "CITEMIND_PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers" in text
+    assert "PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers" in text
     # base worker 与 queue-probe 必须挂载同一个非 root marker 卷。
     assert text.count("probe-markers:/var/lib/citemind/probe-markers") == 2
-    assert "evidencehub.queue_probe" in text
+    assert "rag_backend.queue_probe" in text
     assert "restart: \"no\"" in text
     # 确定性验收使用硬退出码，不引入 result backend。
     assert "--abort-on-container-exit" in text

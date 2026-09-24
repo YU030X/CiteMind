@@ -72,12 +72,29 @@ def test_nginx_api_proxy_uses_docker_resolver_and_preserves_request_uri() -> Non
     assert not re.search(r"proxy_pass\s+http://api", text)
 
 
+def test_nginx_api_proxy_streams_request_body_without_buffering() -> None:
+    """网关不得先把上传正文完整缓冲/落盘，再等 API 鉴权。"""
+
+    text = nginx_text()
+    api_block = text.split("location /api/", 1)[1].split("location /assets/", 1)[0]
+    assert "proxy_http_version 1.1;" in api_block
+    assert "proxy_request_buffering off;" in api_block
+
+
 def test_nginx_api_location_does_not_fall_back_to_spa() -> None:
     text = nginx_text()
 
     api_block = text.split("location /api/", 1)[1].split("location /assets/", 1)[0]
     assert "try_files" not in api_block
     assert "index.html" not in api_block
+
+
+def test_nginx_api_location_caps_upload_body_size() -> None:
+    """网关先拦超大上传，API 侧再按文件字节精确判定。"""
+
+    text = nginx_text()
+    api_block = text.split("location /api/", 1)[1].split("location /assets/", 1)[0]
+    assert "client_max_body_size 20m;" in api_block
 
 
 def test_nginx_serves_spa_fallback_and_immutable_assets() -> None:

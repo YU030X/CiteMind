@@ -19,17 +19,17 @@ citemind_init_roles() {
 	if [ -z "${POSTGRES_USER:-}" ] || [ -z "${POSTGRES_DB:-}" ]; then
 		citemind_init_fail "缺少 POSTGRES_USER 或 POSTGRES_DB"
 	fi
-	if [ -z "${CITEMIND_API_DB_PASSWORD:-}" ]; then
-		citemind_init_fail "缺少 CITEMIND_API_DB_PASSWORD"
+	if [ -z "${API_DB_PASSWORD:-}" ]; then
+		citemind_init_fail "缺少 API_DB_PASSWORD"
 	fi
-	if [ -z "${CITEMIND_WORKER_DB_PASSWORD:-}" ]; then
-		citemind_init_fail "缺少 CITEMIND_WORKER_DB_PASSWORD"
+	if [ -z "${WORKER_DB_PASSWORD:-}" ]; then
+		citemind_init_fail "缺少 WORKER_DB_PASSWORD"
 	fi
 
 	# 密码通过 psql 变量传入，由 psql 负责 SQL 字面量转义，不拼接字符串。
 	psql --set=ON_ERROR_STOP=1 --no-psqlrc --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
-		--set=citemind_api_password="$CITEMIND_API_DB_PASSWORD" \
-		--set=citemind_worker_password="$CITEMIND_WORKER_DB_PASSWORD" <<'SQL' || citemind_init_fail "创建角色或测试库失败"
+		--set=citemind_api_password="$API_DB_PASSWORD" \
+		--set=citemind_worker_password="$WORKER_DB_PASSWORD" <<'SQL' || citemind_init_fail "创建角色或测试库失败"
 CREATE ROLE citemind_api LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
 	PASSWORD :'citemind_api_password';
 CREATE ROLE citemind_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS

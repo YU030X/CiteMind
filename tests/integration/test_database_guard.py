@@ -1,8 +1,11 @@
 """破坏性守卫的纯逻辑测试：不连接数据库，因此在任何环境都应运行。"""
 
+from collections.abc import Callable
+
 import pytest
 from database_guard import (
     ALLOW_DESTRUCTIVE_TEST_DB_ENV,
+    LEGACY_TEST_ENV_VARS,
     TEST_DATABASE_URL_ENV,
     GuardError,
     MissingTestDatabaseError,
@@ -86,6 +89,22 @@ def test_url_rules_are_checked_before_opt_in() -> None:
         resolve_destructive_test_database(
             {TEST_DATABASE_URL_ENV: "postgresql+psycopg://citemind:citemind@localhost:5432/citemind"}
         )
+
+
+@pytest.mark.parametrize("legacy_env_var", LEGACY_TEST_ENV_VARS)
+@pytest.mark.parametrize(
+    "key_case", [str.upper, str.lower, str.title], ids=["upper", "lower", "mixed"]
+)
+def test_legacy_prefixed_test_variables_fail_instead_of_skipping(
+    legacy_env_var: str, key_case: Callable[[str], str]
+) -> None:
+    """旧 CITEMIND_ 前缀键残留时必须显式失败，不能退化成跳过；键名大小写不敏感。"""
+
+    legacy_key = key_case(legacy_env_var)
+    with pytest.raises(GuardError, match=legacy_env_var) as error:
+        resolve_destructive_test_database({legacy_key: VALID_TEST_DATABASE_URL})
+
+    assert not isinstance(error.value, MissingTestDatabaseError)
 
 
 def test_returns_database_name_for_opted_in_test_database() -> None:

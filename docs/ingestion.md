@@ -1,14 +1,16 @@
 # 文档入库、索引与版本
 
-> 本文是待实现的技术契约。MVP 只处理 Markdown 与可提取文本的 PDF；DOCX 与静态网页属于后续完整范围。第二切片的 `index_generation`、`chunk` 与 `chunk_embedding` 存储 schema（含 512 维向量列、`GIN(fts)` 与部分唯一索引）已由迁移 `20260922_0003` 落地，但解析、切分、编码与发布的 worker 写入路径、跨表来源一致性核对和发布事务仍未实现，本文其余行为不能据此声称可运行。
+> 本文描述完整的 Markdown 与可提取文本 PDF 入库契约。当前只实现了 Markdown 上传受理（`POST /api/v1/knowledge-bases/{kb_id}/documents`）：校验、KB 私有内容寻址保存，以及单事务写入 `document`/`document_version`/`ingest_job`/`outbox_event` 并返回 `202`。**没有 dispatcher，也没有 worker 业务任务**，因此 outbox 事件不会被投递、任务不会进入 worker；解析、切分、编码、索引发布、检索与文件回收均未实现，不能据此声称任何文档可被检索。第二切片的 `index_generation`、`chunk` 与 `chunk_embedding` 存储 schema（含 512 维向量列、`GIN(fts)` 与部分唯一索引）已由迁移 `20260922_0003` 落地，但 worker 写入路径、跨表来源一致性核对和发布事务仍未实现。MVP 目标格式为 Markdown 与可提取文本的 PDF；DOCX 与静态网页属于后续完整范围，PDF 与下文其余格式当前均未实现。
 
 ## 入库状态与流程
 
-1. API 检查 KB 编辑权限、真实 MIME、后缀、20 MB 文件上限、PDF 100 页上限与配额。原文件存入隔离卷的 SHA-256 路径，不拼接用户文件名。
-2. 对同 KB、同文档、同内容的重复上传返回已有任务或版本。不能通过跨权限去重提示暴露其他文档。上传事务一并写入 `document_version`、`ingest_job`、`outbox_event`，提交后返回 `202`；这时文档仍可能不可检索。
-3. worker 按 `QUEUED → PARSING → CHUNKING → EMBEDDING → INDEXING → READY` 执行，记录阶段、进度、错误码与尝试次数。解析限制为单次 60 秒，超时要终止实际解析子进程。永久格式错误进入 FAILED；临时故障最多重试 3 次。
-4. 解析器生成有位置映射的结构块；切分后保存 chunk 文本、token 数、hash、来源 locator、解析器与切分器版本。对缓存未命中的模型输入批量编码，将向量、FTS 与 locator 写入不可见的 staging generation。
-5. 校验 chunk 数、非空文本、向量维度、映射和预期文档版本后，在锁定文档的事务中发布 READY generation 并切换 `active_version_id`。首次导入失败不可检索；更新失败时旧版继续服务。
+1. 已实现：API 校验 KB `EDITOR` 角色、`Origin`、CSRF、必填 `Idempotency-Key`、`.md`/`.markdown` 后缀、有效 UTF-8 文本与 20,000,000 字节单文件上限；授权、CSRF、Origin 与接收阶段体积上限都在读取 multipart 正文之前完成。原文件存入 api 进程私有的 `api-documents` 命名卷（容器路径 `/var/lib/citemind/documents`，由可选配置 `DOCUMENT_STORAGE_DIRECTORY` 指定），相对路径只由服务端 `knowledge_base.id` 与内容 SHA-256 派生（`{kb_id}/{sha256}`），不拼接用户文件名。真实 MIME/PDF 页数校验、PDF 支持与 KB 配额未实现（KB 配额没有对应存储字段或实体）。
+2. 已实现：同一 KB、同一 `Idempotency-Key`、同内容且同标题的重复上传复用已有任务并返回同一组 id；内容或标题任一不同返回 409，跨 KB 的去重键互相独立且不通过冲突响应暴露其他 KB 的 key 使用情况。去重键是组织+KB+规范化 key 的 SHA-256，不保存也不回显原始 key。并发同 key 由唯一约束拒绝后回滚重读，再按复用/冲突规则处理。上传事务一并写入 `document`（`CREATED`、`active_version_id=NULL`、`source_type=markdown`）、`document_version`（`version_no=1`、`PENDING`、`parser_version=markdown-v1`，该版本仅登记契约、本切片不解析正文）、`ingest_job`（`QUEUED`、`attempt=0`）与 `outbox_event`（`ingest.requested`、`PENDING`），提交后返回 `202`；这时文档仍不可检索。
+3. 目标（未实现）：worker 按 `QUEUED → PARSING → CHUNKING → EMBEDDING → INDEXING → READY` 执行，记录阶段、进度、错误码与尝试次数。解析限制为单次 60 秒，超时要终止实际解析子进程。永久格式错误进入 FAILED；临时故障最多重试 3 次。当前没有 dispatcher，`QUEUED` 任务不会进入 worker。
+4. 目标（未实现）：解析器生成有位置映射的结构块；切分后保存 chunk 文本、token 数、hash、来源 locator、解析器与切分器版本。对缓存未命中的模型输入批量编码，将向量、FTS 与 locator 写入不可见的 staging generation。
+5. 目标（未实现）：校验 chunk 数、非空文本、向量维度、映射和预期文档版本后，在锁定文档的事务中发布 READY generation 并切换 `active_version_id`。首次导入失败不可检索；更新失败时旧版继续服务。
+
+已发布的最终 blob 在事务回滚或后续数据库异常时不删除，因为并发事务可能已引用它；这会产生无引用的孤儿文件窗口，本切片不实现 GC，回收与一致性核对留待后续作业。
 
 ## 来源定位与切分
 

@@ -120,8 +120,10 @@ def test_shared_dockerfile_api_target_serves_uvicorn_on_8000() -> None:
     content = SHARED_DOCKERFILE.read_text(encoding="utf-8")
 
     assert "EXPOSE 8000" in content
+    # --no-proxy-headers：客户端 IP 由应用按可信代理 CIDR 自行解析，避免两套信任规则。
     api_command = (
-        'CMD ["uvicorn", "evidencehub.main:app", "--host", "0.0.0.0", "--port", "8000"]'
+        'CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0", "--port", "8000", '
+        '"--no-proxy-headers"]'
     )
     assert api_command in content
 
@@ -130,7 +132,7 @@ def test_shared_dockerfile_worker_target_keeps_celery_command() -> None:
     content = SHARED_DOCKERFILE.read_text(encoding="utf-8")
 
     assert (
-        'CMD ["celery", "-A", "evidencehub.worker:celery_app", "worker", "--loglevel=INFO"]'
+        'CMD ["celery", "-A", "rag_backend.worker:celery_app", "worker", "--loglevel=INFO"]'
         in content
     )
     # 非 root 与 marker 目录仍由共享 runtime stage 建立并被两个 target 继承。
@@ -212,8 +214,8 @@ def test_inference_dockerfile_bakes_model_at_build_time_and_stays_offline() -> N
     # CPU 线程变量在 torch 导入前由进程环境生效，不靠运行期再设置。
     for variable in ("OMP_NUM_THREADS=2", "MKL_NUM_THREADS=2", "OPENBLAS_NUM_THREADS=2"):
         assert variable in content, f"镜像必须固定 {variable}"
-    assert f"CITEMIND_EMBEDDING_MODEL_PATH={MODEL_DIR_IN_IMAGE}" in content
-    assert f"CITEMIND_EMBEDDING_MODEL_REVISION={FROZEN_EMBEDDING_REVISION}" in content
+    assert f"EMBEDDING_MODEL_PATH={MODEL_DIR_IN_IMAGE}" in content
+    assert f"EMBEDDING_MODEL_REVISION={FROZEN_EMBEDDING_REVISION}" in content
     # 模型烘入镜像：不允许镜像声明模型卷或运行期下载入口。
     assert "VOLUME" not in content
     assert "huggingface-cli download" not in content

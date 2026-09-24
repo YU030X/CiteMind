@@ -15,18 +15,18 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
 from broker_guard import RedisBrokerTarget
-from evidencehub.config import Settings
-from evidencehub.worker import PROBE_TASK_NAME, create_celery_app
+from rag_backend.config import Settings
+from rag_backend.worker import PROBE_TASK_NAME, create_celery_app
 from redis import Redis
 from redis.exceptions import AuthenticationError
 
 pytestmark = [pytest.mark.integration, pytest.mark.broker]
 
-REPO_ROOT = Path(__file__).parents[2]
 WORKER_READY_TIMEOUT_SECONDS = 60.0
 TASK_SUCCESS_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.5
@@ -79,16 +79,16 @@ def running_worker(
     """
 
     environment = os.environ.copy()
-    environment["CITEMIND_REDIS_URL"] = redis_url
-    environment["CITEMIND_ENVIRONMENT"] = "test"
-    environment["CITEMIND_PROBE_MARKER_DIRECTORY"] = str(marker_directory)
+    environment["REDIS_URL"] = redis_url
+    environment["ENVIRONMENT"] = "test"
+    environment["PROBE_MARKER_DIRECTORY"] = str(marker_directory)
     environment["PYTHONUNBUFFERED"] = "1"
     command = [
         sys.executable,
         "-m",
         "celery",
         "-A",
-        "evidencehub.worker:celery_app",
+        "rag_backend.worker:celery_app",
         "worker",
         "--loglevel=INFO",
         # Windows 上不能使用默认的 prefork；本测试用 solo 作 smoke。权威验收是 Linux Compose
@@ -105,7 +105,9 @@ def running_worker(
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,
-            cwd=REPO_ROOT,
+            # 以测试临时目录为工作目录，避免子进程加载仓库根 .env 里的旧配置而提前退出；
+            # rag_backend 由已安装包提供，不依赖仓库根路径。
+            cwd=log_path.parent,
             env=environment,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -151,7 +153,12 @@ def test_probe_task_runs_on_a_separate_worker_through_the_real_broker(
     log_path = tmp_path / "worker.log"
     marker_directory = tmp_path / "markers"
     marker_directory.mkdir(parents=True, exist_ok=True)
-    app = create_celery_app(Settings(environment="test", redis_url=test_redis.url))
+    values: dict[str, Any] = {
+        "_env_file": None,
+        "environment": "test",
+        "redis_url": test_redis.url,
+    }
+    app = create_celery_app(Settings(**values))
 
     try:
         with running_worker(

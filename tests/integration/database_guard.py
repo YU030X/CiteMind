@@ -9,9 +9,15 @@ from dataclasses import dataclass
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
-TEST_DATABASE_URL_ENV = "CITEMIND_TEST_DATABASE_URL"
-ALLOW_DESTRUCTIVE_TEST_DB_ENV = "CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB"
+TEST_DATABASE_URL_ENV = "TEST_DATABASE_URL"
+ALLOW_DESTRUCTIVE_TEST_DB_ENV = "ALLOW_DESTRUCTIVE_TEST_DB"
 ALLOW_DESTRUCTIVE_TEST_DB_VALUE = "1"
+
+# 旧版本用 CITEMIND_ 前缀；残留旧键时显式失败，避免新守卫找不到裸名而静默跳过真实库测试。
+LEGACY_TEST_ENV_VARS = (
+    "CITEMIND_TEST_DATABASE_URL",
+    "CITEMIND_ALLOW_DESTRUCTIVE_TEST_DB",
+)
 
 
 class GuardError(RuntimeError):
@@ -20,6 +26,23 @@ class GuardError(RuntimeError):
 
 class MissingTestDatabaseError(GuardError):
     """未提供测试数据库 DSN；这是正常跳过，不是失败。"""
+
+
+def reject_legacy_test_env_vars(environment: Mapping[str, str]) -> None:
+    """旧 CITEMIND_ 前缀测试变量残留时显式失败，不静默跳过（键名大小写不敏感）。"""
+
+    offenders = sorted(
+        {
+            legacy
+            for legacy in LEGACY_TEST_ENV_VARS
+            for key in environment
+            if key.upper() == legacy
+        }
+    )
+    if offenders:
+        raise GuardError(
+            "检测到已废弃的 CITEMIND_ 前缀测试变量，请改为裸名后重试: " + "、".join(offenders)
+        )
 
 
 @dataclass(frozen=True)
@@ -54,6 +77,7 @@ def resolve_destructive_test_database(environment: Mapping[str, str]) -> Destruc
     """
 
     database_url = environment.get(TEST_DATABASE_URL_ENV)
+    reject_legacy_test_env_vars(environment)
     if not database_url:
         raise MissingTestDatabaseError(
             f"未设置 {TEST_DATABASE_URL_ENV}，跳过真实 PostgreSQL 集成测试"

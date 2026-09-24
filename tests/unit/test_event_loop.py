@@ -1,11 +1,11 @@
 import asyncio
 import sys
 
-import evidencehub.event_loop as event_loop_module
 import pytest
+import rag_backend.event_loop as event_loop_module
 from uvicorn.config import Config
 
-WINDOWS_LOOP_STRING = "evidencehub.event_loop:create_event_loop"
+WINDOWS_LOOP_STRING = "rag_backend.event_loop:create_event_loop"
 
 
 def test_create_event_loop_returns_selector_event_loop_on_windows() -> None:
@@ -51,7 +51,7 @@ def test_create_event_loop_off_windows_uses_new_event_loop(
 def test_uvicorn_resolves_the_documented_loop_string() -> None:
     """离线校验文档中的 --loop 字符串能被已安装的 uvicorn 解析为可用的循环工厂。"""
 
-    config = Config(app="evidencehub.main:app", loop=WINDOWS_LOOP_STRING)
+    config = Config(app="rag_backend.main:app", loop=WINDOWS_LOOP_STRING)
 
     loop_factory = config.get_loop_factory()
     assert loop_factory is not None

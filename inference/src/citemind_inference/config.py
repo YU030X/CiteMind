@@ -8,12 +8,37 @@ token 使用 ``SecretStr`` 保存，``repr``/日志不会打印明文。生产�
 编码契约是冻结的：模型、revision、维度与模型自身的最大输入长度都不可在运行期更改。
 """
 
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource
+
+# 旧版本曾用 CITEMIND_ 前缀；重命名为裸名后，任何残留旧键都必须在读取任何 source 之前
+# 被发现，避免静默读到旧值或误以为新配置已经生效。这里只检查键名，不读取也不回显值。
+LEGACY_ENV_PREFIX = "CITEMIND_"
+
+
+def reject_legacy_prefixed_env_vars(*env_vars_sources: Mapping[str, str | None]) -> None:
+    """进程环境与 dotenv 中任意 CITEMIND_* 旧键都让启动显式失败（只读键名，不回显值）。"""
+
+    offenders = sorted(
+        {
+            key.upper()
+            for env_vars in env_vars_sources
+            for key in env_vars
+            if key.upper().startswith(LEGACY_ENV_PREFIX)
+        }
+    )
+    if offenders:
+        raise ValueError(
+            "检测到已废弃的 CITEMIND_ 前缀环境变量，请去掉前缀改为裸名后重新启动: "
+            + "、".join(offenders)
+        )
+
 
 # 开发占位 token：仅用于本地与测试。生产环境使用该值会在启动校验中失败。
 DEVELOPMENT_INFERENCE_TOKEN = "citemind-inference"
@@ -32,7 +57,7 @@ DEFAULT_EMBEDDING_MODEL_PATH = Path("/models/bge-small-zh-v1.5")
 # 量级取 3 倍再加固定余量覆盖键名、引号与逗号。该推导不是所有 JSON 转义的最坏界
 # （例如把短 ASCII 文本逐字写成 \uXXXX 可放大到约 6 倍），这类极端转义会先被解析前
 # 的 body 字节上限拒绝；需要独立调整传输预算时显式设置
-# CITEMIND_EMBEDDING_MAX_REQUEST_BYTES。
+# EMBEDDING_MAX_REQUEST_BYTES。
 DEFAULT_MAX_TEXT_BYTES = 262144
 REQUEST_BYTES_MULTIPLIER = 3
 REQUEST_BYTES_OVERHEAD = 1024
@@ -49,7 +74,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_prefix="CITEMIND_",
+        env_prefix="",
         extra="ignore",
         # 校验失败时隐藏输入值，避免 ValidationError 打印 token 明文。
         hide_input_in_errors=True,
@@ -57,7 +82,7 @@ class Settings(BaseSettings):
 
     environment: Literal["development", "test", "production"] = "development"
     # 内部接口的 Bearer token。默认空值只用于让“环境变量缺失”与“显式空值”走同一条
-    # 启动失败路径；真正的值必须由 CITEMIND_INFERENCE_TOKEN 注入。
+    # 启动失败路径；真正的值必须由 INFERENCE_TOKEN 注入。
     inference_token: SecretStr = SecretStr("")
 
     # 本地模型目录：必须已包含冻结 revision 的权重，运行期不会联网下载。
@@ -103,7 +128,7 @@ class Settings(BaseSettings):
     def validate_model_revision(cls, revision: str) -> str:
         if revision != FROZEN_EMBEDDING_REVISION:
             raise ValueError(
-                "CITEMIND_EMBEDDING_MODEL_REVISION 只接受冻结 revision "
+                "EMBEDDING_MODEL_REVISION 只接受冻结 revision "
                 f"{FROZEN_EMBEDDING_REVISION}；更换模型或 revision 必须另建 index profile"
             )
         return revision
@@ -113,57 +138,77 @@ class Settings(BaseSettings):
         token = self.inference_token.get_secret_value()
 
         if not token:
-            raise ValueError("CITEMIND_INFERENCE_TOKEN 不能为空")
+            raise ValueError("INFERENCE_TOKEN 不能为空")
         if self.environment == "production" and token == DEVELOPMENT_INFERENCE_TOKEN:
             raise ValueError(
-                "生产环境不得使用开发占位 CITEMIND_INFERENCE_TOKEN；请注入独立密钥"
+                "生产环境不得使用开发占位 INFERENCE_TOKEN；请注入独立密钥"
             )
         return self
 
     @model_validator(mode="after")
     def validate_embedding_limits(self) -> "Settings":
         positive_limits = {
-            "CITEMIND_EMBEDDING_MAX_BATCH_SIZE": self.embedding_max_batch_size,
-            "CITEMIND_EMBEDDING_MAX_TOTAL_BYTES": self.embedding_max_total_bytes,
-            "CITEMIND_EMBEDDING_MAX_CHARS_PER_TEXT": self.embedding_max_chars_per_text,
-            "CITEMIND_EMBEDDING_MAX_TOKENS_PER_TEXT": self.embedding_max_tokens_per_text,
-            "CITEMIND_EMBEDDING_MAX_TOTAL_TOKENS": self.embedding_max_total_tokens,
-            "CITEMIND_EMBEDDING_MAX_CONCURRENCY": self.embedding_max_concurrency,
-            "CITEMIND_EMBEDDING_TORCH_THREADS": self.embedding_torch_threads,
+            "EMBEDDING_MAX_BATCH_SIZE": self.embedding_max_batch_size,
+            "EMBEDDING_MAX_TOTAL_BYTES": self.embedding_max_total_bytes,
+            "EMBEDDING_MAX_CHARS_PER_TEXT": self.embedding_max_chars_per_text,
+            "EMBEDDING_MAX_TOKENS_PER_TEXT": self.embedding_max_tokens_per_text,
+            "EMBEDDING_MAX_TOTAL_TOKENS": self.embedding_max_total_tokens,
+            "EMBEDDING_MAX_CONCURRENCY": self.embedding_max_concurrency,
+            "EMBEDDING_TORCH_THREADS": self.embedding_torch_threads,
         }
         for name, value in positive_limits.items():
             if value < 1:
                 raise ValueError(f"{name} 必须 >= 1")
         # 0 表示“不排队，满了立即拒绝”，是合法配置。
         if self.embedding_queue_depth < 0:
-            raise ValueError("CITEMIND_EMBEDDING_QUEUE_DEPTH 必须 >= 0")
+            raise ValueError("EMBEDDING_QUEUE_DEPTH 必须 >= 0")
 
         # 模型自身只支持 512 个位置；配置再大也无法在不截断的前提下编码。
         if self.embedding_max_tokens_per_text > EMBEDDING_MAX_TOKENS:
             raise ValueError(
-                f"CITEMIND_EMBEDDING_MAX_TOKENS_PER_TEXT 不得超过模型上限 {EMBEDDING_MAX_TOKENS}"
+                f"EMBEDDING_MAX_TOKENS_PER_TEXT 不得超过模型上限 {EMBEDDING_MAX_TOKENS}"
             )
         # UTF-8 每个字符至少占 1 字节；字符上限大于字节上限时可编码的文本永远通不过字节检查。
         if self.embedding_max_chars_per_text > self.embedding_max_total_bytes:
             raise ValueError(
-                "CITEMIND_EMBEDDING_MAX_CHARS_PER_TEXT 不得超过 "
-                "CITEMIND_EMBEDDING_MAX_TOTAL_BYTES"
+                "EMBEDDING_MAX_CHARS_PER_TEXT 不得超过 "
+                "EMBEDDING_MAX_TOTAL_BYTES"
             )
         # 一条文本的 token 预算必须装得进单请求总预算，否则单独把上限调高没有意义。
         if self.embedding_max_total_tokens < self.embedding_max_tokens_per_text:
             raise ValueError(
-                "CITEMIND_EMBEDDING_MAX_TOTAL_TOKENS 不得小于 "
-                "CITEMIND_EMBEDDING_MAX_TOKENS_PER_TEXT"
+                "EMBEDDING_MAX_TOTAL_TOKENS 不得小于 "
+                "EMBEDDING_MAX_TOKENS_PER_TEXT"
             )
         # 传输预算至少要能装下语义预算，否则合法请求必然先在字节层被拒。
         if self.embedding_max_request_bytes is not None and (
             self.embedding_max_request_bytes < self.embedding_max_total_bytes
         ):
             raise ValueError(
-                "CITEMIND_EMBEDDING_MAX_REQUEST_BYTES 不得小于 "
-                "CITEMIND_EMBEDDING_MAX_TOTAL_BYTES"
+                "EMBEDDING_MAX_REQUEST_BYTES 不得小于 "
+                "EMBEDDING_MAX_TOTAL_BYTES"
             )
         return self
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """在读取字段前拒绝旧 CITEMIND_* 键；只查键名，不读取或回显值。"""
+
+        reject_legacy_prefixed_env_vars(
+            *[
+                source.env_vars
+                for source in (env_settings, dotenv_settings)
+                if isinstance(source, EnvSettingsSource)
+            ]
+        )
+        return init_settings, env_settings, dotenv_settings, file_secret_settings
 
 
 @lru_cache

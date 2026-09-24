@@ -38,7 +38,7 @@ torch = { index = "pytorch-cpu" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-  "model: requires the real local BGE weights and is opt-in via CITEMIND_RUN_MODEL_TESTS=1",
+  "model: requires the real local BGE weights and is opt-in via RUN_MODEL_TESTS=1",
 ]
 
 [tool.ruff]

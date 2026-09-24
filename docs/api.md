@@ -1,16 +1,20 @@
 # API 契约草案
 
-> 以下为计划接口，尚未实现或生成 OpenAPI。外部统一前缀 `/api/v1`。MVP 范围见 [交付计划](roadmap.md)；标为“后续”的接口不属于 MVP。
+> OpenAPI 已由 FastAPI 生成；`GET /health`、认证组 `POST /auth/login`、`POST /auth/logout`、`GET /me`、知识库组 `GET /knowledge-bases`、`POST /knowledge-bases`、`GET /knowledge-bases/{id}/members`、`PUT /knowledge-bases/{id}/members` 与文档上传 `POST /knowledge-bases/{id}/documents` 已实现，其余接口与标为“后续”的接口仍未实现。外部统一前缀 `/api/v1`。MVP 范围见 [交付计划](roadmap.md)；标为“后续”的接口不属于 MVP。
 
 Session Cookie 使用 HttpOnly、SameSite，并在生产环境启用 HTTPS；状态变更接受 CSRF 防护。请求/响应由 Pydantic 定义，外部字段使用 camelCase。标准错误体含 `code`、`message`、`requestId`、`details`，无权资源使用不暴露存在性的统一策略。异步入库、重建和评估受理后返回 `202`，不代表任务完成。
 
+已实现的认证接口：`POST /api/v1/auth/login` 请求体为 `{"username":"...","password":"..."}`，先校验 `Origin` 白名单再进行 Redis 登录限流，成功后返回 `{"user":{"id","username","isAdmin","organizationId"},"csrfToken"}` 并在 `Set-Cookie` 写入 HttpOnly + SameSite=Lax 会话 Cookie（生产默认 Secure，本地回环可显式关闭）。限流的客户端 IP 在可信代理网段内取网关覆盖的 `X-Real-IP`，否则取直连对端地址。未知用户、禁用与密码错误统一返回 401 `AUTH_INVALID_CREDENTIALS`，不泄露用户名是否存在；超过限流阈值返回 429 `AUTH_RATE_LIMITED` 与 `Retry-After`；Redis 不可用返回 503 `AUTH_DEPENDENCY_UNAVAILABLE`。`POST /api/v1/auth/logout` 要求 `X-CSRF-Token`，软撤销服务端会话并在确实撤销后才清除 Cookie，无有效会话时幂等返回 204 且不下发 `Set-Cookie`。`GET /api/v1/me` 每次从数据库重建授权上下文，会话撤销、到期或用户禁用立即返回 401；CSRF 令牌由服务端密钥派生，因此在进程重启后仍能从会话恢复同一 `csrfToken`；`GET /me` 还返回当前可访问 KB 的 `knowledgeBases` 角色概览（`[{id,name,role}]`）。422 校验错误体的 `details` 只含 `type`/`loc`/`msg`，不回显请求输入（包括密码）。
+
+已实现的 KB 成员接口：`GET /api/v1/knowledge-bases` 只返回当前用户在服务端会话组织内仍是有效成员的 KB（`{"knowledgeBases":[{id,name,role,aclRevision}]}`），组织与角色都来自数据库 `kb_member`，`organizationId` 不在请求体中定义，即使提交也不生效。`POST /api/v1/knowledge-bases` 请求体只有 `{"name"}`，要求管理员（`user_account.is_admin`）、合法 `Origin` 与 `X-CSRF-Token`，并在同一事务创建 KB 与创建者的 `OWNER` 成员行，成功返回 201 `{id,name,role,aclRevision,kbRevision}`。`GET /api/v1/knowledge-bases/{id}/members` 允许同组织任意有效成员读取，返回 `{members:[{userId,username,role}],aclRevision}`。`PUT /api/v1/knowledge-bases/{id}/members` 只允许 `OWNER`、合法 `Origin` 与 CSRF，请求体 `{members:[{userId,role}]}` 做全量替换：缺席者软撤销、重加入者清空 `revoked_at` 并更新角色；空列表与重复用户返回 422 `KB_MEMBERS_INVALID`，引用不存在或外组织用户返回 422 `KB_MEMBER_USER_INVALID`，新加入或提升已禁用用户为 `OWNER` 返回 422 `KB_MEMBER_OWNER_DISABLED`，替换后没有任何 `OWNER`（或没有任何启用中的 `OWNER`）返回 409 `LAST_OWNER_REQUIRED`，被拒绝的请求不产生部分事务；只有实际变化才在事务内递增 `acl_revision`。KB 不存在、属于其他组织、成员已撤销或角色不足统一返回不暴露存在性的 404 `KNOWLEDGE_BASE_NOT_FOUND`；成员替换在事务内锁定知识库行以序列化并发，在锁内复核调用者仍是该 KB 的有效 OWNER，并在同一事务内读出成员快照，使响应体与 `aclRevision` 一致。本切片没有用户目录或用户查询接口，成员替换请求体里的 `userId` 只能取自运维开户 CLI 打印的账号 id，不能用用户名代替。本切片不提供管理员接管或自动恢复：成员替换要求至少一名启用中的 OWNER，这是事务时点校验而非数据库永久约束；若唯一 OWNER 已被直接写库禁用，现有 API 无法把所有权移交给无法登录的账号，只能由运维先在数据库层把该账号 `enabled` 恢复，再由本人登录移交。
+
+已实现的 Markdown 上传接口：`POST /api/v1/knowledge-bases/{id}/documents` 为 multipart 请求（`title` 文本字段与 `file` 文件字段），必须携带 `Idempotency-Key` 请求头，并要求会话对该 KB 至少为 `EDITOR`、合法 `Origin` 与 `X-CSRF-Token`；授权、CSRF、Origin 与接收阶段体积上限都在调用 `request.form()` 之前完成，未授权请求不会把正文落盘。只接受 `.md`/`.markdown` 后缀且实际字节为有效 UTF-8、不含二进制控制字符的文本；`file` 最多 20,000,000 字节，`title` 最长 500 字符，`Idempotency-Key` 最长 255 字符。成功返回 202 `{documentId,versionId,jobId}`。同一 KB 下同一 `Idempotency-Key` 且内容与标题都相同时复用同一组 id（仍返回 202）；内容或标题任一不同返回 409 `IDEMPOTENCY_KEY_REUSED`；不同 key 即便内容相同也新建独立 document。去重键在服务端以组织+KB+规范化 key 的 SHA-256 存储，错误体不回显 key 原值、文件内容或文件名。错误映射：超过 20,000,000 字节 413 `DOCUMENT_TOO_LARGE`，空内容 422 `DOCUMENT_EMPTY`，非 UTF-8 或含二进制控制字符 422 `DOCUMENT_NOT_TEXT`，非常规文本后缀 422 `UNSUPPORTED_DOCUMENT_TYPE`，标题非法 422 `DOCUMENT_TITLE_INVALID`，key 非法 422 `IDEMPOTENCY_KEY_INVALID`，缺少 `Idempotency-Key` 请求头 422 `VALIDATION_ERROR`，multipart 格式错误 422 `UPLOAD_MALFORMED`。本切片只受理并持久化入库事实：document `CREATED`、version `PENDING`（`parser_version=markdown-v1` 仅声明、未解析）、job `QUEUED`、outbox `PENDING`；**没有 dispatcher**，任务不会进入 worker，202 只表示任务已持久化，文档不可检索。PDF、KB 总配额、解析/切分/embedding/索引发布/检索、文件回收以及文档列表/详情/删除等接口均未实现。
+
 | 方法与路径（省略 `/api/v1`） | 用途与关键约束 |
 | --- | --- |
-| `POST /auth/login`、`POST /auth/logout`、`GET /me` | 登录、注销、当前授权概览；不回显密码 |
-| `GET /knowledge-bases`、`POST /knowledge-bases` | 列表和创建；创建限管理员 |
-| `PATCH /knowledge-bases/{id}` | 更新元数据/策略，OWNER 与乐观锁 version |
-| `GET /knowledge-bases/{id}/members`、`PUT /knowledge-bases/{id}/members` | 查看/替换成员，变更递增 `acl_revision` |
-| `POST /knowledge-bases/{id}/documents` | multipart 上传、title、Idempotency-Key；检查配额，返回 documentId/versionId/jobId |
+| `POST /auth/login`、`POST /auth/logout`、`GET /me`（已实现） | 登录校验 Origin 与 Redis 限流后签发 HttpOnly/SameSite 会话 Cookie 并返回授权概览与可恢复的 CSRF 令牌；注销软撤销会话；`GET /me` 每次从数据库重建授权上下文；不回显密码 |
+| `GET /knowledge-bases`、`POST /knowledge-bases`、`GET /knowledge-bases/{id}/members`、`PUT /knowledge-bases/{id}/members`（已实现） | 列表与创建（创建限管理员且要求 Origin/CSRF，同事务写入创建者 OWNER）；成员读取（有效成员）与全量替换（仅 OWNER，软撤销/重加入，至少保留一名有效 OWNER，实际变化递增 `acl_revision`）；越权/跨组织/不存在统一 404 |
+| `POST /knowledge-bases/{id}/documents`（已实现） | Markdown-only multipart 上传，要求 KB `EDITOR`、合法 Origin、CSRF 与 `Idempotency-Key`；授权先于正文读取，单文件上限 20,000,000 字节且必须为有效 UTF-8 文本；同 key 同内容同标题复用、内容或标题不同 409、跨 KB 隔离；202 只表示四张表事实已持久化，无 dispatcher 故不可检索；PDF/配额/解析/检索等未实现 |
 | `POST /knowledge-bases/{id}/web-imports`（后续） | 白名单内静态 URL；先通过 SSRF 和大小限制 |
 | `GET /knowledge-bases/{id}/documents` | 按状态/格式/版本分页；无权文档不出现 |
 | `GET /documents/{id}` | 文档详情、当前有效版本、任务和解析警告 |
@@ -34,6 +38,6 @@ Session Cookie 使用 HttpOnly、SameSite，并在生产环境启用 HTTPS；状
 
 内部 inference 接口：`POST /internal/embed` 返回 vectors、dimension、modelRevision、tokenCounts；`POST /internal/rerank`（后续）返回 candidateId 与 score；`GET /health` 检查进程存活，`GET /capabilities` 报告各能力是否就绪。内部接口有凭证、输入条数、字节、token、超时和并发限制，不开放公网，不接受任意模型路径，也不处理用户文档授权。当前实现会在启动时从本地目录加载构建期烘入的固定 revision 模型（缺失或不符即启动失败）：`/health` 返回 `modelLoaded=true`，`/ready` 与 `/capabilities` 报告 `embedding.ready=true`、dimension=512 与冻结 modelRevision，`/internal/embed` 缺少或错误 Bearer token 返回 401、`kind=document` 返回 512 维 L2 归一化向量与 tokenCounts、`kind=query` 因 Literal 校验返回 422；rerank 路由未实现，`/capabilities` 如实报告 rerank.ready=false。
 
-问答 citation 至少含 `citationId`、`displayLabel`、`documentTitle`、`version`、`locator`、`quote`，全部由服务端映射。本次模型只可返回临时引用 ID。`get_current_user` 从数据库会话生成 AuthContext，`require_kb_role` 验证库角色，repository 继续施加文档 ACL；路由层登录校验不能代替资源级授权。
+问答 citation 至少含 `citationId`、`displayLabel`、`documentTitle`、`version`、`locator`、`quote`，全部由服务端映射。本次模型只可返回临时引用 ID。已实现的 `get_auth_context` 从数据库会话生成 `AuthContext`，`require_kb_role` 按本次请求的数据库成员关系判定 KB 最小角色（不跨请求缓存）；文档 ACL 与检索期资源级授权仍属计划，路由层登录校验不能代替资源级授权。
 
-云 LLM 一次性探针是命令行入口 `evidencehub.llm_probe`，不是 HTTP API：本切片未新增或默认启用任何路由，也未开放文档正文；`GET /usage` 仍属计划接口。探针只向固定供应商 endpoint 发一次请求，并只把 provider 报告的 usage 事实写入 `llm_usage`。
+云 LLM 一次性探针是命令行入口 `rag_backend.llm_probe`，不是 HTTP API：本切片未新增或默认启用任何路由，也未开放文档正文；`GET /usage` 仍属计划接口。探针只向固定供应商 endpoint 发一次请求，并只把 provider 报告的 usage 事实写入 `llm_usage`。

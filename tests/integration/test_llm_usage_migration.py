@@ -14,8 +14,8 @@ import pytest
 from alembic import command
 from database_guard import DestructiveTestDatabase
 from database_roles_guard import API_ROLE, WORKER_ROLE, RoleTestDatabases
-from evidencehub.config import Settings
-from evidencehub.llm_probe import (
+from rag_backend.config import Settings
+from rag_backend.llm_probe import (
     EXIT_PROVIDER_FAILURE,
     LedgerPreflightError,
     SqlAlchemyUsageLedger,

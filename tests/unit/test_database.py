@@ -1,15 +1,23 @@
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
-import evidencehub.app as app_module
 import pytest
-from evidencehub.app import create_app
-from evidencehub.config import DEFAULT_DATABASE_URL, Settings
-from evidencehub.database import create_database_engine, create_session_factory
-from pydantic import ValidationError
+import rag_backend.app as app_module
+from pydantic import SecretStr, ValidationError
+from rag_backend.app import create_app
+from rag_backend.config import DEFAULT_DATABASE_URL, Settings
+from rag_backend.database import create_database_engine, create_session_factory
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 PRODUCTION_DATABASE_URL = "postgresql+psycopg://citemind_app:strong-password@postgres:5432/citemind"
 PRODUCTION_REDIS_URL = "redis://:strong-password@redis:6379/0"
+
+
+def make_settings(**overrides: Any) -> Settings:
+    """构造不读取仓库根 .env 的配置，避免测试受尚未迁移的旧变量影响。"""
+
+    values: dict[str, Any] = {"_env_file": None}
+    values.update(overrides)
+    return Settings(**values)
 
 
 class DisposableEngine:
@@ -22,7 +30,7 @@ class DisposableEngine:
 
 def test_settings_rejects_non_postgresql_driver() -> None:
     with pytest.raises(ValidationError, match=r"postgresql\+psycopg"):
-        Settings(database_url="sqlite+aiosqlite:///./citemind.db")
+        make_settings(database_url="sqlite+aiosqlite:///./citemind.db")
 
 
 @pytest.mark.parametrize(
@@ -37,7 +45,7 @@ def test_settings_rejects_missing_database_host_or_name(
     database_url: str, error_message: str
 ) -> None:
     with pytest.raises(ValidationError, match=error_message):
-        Settings(database_url=database_url)
+        make_settings(database_url=database_url)
 
 
 @pytest.mark.parametrize(
@@ -51,12 +59,12 @@ def test_settings_rejects_missing_database_host_or_name(
 )
 def test_settings_rejects_default_credentials_in_production(database_url: str) -> None:
     with pytest.raises(ValidationError, match="默认数据库凭据"):
-        Settings(environment="production", database_url=database_url)
+        make_settings(environment="production", database_url=database_url)
 
 
 def test_settings_requires_username_in_production() -> None:
     with pytest.raises(ValidationError, match="非空 username"):
-        Settings(
+        make_settings(
             environment="production",
             database_url="postgresql+psycopg://:secret@postgres:5432/citemind",
         )
@@ -72,12 +80,12 @@ def test_settings_requires_username_in_production() -> None:
 )
 def test_settings_requires_password_in_production(database_url: str) -> None:
     with pytest.raises(ValidationError, match="非空 password"):
-        Settings(environment="production", database_url=database_url)
+        make_settings(environment="production", database_url=database_url)
 
 
 def test_settings_rejects_database_echo_in_production() -> None:
     with pytest.raises(ValidationError, match="database_echo"):
-        Settings(
+        make_settings(
             environment="production",
             database_url=PRODUCTION_DATABASE_URL,
             database_echo=True,
@@ -85,10 +93,13 @@ def test_settings_rejects_database_echo_in_production() -> None:
 
 
 def test_settings_accepts_production_database_configuration() -> None:
-    settings = Settings(
+    settings = make_settings(
         environment="production",
         database_url=PRODUCTION_DATABASE_URL,
         redis_url=PRODUCTION_REDIS_URL,
+        csrf_secret=SecretStr("a" * 48),
+        trusted_proxy_cidrs="172.28.10.0/24",
+        allowed_origins="https://kb.example.com",
     )
 
     assert settings.database_echo is False
@@ -98,7 +109,7 @@ def test_settings_accepts_production_database_configuration() -> None:
 def test_settings_keeps_development_and_test_usable(
     environment: Literal["development", "test"],
 ) -> None:
-    settings = Settings(environment=environment, database_echo=True)
+    settings = make_settings(environment=environment, database_echo=True)
 
     assert settings.database_url == DEFAULT_DATABASE_URL
     assert settings.database_echo is True
@@ -108,14 +119,14 @@ def test_settings_keeps_development_and_test_usable(
 def test_settings_allows_default_credentials_outside_production(
     environment: Literal["development", "test"],
 ) -> None:
-    settings = Settings(environment=environment, database_url=DEFAULT_DATABASE_URL)
+    settings = make_settings(environment=environment, database_url=DEFAULT_DATABASE_URL)
 
     assert settings.environment == environment
 
 
 @pytest.mark.anyio
 async def test_database_engine_and_session_factory_can_be_created_and_disposed() -> None:
-    settings = Settings(environment="test")
+    settings = make_settings(environment="test")
     engine = create_database_engine(settings)
     session_factory = create_session_factory(engine)
 
@@ -134,7 +145,7 @@ async def test_fastapi_lifespan_creates_and_disposes_database_engine(
     engine = cast(AsyncEngine, disposable_engine)
     monkeypatch.setattr(app_module, "create_database_engine", lambda settings: engine)
 
-    app = create_app(Settings(environment="test"))
+    app = create_app(make_settings(environment="test"))
     async with app.router.lifespan_context(app):
         assert app.state.database_engine is engine
         assert app.state.database_session_factory is not None

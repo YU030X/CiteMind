@@ -1,10 +1,13 @@
 """角色 DSN 守卫的纯逻辑测试：不连接数据库，因此在任何环境都应运行。"""
 
+from collections.abc import Callable
+
 import conftest
 import pytest
 from database_roles_guard import (
     API_DATABASE_URL_ENV,
     API_ROLE,
+    LEGACY_TEST_ENV_VARS,
     MIGRATOR_DATABASE_URL_ENV,
     MIGRATOR_ROLE,
     ROLE_ENV_VARS,
@@ -186,6 +189,22 @@ def test_role_env_var_mapping_covers_exactly_three_roles() -> None:
         API_ROLE: API_DATABASE_URL_ENV,
         WORKER_ROLE: WORKER_DATABASE_URL_ENV,
     }
+
+
+@pytest.mark.parametrize("legacy_env_var", LEGACY_TEST_ENV_VARS)
+@pytest.mark.parametrize(
+    "key_case", [str.upper, str.lower, str.title], ids=["upper", "lower", "mixed"]
+)
+def test_legacy_prefixed_test_variables_fail_instead_of_skipping(
+    legacy_env_var: str, key_case: Callable[[str], str]
+) -> None:
+    """旧 CITEMIND_ 前缀键残留时必须显式失败，不能退化成跳过；键名大小写不敏感。"""
+
+    legacy_key = key_case(legacy_env_var)
+    with pytest.raises(GuardError, match=legacy_env_var) as error:
+        resolve_role_test_databases({legacy_key: MIGRATOR_URL})
+
+    assert not isinstance(error.value, MissingTestDatabasesError)
 
 
 def test_role_fixture_skips_when_all_three_dsns_are_missing(

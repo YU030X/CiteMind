@@ -1,6 +1,6 @@
 """真实 BGE 模型的显式 opt-in 验收：与独立 golden 参考逐项比较。
 
-默认跳过：需要真实的本地权重目录与 ``CITEMIND_RUN_MODEL_TESTS=1``。显式 opt-in 后，模型
+默认跳过：需要真实的本地权重目录与 ``RUN_MODEL_TESTS=1``。显式 opt-in 后，模型
 缺失、损坏或 golden 不一致都必须使测试失败，不能用跳过冒充通过。
 
 golden 由独立断网 CPU 环境生成，只在此处做集成比较；token IDs 要求严格相等，512 维向量
@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +25,40 @@ from citemind_inference.embeddings import Embedder, load_embedder
 
 pytestmark = pytest.mark.model
 
-OPT_IN_ENV = "CITEMIND_RUN_MODEL_TESTS"
-MODEL_PATH_ENV = "CITEMIND_TEST_EMBEDDING_MODEL_PATH"
+OPT_IN_ENV = "RUN_MODEL_TESTS"
+MODEL_PATH_ENV = "TEST_EMBEDDING_MODEL_PATH"
+# 旧版本用 CITEMIND_ 前缀；残留旧键时显式失败，避免新 opt-in 找不到裸名而静默跳过真实模型验收。
+LEGACY_OPT_IN_ENV_VARS = (
+    f"CITEMIND_{OPT_IN_ENV}",
+    f"CITEMIND_{MODEL_PATH_ENV}",
+)
 GOLDEN_PATH = Path(__file__).resolve().parent / "golden" / "golden-reference.json"
 # 由独立断网 CPU 环境生成并审核；cross_env_note 为文字说明，实测数值未改动。
 GOLDEN_SHA256 = "967e700bc3baf8147fcfe8919c2b8a8e665a82f3bb2fc7ff7fcf33850b8eb057"
 VECTOR_MAX_ABS_DIFF = 1e-4
 
 
+def legacy_opt_in_env_var_names(environment: Mapping[str, str | None]) -> list[str]:
+    """返回残留的旧 CITEMIND_ 前缀 opt-in 键名；只读键名，不回显任何值。"""
+
+    return sorted(
+        {
+            legacy
+            for legacy in LEGACY_OPT_IN_ENV_VARS
+            for key in environment
+            if key.upper() == legacy
+        }
+    )
+
+
 def _require_opt_in() -> Path:
+    offenders = legacy_opt_in_env_var_names(os.environ)
+    if offenders:
+        # 旧前缀 opt-in 会在 Settings 校验之前被跳过，必须显式失败而不是静默跳过。
+        pytest.fail(
+            "检测到已废弃的 CITEMIND_ 前缀 opt-in 环境变量，请改为裸名后重试: "
+            + "、".join(offenders)
+        )
     if os.environ.get(OPT_IN_ENV) != "1":
         pytest.skip(f"设置 {OPT_IN_ENV}=1 才运行真实模型验收")
     path = Path(os.environ.get(MODEL_PATH_ENV, str(DEFAULT_EMBEDDING_MODEL_PATH)))
@@ -162,3 +188,44 @@ def test_real_app_embeds_and_rejects_over_512_tokens(real_settings: Settings) ->
     # 超过模型 512 位置上限且不截断，必须明确拒绝。
     assert oversized.status_code == 422
     assert oversized.json()["code"] == "EMBEDDING_INPUT_TOO_LONG"
+
+
+# ---------------------------------------------------------------- 旧前缀 opt-in 回归
+
+
+@pytest.mark.parametrize("legacy_env_var", LEGACY_OPT_IN_ENV_VARS)
+@pytest.mark.parametrize(
+    "key_case", [str.upper, str.lower, str.title], ids=["upper", "lower", "mixed"]
+)
+def test_legacy_opt_in_env_var_name_is_reported_case_insensitively(
+    legacy_env_var: str, key_case: Callable[[str], str]
+) -> None:
+    """旧前缀键名大小写不敏感地被识别；纯映射测试，不加载真实权重。"""
+
+    assert legacy_opt_in_env_var_names({key_case(legacy_env_var): "1"}) == [legacy_env_var]
+
+
+@pytest.mark.parametrize("legacy_env_var", LEGACY_OPT_IN_ENV_VARS)
+def test_legacy_opt_in_fails_before_opt_in_skip(
+    legacy_env_var: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧 opt-in 变量残留时必须在 skip 之前显式失败，且不得回显其值。"""
+
+    monkeypatch.delenv(OPT_IN_ENV, raising=False)
+    monkeypatch.setenv(legacy_env_var, "legacy-secret")
+
+    with pytest.raises(pytest.fail.Exception, match=legacy_env_var) as error_info:
+        _require_opt_in()
+
+    assert "legacy-secret" not in str(error_info.value)
+
+
+def test_missing_bare_opt_in_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    """没有旧前缀键且裸 RUN_MODEL_TESTS 未设置时，仍按 opt-in 正常跳过。"""
+
+    monkeypatch.delenv(OPT_IN_ENV, raising=False)
+    for legacy_env_var in LEGACY_OPT_IN_ENV_VARS:
+        monkeypatch.delenv(legacy_env_var, raising=False)
+
+    with pytest.raises(pytest.skip.Exception, match=OPT_IN_ENV):
+        _require_opt_in()

@@ -1,8 +1,11 @@
 """broker 守卫的纯逻辑测试：不连接 Redis，因此在任何环境都应运行。"""
 
+from collections.abc import Callable
+
 import pytest
 from broker_guard import (
     ALLOW_TEST_REDIS_ENV,
+    LEGACY_TEST_ENV_VARS,
     TEST_REDIS_URL_ENV,
     GuardError,
     MissingTestRedisError,
@@ -116,6 +119,22 @@ def test_url_rules_are_checked_before_opt_in() -> None:
 
     with pytest.raises(GuardError, match="非 0 逻辑库"):
         resolve_test_redis({TEST_REDIS_URL_ENV: "redis://:citemind@127.0.0.1:56379/0"})
+
+
+@pytest.mark.parametrize("legacy_env_var", LEGACY_TEST_ENV_VARS)
+@pytest.mark.parametrize(
+    "key_case", [str.upper, str.lower, str.title], ids=["upper", "lower", "mixed"]
+)
+def test_legacy_prefixed_test_variables_fail_instead_of_skipping(
+    legacy_env_var: str, key_case: Callable[[str], str]
+) -> None:
+    """旧 CITEMIND_ 前缀键残留时必须显式失败，不能退化成跳过；键名大小写不敏感。"""
+
+    legacy_key = key_case(legacy_env_var)
+    with pytest.raises(GuardError, match=legacy_env_var) as error:
+        resolve_test_redis({legacy_key: VALID_TEST_REDIS_URL})
+
+    assert not isinstance(error.value, MissingTestRedisError)
 
 
 def test_returns_logical_database_for_opted_in_loopback_broker() -> None:

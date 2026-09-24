@@ -6,8 +6,9 @@
 # 第三方镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
 # inference 已能离线编码 kind=document 文本（query 与 rerank 未实现）；worker 写入事务与
 # dispatcher/业务 API 仍未实现。云 LLM 用量账本 llm_usage 由迁移 20260923_0004 落地；
-# 一次性真实探针 evidencehub.llm_probe 默认关闭、不随容器启动，已由用户执行一次真实
+# 一次性真实探针 rag_backend.llm_probe 默认关闭、不随容器启动，已由用户执行一次真实
 # DeepSeek 成功调用并与 llm_usage 落账回读；Phase 0 工程底座退出条件据此达成。
+# 环境变量统一为无前缀裸名（如 MIGRATION_DB_PASSWORD、DATABASE_URL）；旧 CITEMIND_* 键已失效。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
 #   docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait
@@ -16,7 +17,8 @@
 # `down -v` 删除数据卷；initdb 脚本只在空卷上执行，角色或 ACL 需要重建时必须用它。
 # `docker compose config` 会把插值后的密码明文打印出来，不要分享该输出。
 # 首次真实启动前按 docs/development.md 配置已忽略的根 .env；根 .env 已存在时不要覆盖，
-# 只补齐 Compose 需要的密码、端口与 inference 令牌变量。
+# 只补齐 Compose 需要的密码、端口与 inference 令牌变量，并把仍在使用旧 CITEMIND_* 名的
+# 本地键手动改成裸名（旧键会导致应用启动失败）。
 
 name: citemind
 
@@ -29,14 +31,14 @@ services:
       # 安装与升级 vector 扩展需要超级用户，因此本地高权限账号只交给迁移进程。
       POSTGRES_USER: citemind_migrator
       POSTGRES_DB: citemind
-      POSTGRES_PASSWORD: ${CITEMIND_MIGRATION_DB_PASSWORD:?必须设置 CITEMIND_MIGRATION_DB_PASSWORD}
+      POSTGRES_PASSWORD: ${MIGRATION_DB_PASSWORD:?必须设置 MIGRATION_DB_PASSWORD}
       # 固定集群编码、locale 与 data checksums；官方入口把该值原样拼进 initdb 参数。
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
       # initdb 脚本只在空数据卷执行，用它创建 api/worker 运行角色与测试库。
-      CITEMIND_API_DB_PASSWORD: ${CITEMIND_API_DB_PASSWORD:?必须设置 CITEMIND_API_DB_PASSWORD}
-      CITEMIND_WORKER_DB_PASSWORD: ${CITEMIND_WORKER_DB_PASSWORD:?必须设置 CITEMIND_WORKER_DB_PASSWORD}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:?必须设置 API_DB_PASSWORD}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}
     ports:
-      - "127.0.0.1:${CITEMIND_POSTGRES_PORT:-55432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
@@ -53,7 +55,7 @@ services:
     restart: unless-stopped
     environment:
       # redis-cli 从该变量读取密码，healthcheck 因此不需要把密码写进命令行。
-      REDISCLI_AUTH: ${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}
     command:
       - redis-server
       - --appendonly
@@ -65,9 +67,9 @@ services:
       - --maxmemory-policy
       - noeviction
       - --requirepass
-      - ${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}
+      - ${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}
     ports:
-      - "127.0.0.1:${CITEMIND_REDIS_PORT:-56379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-56379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -85,12 +87,34 @@ services:
       target: api
     restart: unless-stopped
     environment:
-      CITEMIND_ENVIRONMENT: development
+      ENVIRONMENT: development
       # 容器内用服务名与内部端口；绝不透传宿主 127.0.0.1 DSN，避免容器访问宿主回环。
-      CITEMIND_DATABASE_URL: postgresql+psycopg://citemind_api:${CITEMIND_API_DB_PASSWORD:?必须设置 CITEMIND_API_DB_PASSWORD}@postgres:5432/citemind
+      DATABASE_URL: postgresql+psycopg://citemind_api:${API_DB_PASSWORD:?必须设置 API_DB_PASSWORD}@postgres:5432/citemind
+      # 登录限流依赖 Redis；未配置时登录会 fail closed 返回 503，不会回退到进程内计数。
+      REDIS_URL: redis://:${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}@redis:6379/0
+      # 本地网关只发布回环 HTTP 端口，显式关闭 Secure Cookie，并把状态变更来源限定在回环。
+      SESSION_COOKIE_SECURE: "0"
+      ALLOWED_ORIGINS: http://127.0.0.1:${GATEWAY_PORT:-58080},http://localhost:${GATEWAY_PORT:-58080}
+      # CSRF 令牌派生密钥；这是开发占位值，生产环境会被启动校验拒绝。
+      CSRF_SECRET: ${CSRF_SECRET:-development-csrf-secret}
+      # 只有网关网段内的直连对端才可提供 X-Real-IP；否则退回对端地址。
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.28.10.0/24}
+      # 上传原文件落在 api 专用私有命名卷；路径只由服务端 KB ID 与内容 SHA-256 派生。
+      DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
+    volumes:
+      # api 专用命名卷：镜像内该目录已归属 uid 10001，新建卷会继承该所有权。
+      # 不挂宿主目录，也不与其他进程共享；worker/inference 无权访问。
+      - api-documents:/var/lib/citemind/documents
+    networks:
+      # default 用于访问 postgres/redis；gateway 是网关到 api 的专用入口网段。
+      - default
+      - gateway
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        # 限流器惰性连接，只需 redis 容器启动即可。
+        condition: service_started
     healthcheck:
       # 用容器内 Python 走 HTTP 探针；非 200 会抛异常，退出码非零。
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
@@ -106,16 +130,16 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      CITEMIND_ENVIRONMENT: development
+      ENVIRONMENT: development
       # 内部接口 Bearer token；开发占位值，生产环境使用该值会启动失败。
-      CITEMIND_INFERENCE_TOKEN: ${CITEMIND_INFERENCE_TOKEN:?必须设置 CITEMIND_INFERENCE_TOKEN}
+      INFERENCE_TOKEN: ${INFERENCE_TOKEN:?必须设置 INFERENCE_TOKEN}
       # 模型烘入镜像，不挂宿主模型卷、不在启动时下载。
-      CITEMIND_EMBEDDING_MODEL_PATH: /models/bge-small-zh-v1.5
-      CITEMIND_EMBEDDING_MODEL_REVISION: 7999e1d3359715c523056ef9478215996d62a620
-      CITEMIND_EMBEDDING_TORCH_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
-      OMP_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
-      MKL_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
-      OPENBLAS_NUM_THREADS: ${CITEMIND_EMBEDDING_TORCH_THREADS:-2}
+      EMBEDDING_MODEL_PATH: /models/bge-small-zh-v1.5
+      EMBEDDING_MODEL_REVISION: 7999e1d3359715c523056ef9478215996d62a620
+      EMBEDDING_TORCH_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
+      OMP_NUM_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
       TOKENIZERS_PARALLELISM: "false"
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -137,11 +161,11 @@ services:
       target: worker
     restart: unless-stopped
     environment:
-      CITEMIND_ENVIRONMENT: development
+      ENVIRONMENT: development
       # broker 指向 Compose 网络内的 redis 服务，密码沿用 Redis 的认证变量。
-      CITEMIND_REDIS_URL: redis://:${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}@redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}@redis:6379/0
       # worker 使用非特权的 citemind_worker 角色；probe 任务不写库，此 DSN 为后续入库事务预留。
-      CITEMIND_DATABASE_URL: postgresql+psycopg://citemind_worker:${CITEMIND_WORKER_DB_PASSWORD:?必须设置 CITEMIND_WORKER_DB_PASSWORD}@postgres:5432/citemind
+      DATABASE_URL: postgresql+psycopg://citemind_worker:${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}@postgres:5432/citemind
     depends_on:
       postgres:
         condition: service_healthy
@@ -150,13 +174,13 @@ services:
     command:
       - celery
       - -A
-      - evidencehub.worker:celery_app
+      - rag_backend.worker:celery_app
       - worker
       - --loglevel=INFO
       - --concurrency=1
     healthcheck:
       # 通过 broker 回环的 inspect ping 确认 worker 真的在消费；无回复时 grep 失败。
-      test: ["CMD-SHELL", "celery -A evidencehub.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]
+      test: ["CMD-SHELL", "celery -A rag_backend.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]
       interval: 15s
       timeout: 10s
       retries: 3
@@ -170,10 +194,13 @@ services:
     restart: unless-stopped
     # 唯一对外发布的端口，且只绑定回环；api/inference/worker 不发布宿主端口。
     ports:
-      - "127.0.0.1:${CITEMIND_GATEWAY_PORT:-58080}:8080"
+      - "127.0.0.1:${GATEWAY_PORT:-58080}:8080"
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      # 网关只接 gateway 网络，因此对 api 的连接一定来自可信网段。
+      - gateway
     healthcheck:
       # 网关自身探针不经过 api，api 故障不回退 SPA。
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
@@ -185,3 +212,13 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  # api 上传原文件私有存储；不使用 bind mount，避免宿主权限与 CRLF 问题。
+  api-documents:
+
+networks:
+  default:
+  # 固定网关↔api 的专用网段，让 api 的可信代理 CIDR 可确定配置，不依赖运行时随机子网。
+  gateway:
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24

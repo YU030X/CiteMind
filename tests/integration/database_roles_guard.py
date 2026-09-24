@@ -11,9 +11,16 @@ from typing import cast
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
-MIGRATOR_DATABASE_URL_ENV = "CITEMIND_TEST_MIGRATOR_DATABASE_URL"
-API_DATABASE_URL_ENV = "CITEMIND_TEST_API_DATABASE_URL"
-WORKER_DATABASE_URL_ENV = "CITEMIND_TEST_WORKER_DATABASE_URL"
+MIGRATOR_DATABASE_URL_ENV = "TEST_MIGRATOR_DATABASE_URL"
+API_DATABASE_URL_ENV = "TEST_API_DATABASE_URL"
+WORKER_DATABASE_URL_ENV = "TEST_WORKER_DATABASE_URL"
+
+# 旧版本用 CITEMIND_ 前缀；残留旧键时显式失败，避免新守卫找不到裸名而静默跳过真实库测试。
+LEGACY_TEST_ENV_VARS = (
+    "CITEMIND_TEST_MIGRATOR_DATABASE_URL",
+    "CITEMIND_TEST_API_DATABASE_URL",
+    "CITEMIND_TEST_WORKER_DATABASE_URL",
+)
 
 MIGRATOR_ROLE = "citemind_migrator"
 API_ROLE = "citemind_api"
@@ -36,6 +43,23 @@ class GuardError(RuntimeError):
 
 class MissingTestDatabasesError(GuardError):
     """三个测试 DSN 都未提供；这是正常跳过，不是失败。"""
+
+
+def reject_legacy_test_env_vars(environment: Mapping[str, str]) -> None:
+    """旧 CITEMIND_ 前缀测试变量残留时显式失败，不静默跳过（键名大小写不敏感）。"""
+
+    offenders = sorted(
+        {
+            legacy
+            for legacy in LEGACY_TEST_ENV_VARS
+            for key in environment
+            if key.upper() == legacy
+        }
+    )
+    if offenders:
+        raise GuardError(
+            "检测到已废弃的 CITEMIND_ 前缀测试变量，请改为裸名后重试: " + "、".join(offenders)
+        )
 
 
 @dataclass(frozen=True)
@@ -92,6 +116,7 @@ def resolve_role_test_databases(environment: Mapping[str, str]) -> RoleTestDatab
     """
 
     configured = {role: environment.get(env_var) for role, env_var in ROLE_ENV_VARS.items()}
+    reject_legacy_test_env_vars(environment)
     provided = {role: value for role, value in configured.items() if value}
     if not provided:
         missing_all = "、".join(ROLE_ENV_VARS.values())

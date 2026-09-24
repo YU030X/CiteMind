@@ -6,6 +6,8 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from alembic.util import CommandError
+from rag_backend.config import DEFAULT_DATABASE_URL
 
 REPO_ROOT = Path(__file__).parents[2]
 ALEMBIC_INI = REPO_ROOT / "alembic.ini"
@@ -13,6 +15,7 @@ PGVECTOR_REVISION = "20260921_0001"
 CORE_REVISION = "20260922_0002"
 SECOND_SLICE_REVISION = "20260922_0003"
 LLM_USAGE_REVISION = "20260923_0004"
+IDENTITY_REVISION = "20260923_0005"
 
 CORE_TABLES = (
     "index_profile",
@@ -24,7 +27,8 @@ CORE_TABLES = (
 )
 SECOND_SLICE_TABLES = ("index_generation", "chunk", "chunk_embedding")
 LLM_USAGE_TABLES = ("llm_usage",)
-ALL_TABLES = CORE_TABLES + SECOND_SLICE_TABLES + LLM_USAGE_TABLES
+IDENTITY_TABLES = ("user_account", "auth_session", "kb_member")
+ALL_TABLES = CORE_TABLES + SECOND_SLICE_TABLES + LLM_USAGE_TABLES + IDENTITY_TABLES
 
 EXPECTED_CHECK_CONSTRAINTS = (
     "ck_index_profile_dimension_is_512",
@@ -59,6 +63,7 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_llm_usage_succeeded_requires_provider_usage",
     "ck_llm_usage_failure_has_error_code",
     "ck_llm_usage_price_consistent",
+    "ck_kb_member_role",
 )
 
 SECOND_SLICE_GRANTS = (
@@ -71,10 +76,18 @@ SECOND_SLICE_GRANTS = (
 )
 FIRST_SLICE_GRANT_COUNT = 11
 LLM_USAGE_GRANTS = ("GRANT SELECT, INSERT ON TABLE llm_usage TO citemind_api;",)
+IDENTITY_GRANTS = (
+    "GRANT SELECT, INSERT, UPDATE ON TABLE user_account TO citemind_api;",
+    "GRANT SELECT, INSERT, UPDATE ON TABLE auth_session TO citemind_api;",
+    "GRANT SELECT, INSERT, UPDATE ON TABLE kb_member TO citemind_api;",
+)
 
 
 def alembic_config() -> Config:
-    return Config(str(ALEMBIC_INI))
+    # 显式提供离线 DSN，避免离线 SQL 测试回退去读取仓库根 .env。
+    config = Config(str(ALEMBIC_INI))
+    config.set_main_option("sqlalchemy.url", DEFAULT_DATABASE_URL.replace("%", "%%"))
+    return config
 
 
 @pytest.fixture(scope="module")
@@ -83,15 +96,18 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [LLM_USAGE_REVISION]
+    assert script_directory.get_heads() == [IDENTITY_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    identity = script_directory.get_revision(IDENTITY_REVISION)
     llm_usage = script_directory.get_revision(LLM_USAGE_REVISION)
     second_slice = script_directory.get_revision(SECOND_SLICE_REVISION)
     core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert identity.down_revision == LLM_USAGE_REVISION
     assert llm_usage.down_revision == SECOND_SLICE_REVISION
+    assert llm_usage.nextrev == {IDENTITY_REVISION}
     assert second_slice.down_revision == CORE_REVISION
     assert second_slice.nextrev == {LLM_USAGE_REVISION}
     assert core.down_revision == PGVECTOR_REVISION
@@ -106,6 +122,26 @@ def test_legacy_pgvector_migration_test_still_only_covers_its_own_revision() -> 
     )
 
     assert f'PGVECTOR_REVISION = "{PGVECTOR_REVISION}"' in source
+
+
+def test_online_upgrade_requires_migration_database_url_without_root_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只有 DATABASE_URL 时在线迁移必须在连接前失败，不回退也不读仓库根 .env。
+
+    工作目录隔离到没有 .env 的临时目录；即使实现错误地去构造 Settings，也读不到仓库根
+    .env。DATABASE_URL 使用自制无效 DSN：一旦意外尝试连接就会先报连接错误而非 CommandError。
+    """
+
+    monkeypatch.chdir(tmp_path)
+    config = Config(str(ALEMBIC_INI))
+    monkeypatch.delenv("MIGRATION_DATABASE_URL", raising=False)
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/citemind"
+    )
+
+    with pytest.raises(CommandError, match="MIGRATION_DATABASE_URL"):
+        command.upgrade(config, "head")
 
 
 def test_offline_upgrade_sql_covers_the_business_tables(
@@ -166,7 +202,10 @@ def test_offline_upgrade_sql_grants_the_business_tables_exactly(
         for statement in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
             assert f"GRANT {statement} ON TABLE {table}" not in output
     assert output.count("GRANT ") == (
-        FIRST_SLICE_GRANT_COUNT + len(SECOND_SLICE_GRANTS) + len(LLM_USAGE_GRANTS)
+        FIRST_SLICE_GRANT_COUNT
+        + len(SECOND_SLICE_GRANTS)
+        + len(LLM_USAGE_GRANTS)
+        + len(IDENTITY_GRANTS)
     )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
@@ -194,6 +233,31 @@ def test_offline_downgrade_sql_removes_llm_usage(
     output = capsys.readouterr().out
 
     assert "DROP TABLE llm_usage;" in output
+
+
+def test_offline_upgrade_sql_grants_identity_tables_only_to_api(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(alembic_config(), "head", sql=True)
+    output = capsys.readouterr().out
+
+    for table in IDENTITY_TABLES:
+        assert f"REVOKE ALL ON TABLE {table} FROM PUBLIC;" in output
+        for statement in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+            assert f"GRANT {statement} ON TABLE {table}" not in output
+        assert f"{table} TO citemind_worker" not in output
+    for grant in IDENTITY_GRANTS:
+        assert grant in output
+
+
+def test_offline_downgrade_sql_removes_identity_tables(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(alembic_config(), f"{IDENTITY_REVISION}:{LLM_USAGE_REVISION}", sql=True)
+    output = capsys.readouterr().out
+
+    for table in IDENTITY_TABLES:
+        assert f"DROP TABLE {table};" in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(

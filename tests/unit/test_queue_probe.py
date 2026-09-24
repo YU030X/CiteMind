@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from evidencehub.queue_probe import (
+from rag_backend.queue_probe import (
     QueueProbeError,
     read_probe_marker,
     verify_probe_marker,

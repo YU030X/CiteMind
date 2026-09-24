@@ -5,8 +5,8 @@ from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
-from evidencehub.models import metadata
 from pgvector.sqlalchemy import Vector
+from rag_backend.models import metadata
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 
 FIRST_SLICE_TABLES = {
@@ -19,7 +19,10 @@ FIRST_SLICE_TABLES = {
 }
 SECOND_SLICE_TABLES = {"index_generation", "chunk", "chunk_embedding"}
 LLM_USAGE_TABLES = {"llm_usage"}
-EXPECTED_TABLES = FIRST_SLICE_TABLES | SECOND_SLICE_TABLES | LLM_USAGE_TABLES
+IDENTITY_TABLES = {"user_account", "auth_session", "kb_member"}
+EXPECTED_TABLES = (
+    FIRST_SLICE_TABLES | SECOND_SLICE_TABLES | LLM_USAGE_TABLES | IDENTITY_TABLES
+)
 
 # chunk_embedding 的主键来自 chunk，不是应用新生成的 UUID。
 UUID_PK_TABLES = EXPECTED_TABLES - {"chunk_embedding"}
@@ -31,7 +34,13 @@ UPDATED_AT_TABLES = {
     "ingest_job",
     "outbox_event",
     "index_generation",
+    "user_account",
+    "auth_session",
+    "kb_member",
 }
+
+# ``expires_at`` 由应用按会话 TTL 显式写入，是唯一非空但没有 server_default 的时间列。
+EXPLICIT_TIMESTAMPS_WITHOUT_SERVER_DEFAULT = {"expires_at"}
 
 EXPECTED_NAMED_CONSTRAINTS = {
     "index_profile": {
@@ -116,6 +125,22 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "ck_llm_usage_failure_has_error_code",
         "ck_llm_usage_price_consistent",
     },
+    "user_account": {
+        "pk_user_account",
+        "uq_user_account_organization_id_username",
+    },
+    "auth_session": {
+        "pk_auth_session",
+        "fk_auth_session_user_id_user_account",
+        "uq_auth_session_token_hash",
+    },
+    "kb_member": {
+        "pk_kb_member",
+        "fk_kb_member_kb_id_knowledge_base",
+        "fk_kb_member_user_id_user_account",
+        "uq_kb_member_kb_id_user_id",
+        "ck_kb_member_role",
+    },
 }
 
 EXPECTED_INDEXES = {
@@ -182,6 +207,10 @@ def test_timestamps_are_timezone_aware(table_name: str) -> None:
         assert cast(sa.DateTime, column.type).timezone is True, (
             f"{table_name}.{column.name} 必须带时区"
         )
+        if column.name in EXPLICIT_TIMESTAMPS_WITHOUT_SERVER_DEFAULT:
+            assert column.nullable is False
+            assert column.server_default is None
+            continue
         assert column.nullable == (column.server_default is None), (
             f"{table_name}.{column.name} 的可空性与 server_default 不匹配"
         )
@@ -416,3 +445,108 @@ def test_llm_usage_status_and_usage_source_are_enumerated() -> None:
     assert "TIMEOUT" in status_sql
     assert "PROVIDER_REPORTED" in source_sql
     assert "UNKNOWN" in source_sql
+
+
+def _unique_columns(table_name: str, constraint_name: str) -> list[str]:
+    table = metadata.tables[table_name]
+    (constraint,) = [
+        constraint for constraint in table.constraints if constraint.name == constraint_name
+    ]
+    assert isinstance(constraint, sa.UniqueConstraint)
+    return [column.name for column in constraint.columns]
+
+
+def test_user_account_has_only_the_frozen_columns() -> None:
+    table = metadata.tables["user_account"]
+
+    assert [column.name for column in table.columns] == [
+        "id",
+        "organization_id",
+        "username",
+        "password_hash",
+        "enabled",
+        "is_admin",
+        "created_at",
+        "updated_at",
+    ]
+
+
+def test_user_account_username_is_unique_within_organization() -> None:
+    columns = _unique_columns(
+        "user_account", "uq_user_account_organization_id_username"
+    )
+
+    assert columns == ["organization_id", "username"]
+
+
+def test_auth_session_has_only_the_frozen_columns() -> None:
+    table = metadata.tables["auth_session"]
+
+    assert [column.name for column in table.columns] == [
+        "id",
+        "user_id",
+        "token_hash",
+        "csrf_token_hash",
+        "expires_at",
+        "revoked_at",
+        "created_at",
+        "updated_at",
+    ]
+
+
+def test_auth_session_token_hash_is_unique() -> None:
+    columns = _unique_columns("auth_session", "uq_auth_session_token_hash")
+
+    assert columns == ["token_hash"]
+
+
+def test_auth_session_required_columns_and_soft_revoke() -> None:
+    table = metadata.tables["auth_session"]
+
+    for name in ("user_id", "token_hash", "csrf_token_hash", "expires_at"):
+        assert table.columns[name].nullable is False, name
+    assert table.columns["revoked_at"].nullable is True
+    assert table.columns["revoked_at"].server_default is None
+
+
+def test_kb_member_has_only_the_frozen_columns() -> None:
+    table = metadata.tables["kb_member"]
+
+    assert [column.name for column in table.columns] == [
+        "id",
+        "kb_id",
+        "user_id",
+        "role",
+        "revoked_at",
+        "created_at",
+        "updated_at",
+    ]
+
+
+def test_kb_member_kb_and_user_are_unique() -> None:
+    columns = _unique_columns("kb_member", "uq_kb_member_kb_id_user_id")
+
+    assert columns == ["kb_id", "user_id"]
+
+
+def test_kb_member_role_is_enumerated() -> None:
+    table = metadata.tables["kb_member"]
+    (check,) = [
+        constraint
+        for constraint in table.constraints
+        if constraint.name == "ck_kb_member_role"
+    ]
+    assert isinstance(check, sa.CheckConstraint)
+    sql_text = str(check.sqltext)
+
+    for role in ("OWNER", "EDITOR", "READER"):
+        assert role in sql_text
+
+
+def test_kb_member_required_columns_and_soft_revoke() -> None:
+    table = metadata.tables["kb_member"]
+
+    for name in ("kb_id", "user_id", "role"):
+        assert table.columns[name].nullable is False, name
+    assert table.columns["revoked_at"].nullable is True
+    assert table.columns["revoked_at"].server_default is None

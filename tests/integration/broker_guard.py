@@ -9,9 +9,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-TEST_REDIS_URL_ENV = "CITEMIND_TEST_REDIS_URL"
-ALLOW_TEST_REDIS_ENV = "CITEMIND_ALLOW_TEST_REDIS"
+TEST_REDIS_URL_ENV = "TEST_REDIS_URL"
+ALLOW_TEST_REDIS_ENV = "ALLOW_TEST_REDIS"
 ALLOW_TEST_REDIS_VALUE = "1"
+
+# 旧版本用 CITEMIND_ 前缀；残留旧键时显式失败，避免新守卫找不到裸名而静默跳过真实 broker 测试。
+LEGACY_TEST_ENV_VARS = (
+    "CITEMIND_TEST_REDIS_URL",
+    "CITEMIND_ALLOW_TEST_REDIS",
+)
 
 REDIS_SCHEMES = frozenset({"redis", "rediss"})
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -23,6 +29,23 @@ class GuardError(RuntimeError):
 
 class MissingTestRedisError(GuardError):
     """未提供测试 broker DSN；这是正常跳过，不是失败。"""
+
+
+def reject_legacy_test_env_vars(environment: Mapping[str, str]) -> None:
+    """旧 CITEMIND_ 前缀测试变量残留时显式失败，不静默跳过（键名大小写不敏感）。"""
+
+    offenders = sorted(
+        {
+            legacy
+            for legacy in LEGACY_TEST_ENV_VARS
+            for key in environment
+            if key.upper() == legacy
+        }
+    )
+    if offenders:
+        raise GuardError(
+            "检测到已废弃的 CITEMIND_ 前缀测试变量，请改为裸名后重试: " + "、".join(offenders)
+        )
 
 
 @dataclass(frozen=True)
@@ -71,6 +94,7 @@ def resolve_test_redis(environment: Mapping[str, str]) -> RedisBrokerTarget:
     """
 
     redis_url = environment.get(TEST_REDIS_URL_ENV)
+    reject_legacy_test_env_vars(environment)
     if not redis_url:
         raise MissingTestRedisError(
             f"未设置 {TEST_REDIS_URL_ENV}，跳过真实 Redis broker 集成测试"

@@ -1,19 +1,20 @@
 # CiteMind Phase 0 Linux Compose 确定性验收 override：在共享 marker 卷上运行一次性 queue-probe。
 # 验收只显式启动 queue-probe service；Compose 会自动带上它依赖的 worker/redis/postgres，
 # 从而避免六服务里其余容器干扰 `--abort-on-container-exit`。
+# 环境变量统一为无前缀裸名；旧 CITEMIND_* 键已失效。
 # 用法（从仓库根目录，单行）：
 #   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml up --build --abort-on-container-exit --exit-code-from queue-probe queue-probe
 # 清理（单行）：保留 postgres/redis/marker 命名卷，不用 `down -v`：
 #   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/queue.yml down --remove-orphans
 # 如需单独删除 queue-probe 的 marker 卷，用 `docker volume rm citemind_probe-markers`；不要用 `down -v`，它会一并删除数据库与 Redis 数据。
-# queue-probe 派发唯一 evidencehub.probe，只在共享 marker 卷里等待并校验 marker；成功 exit 0，失败/超时非 0。
+# queue-probe 派发唯一 rag_backend.probe，只在共享 marker 卷里等待并校验 marker；成功 exit 0，失败/超时非 0。
 # 不给 worker 添加 result backend；probe 仍不写业务表或任务状态。base compose 默认不运行 queue-probe。
 
 services:
   worker:
     environment:
       # 只有显式配置该受信目录时 probe 才写 marker；payload 无法控制路径。
-      CITEMIND_PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers
+      PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers
     volumes:
       - probe-markers:/var/lib/citemind/probe-markers
 
@@ -25,10 +26,10 @@ services:
       target: worker
     restart: "no"
     environment:
-      CITEMIND_ENVIRONMENT: development
-      CITEMIND_REDIS_URL: redis://:${CITEMIND_REDIS_PASSWORD:?必须设置 CITEMIND_REDIS_PASSWORD}@redis:6379/0
-      CITEMIND_PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers
-      CITEMIND_QUEUE_PROBE_TIMEOUT_SECONDS: "90"
+      ENVIRONMENT: development
+      REDIS_URL: redis://:${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}@redis:6379/0
+      PROBE_MARKER_DIRECTORY: /var/lib/citemind/probe-markers
+      QUEUE_PROBE_TIMEOUT_SECONDS: "90"
     depends_on:
       redis:
         condition: service_healthy
@@ -39,7 +40,7 @@ services:
     command:
       - python
       - -m
-      - evidencehub.queue_probe
+      - rag_backend.queue_probe
 
 volumes:
   probe-markers:
