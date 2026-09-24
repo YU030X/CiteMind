@@ -329,6 +329,21 @@ def test_compose_worker_service_runs_celery_and_depends_on_data_services() -> No
     assert "inference:" not in compose_service_block("worker")
 
 
+def test_compose_worker_consumes_ingest_and_default_probe_queues() -> None:
+    worker_block = compose_service_block("worker")
+
+    # 同一 worker 同时消费 ingest 专用队列与 probe 的默认队列，两类任务只按队列隔离。
+    assert "--queues=celery,ingest" in worker_block
+
+
+def test_compose_api_enables_dispatcher_without_blocking_on_redis_health() -> None:
+    api_block = compose_service_block("api")
+
+    assert 'DISPATCHER_ENABLED: "true"' in api_block
+    # dispatcher 启用后仍只等 redis 启动（而非 healthy），慢启动不阻塞 API。
+    assert "condition: service_started" in api_block
+
+
 def test_dockerfile_pins_base_images_and_runs_the_worker_as_non_root() -> None:
     content = DOCKERFILE.read_text(encoding="utf-8")
     pinned = [

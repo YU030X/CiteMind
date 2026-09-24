@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from rag_backend.dispatch.protocol import INGEST_REQUESTED_EVENT_TYPE
 from rag_backend.ingestion.errors import DocumentTooLarge, IdempotencyConflict
 from rag_backend.ingestion.storage import DocumentBlobStore, content_hash
 from rag_backend.ingestion.validation import (
@@ -45,7 +45,8 @@ VERSION_STATUS_PENDING = "PENDING"
 JOB_STATUS_QUEUED = "QUEUED"
 OUTBOX_STATUS_PENDING = "PENDING"
 # outbox 只携带 job 引用与协议事件类型；不含正文、凭据或可执行路径。
-OUTBOX_EVENT_TYPE = "ingest.requested"
+# 事件类型由 dispatch 协议统一定义，避免投递端与写入端各写一份字面量。
+OUTBOX_EVENT_TYPE = INGEST_REQUESTED_EVENT_TYPE
 
 
 @dataclass(frozen=True)
@@ -118,9 +119,12 @@ async def _insert_upload(
     file_hash: str,
     dedupe_key: str,
 ) -> UploadOutcome:
-    """写入四张表并提交；唯一去重键并发冲突时回滚后重读。"""
+    """写入四张表并提交；唯一去重键并发冲突时回滚后重读。
 
-    now = datetime.now(UTC)
+    ``ingest_job.next_run_at`` 与 ``outbox_event.next_send_at`` 不传值，由数据库
+    ``now()`` server_default 提供，避免应用时钟与 DB 时钟不一致导致投递后立即被补偿。
+    """
+
     document_id = uuid.uuid4()
     version_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -164,7 +168,6 @@ async def _insert_upload(
                 lease_token=None,
                 lease_until=None,
                 heartbeat_at=None,
-                next_run_at=now,
                 dedupe_key=dedupe_key,
                 error_code=None,
             )
@@ -177,7 +180,6 @@ async def _insert_upload(
                 event_type=OUTBOX_EVENT_TYPE,
                 status=OUTBOX_STATUS_PENDING,
                 dispatch_attempt=0,
-                next_send_at=now,
                 lease_owner=None,
                 lease_token=None,
                 lease_until=None,

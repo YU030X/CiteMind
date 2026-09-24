@@ -101,6 +101,9 @@ services:
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.28.10.0/24}
       # 上传原文件落在 api 专用私有命名卷；路径只由服务端 KB ID 与内容 SHA-256 派生。
       DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
+      # Phase 1：由 API 进程 lifespan 承载 outbox dispatcher，向 Redis 的 ingest 队列投递。
+      # 非 Compose 默认关闭（Settings.dispatcher_enabled=false），避免测试进程意外连 broker。
+      DISPATCHER_ENABLED: "true"
     volumes:
       # api 专用命名卷：镜像内该目录已归属 uid 10001，新建卷会继承该所有权。
       # 不挂宿主目录，也不与其他进程共享；worker/inference 无权访问。
@@ -178,6 +181,8 @@ services:
       - worker
       - --loglevel=INFO
       - --concurrency=1
+      # 同时消费 ingest 专用队列与 probe 的默认队列，两类任务不混淆。
+      - --queues=celery,ingest
     healthcheck:
       # 通过 broker 回环的 inspect ping 确认 worker 真的在消费；无回复时 grep 失败。
       test: ["CMD-SHELL", "celery -A rag_backend.worker:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]

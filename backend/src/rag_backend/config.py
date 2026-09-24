@@ -190,6 +190,9 @@ class Settings(BaseSettings):
     document_storage_directory: str = "/var/lib/citemind/documents"
     # queue-probe 一次性验收入口等待 marker 的时限；只用于 Linux Compose 验收。
     queue_probe_timeout_seconds: float = 60.0
+    # 是否在 API 进程 lifespan 启动后台 outbox dispatcher。非 Compose 默认关闭，
+    # 避免开发/测试进程意外连 broker 或数据库写表；Compose 显式设为 true。
+    dispatcher_enabled: bool = False
     # 产品专用 DeepSeek 密钥；仅由显式 opt-in 的一次性探针读取，默认不配置。
     # 与开发期 Node Jev 专用的 AI_GATEWAY_API_KEY 无关，后者不是本配置字段，
     # 不会进入本配置或 api/worker 运行时。
@@ -262,6 +265,8 @@ class Settings(BaseSettings):
             raise ValueError("document_storage_directory 不能为空字符串")
         if self.queue_probe_timeout_seconds <= 0:
             raise ValueError("queue_probe_timeout_seconds 必须为正数")
+        if self.dispatcher_enabled and self.redis_url is None:
+            raise ValueError("启用 dispatcher 必须配置 Redis URL 作为投递 broker")
         if self.llm_api_key is not None and not self.llm_api_key.get_secret_value().strip():
             # 空白值等于未配置密钥，避免探针把空字符串当成凭据。
             self.llm_api_key = None
