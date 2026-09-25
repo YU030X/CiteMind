@@ -8,6 +8,7 @@ from httpx import Response
 from support import TEST_TOKEN, StubEmbedder, build_settings
 
 from citemind_inference.app import create_app
+from citemind_inference.config import BGE_ZH_QUERY_PREFIX, QUERY_ENCODING_CONTRACT
 
 EMBED_URL = "/internal/embed"
 AUTH = {"Authorization": f"Bearer {TEST_TOKEN}"}
@@ -111,6 +112,98 @@ def test_embed_defaults_to_document_kind(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def test_embed_document_kind_is_unchanged_without_query_prefix(
+    client: TestClient, embedder: StubEmbedder
+) -> None:
+    text = "企业知识库的段落正文"
+
+    response = post_texts(client, [text], kind="document")
+
+    assert response.status_code == 200
+    assert embedder.token_count_calls == [[text]]
+    assert embedder.embed_calls == [[text]]
+    assert response.json()["tokenCounts"] == [len(text) + 2]
+
+
+def test_query_prefix_and_contract_match_frozen_golden_literals() -> None:
+    # 独立 literal golden：不引用被测常量本身，改动 prefix/契约而不同步这里就会失败。
+    # 这只能证明“实现没有偏离已记录的前缀与契约版本”，不能自证前缀一定正确。
+    assert BGE_ZH_QUERY_PREFIX == "为这个句子生成表示以用于检索相关文章："
+    assert QUERY_ENCODING_CONTRACT == "bge-zh-query-v1"
+
+
+def test_embed_query_response_carries_wire_contract(
+    client: TestClient,
+) -> None:
+    response = post_texts(client, ["企业知识库怎么用"], kind="query")
+
+    assert response.status_code == 200
+    assert response.json()["queryEncodingContract"] == QUERY_ENCODING_CONTRACT
+
+
+def test_embed_document_response_omits_wire_contract(
+    client: TestClient,
+) -> None:
+    response = post_texts(client, ["企业知识库的段落正文"], kind="document")
+
+    assert response.status_code == 200
+    # document 响应结构与旧客户端校验不变，不得凭空多出 queryEncodingContract。
+    assert "queryEncodingContract" not in response.json()
+
+
+def test_embed_query_applies_official_prefix_exactly_once(
+    client: TestClient, embedder: StubEmbedder
+) -> None:
+    text = "企业知识库怎么用"
+    prefixed = f"{BGE_ZH_QUERY_PREFIX}{text}"
+
+    response = post_texts(client, [text], kind="query")
+
+    assert response.status_code == 200
+    # 计数与编码都基于服务端追加前缀后的完整模型输入，且前缀只出现一次。
+    assert embedder.token_count_calls == [[prefixed]]
+    assert embedder.embed_calls == [[prefixed]]
+    assert response.json()["tokenCounts"] == [len(prefixed) + 2]
+
+
+def test_embed_query_does_not_deduplicate_user_written_instruction(
+    client: TestClient, embedder: StubEmbedder
+) -> None:
+    # 用户输入本身以官方 instruction 开头时，服务端仍原样再追加一次，不改写、不去重。
+    text = f"{BGE_ZH_QUERY_PREFIX}用户自己写下的句子"
+
+    post_texts(client, [text], kind="query")
+
+    assert embedder.embed_calls == [[f"{BGE_ZH_QUERY_PREFIX}{text}"]]
+
+
+def test_embed_query_prefix_counts_toward_512_token_budget_and_never_truncates(
+    client: TestClient, embedder: StubEmbedder
+) -> None:
+    # stub 计数是“字符数 + 2”；前缀本身也占用 token 预算。
+    boundary = "a" * (512 - 2 - len(BGE_ZH_QUERY_PREFIX))
+    allowed = post_texts(client, [boundary], kind="query")
+    oversized = post_texts(client, [boundary + "a"], kind="query")
+
+    assert allowed.status_code == 200
+    assert allowed.json()["tokenCounts"] == [512]
+    assert oversized.status_code == 422
+    assert oversized.json()["code"] == "EMBEDDING_INPUT_TOO_LONG"
+    # 超出模型 512 位置上限时绝不截断后偷偷编码。
+    assert embedder.embed_calls == [[f"{BGE_ZH_QUERY_PREFIX}{boundary}"]]
+
+
+def test_embed_query_token_overflow_error_does_not_echo_input(client: TestClient) -> None:
+    sentinel = "SENTINEL-QUERY-OVERFLOW-8c1d"
+    text = "a" * 511 + sentinel
+
+    response = post_texts(client, [text], kind="query")
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "EMBEDDING_INPUT_TOO_LONG"
+    assert sentinel not in response.text
+
+
 def test_embed_passes_texts_to_embedder_once(
     client: TestClient, embedder: StubEmbedder
 ) -> None:
@@ -124,8 +217,8 @@ def test_embed_passes_texts_to_embedder_once(
 # ---------------------------------------------------------------- 422 与不回显
 
 
-@pytest.mark.parametrize("kind", ["query", "document_chunk", "QUERY"])
-def test_embed_rejects_non_document_kind(client: TestClient, kind: str) -> None:
+@pytest.mark.parametrize("kind", ["document_chunk", "QUERY", "Query"])
+def test_embed_rejects_unknown_kind(client: TestClient, kind: str) -> None:
     response = post_texts(client, ["文本"], kind=kind)
 
     assert response.status_code == 422
@@ -147,7 +240,7 @@ def test_embed_rejects_blank_and_empty_texts(client: TestClient) -> None:
 def test_schema_422_does_not_echo_raw_body(client: TestClient) -> None:
     sentinel = "SENTINEL-DO-NOT-ECHO-7f3a"
 
-    response = post_texts(client, [sentinel], kind="query")
+    response = post_texts(client, [sentinel], kind="document_chunk")
 
     assert response.status_code == 422
     assert sentinel not in response.text

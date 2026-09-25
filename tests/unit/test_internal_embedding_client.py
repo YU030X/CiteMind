@@ -225,7 +225,16 @@ def test_wire_field_names_match_inference_camel_case_schema() -> None:
     response_fields = _class_field_values(INFERENCE_SRC / "schemas.py", "EmbedResponse")
     request_fields = _class_field_values(INFERENCE_SRC / "schemas.py", "EmbedRequest")
 
-    assert set(response_fields) == {"vectors", "dimension", "model_revision", "token_counts"}
+    assert set(response_fields) == {
+        "vectors",
+        "dimension",
+        "model_revision",
+        "token_counts",
+        "query_encoding_contract",
+    }
+    # 查询契约字段必须可选（默认 None）：document 响应才能省略它、不破坏旧客户端校验。
+    contract_default = response_fields["query_encoding_contract"]
+    assert isinstance(contract_default, ast.Constant) and contract_default.value is None
     assert set(request_fields) == {"kind", "texts"}
     assert REQUEST_KIND_KEY == "kind"
     assert REQUEST_TEXTS_KEY == "texts"

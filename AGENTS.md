@@ -32,15 +32,13 @@ The primary agent may perform small read-only checks when needed to audit a resu
 
 ### Herdr execution model
 
-use deepseek model
-
-Create subagents through the `subagent` tool provided by `pi-herdr-subagents`.
+Create subagents through the `subagent` tool provided by `pi-herdr-subagents`. Every subagent created this way must explicitly specify the verified DeepSeek model ID `cpa1/cline-pass/deepseek-v4.1-flash`; do not rely on an implicit, inherited, or default model.
 
 - Each subagent must run in its own **new Herdr tab**. Do not create subagents by splitting the current pane.
 - Use one primary responsibility per subagent and provide a bounded objective, relevant context, ownership boundaries, and expected output.
 - Run independent tasks in parallel when their file ownership and dependencies do not conflict.
 - Do not allow multiple implementation agents to edit the same files concurrently unless ownership is explicitly partitioned.
-- Prefer named project-local agents from `.pi/agents/` so role defaults and safety constraints are applied consistently.
+- Prefer the narrowest named agent available for the work; if project-local agent definitions exist, keep them in `.pi/agents/` so role defaults and safety constraints are applied consistently.
 
 A delegated task remains part of the parent task until it reaches a terminal outcome and its result has been reviewed. The primary agent may become idle while subagents run; it should not busy-poll them. Completion, failure, stall/recovery, and `caller_ping` notifications from `pi-herdr-subagents` should wake the parent when action is required.
 
@@ -73,26 +71,26 @@ For substantial work, the primary agent should:
 
 If a child uses `caller_ping`, resolve deterministic questions directly from evidence. For bounded semantic questions, consult the dedicated `jev-decider` session, then use `subagent_resume` to return the decision and relevant evidence to the blocked child.
 
-## Jev decision subagent
+## Jev decision layer
 
-Use a dedicated `jev-decider` subagent as the repository's semantic decision layer.
+Use `pi-typesafe` as the repository's lightweight semantic decision layer. Prefer direct `typesafe_evaluate` calls over creating a dedicated Jev subagent.
 
-Maintain one logical Jev decision session for the current task or decision domain. Create it when semantic judgment is first needed, then prefer `subagent_resume` for follow-up decisions so the decision context remains coherent. Do not create competing Jev decision agents for the same decision stream unless the task intentionally requires independent judgments.
+Use Jev only for bounded semantic judgments, such as routing, boolean conditions, choosing among explicit alternatives, scoring, evidence checks, requirement satisfaction, and continue/retry/escalate/stop decisions.
 
-The `jev-decider` may use available Jev MCP tools for bounded judgments such as:
+Each request should include:
 
-- routing a task to an appropriate handler or subagent;
-- deciding whether a semantic condition holds;
-- choosing among a small explicit set of alternatives;
-- comparing or ordering candidates along a defined dimension;
-- checking whether supplied evidence supports a claim;
-- reviewing whether an implementation satisfies stated requirements;
-- deciding whether work should continue, retry, escalate, or stop.
+- minimal relevant `state`;
+- explicit `questions`;
+- `choice` for bounded selection;
+- `noul` for boolean judgments;
+- `score` for ordered or continuous judgments.
 
-Prefer the Jev MCP operation that most closely matches the question, such as verify, decide, compare/rerank, classify, review, or gate when those operations are available.
+The primary agent must construct `state` and `questions` from supported evidence only. Include relevant contradictory evidence and do not fill missing facts with assumptions.
 
-Do not use Jev for deterministic rules, exact calculations, known lookups, filesystem operations, shell execution, code generation, or open-ended repository exploration. Supply Jev with the smallest sufficient evidence and an explicit bounded question.
+Do not use Jev for deterministic logic, exact calculations, lookups, filesystem or shell operations, code generation, or open-ended exploration.
 
-Jev output is decision evidence, not authority. The primary agent must review the evidence and result before using it. If the result is low-confidence, ambiguous, or conflicts with deterministic evidence, gather more evidence or delegate further investigation rather than following it blindly.
+Treat Jev output as decision evidence, not authority. Review confidence and returned results before acting. If the result is ambiguous, low-confidence, or conflicts with deterministic evidence, gather more evidence instead.
 
-The `jev-decider` must not edit repository files or perform implementation work. Implementation remains the responsibility of `worker`; verification remains the responsibility of `tester` and `reviewer`.
+For repeated workflow gates, extensions may call the `pi-typesafe` API directly instead of requiring an agent tool call.
+
+Implementation remains the responsibility of `worker`; verification remains the responsibility of `tester` and `reviewer`.

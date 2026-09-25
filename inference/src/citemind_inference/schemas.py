@@ -63,10 +63,12 @@ class ReadyResponse(CamelModel):
 class EmbedRequest(CamelModel):
     """内部编码请求。
 
-    本切片只接受 ``kind=document``；``query`` 会因 Literal 校验直接得到 422。
+    ``kind=document`` 原样编码正文；``kind=query`` 由服务端按 ``QUERY_ENCODING_CONTRACT``
+    在每条文本前恰好追加一次官方 instruction 前缀，token 计数与向量都基于追加后的完整
+    模型输入。未知 kind 仍由 Literal 校验得到 422。
     """
 
-    kind: Literal["document"] = "document"
+    kind: Literal["document", "query"] = "document"
     texts: list[str]
 
     @field_validator("texts")
@@ -84,5 +86,9 @@ class EmbedResponse(CamelModel):
     vectors: list[list[float]]
     dimension: int
     model_revision: str
-    # 与 vectors 同序的真实 token 数，包含特殊 token。
+    # 与 vectors 同序的**完整模型输入**（``kind=query`` 时含服务端追加的 instruction 前缀）
+    # 真实 token 数，包含特殊 token；不是用户原始查询文本的 token 数。
     token_counts: list[int]
+    # 仅 ``kind=query`` 返回的具名查询契约版本；文档响应通过 ``exclude_none`` 省略该字段，
+    # 保持既有 document 响应结构与旧客户端校验不变。
+    query_encoding_contract: str | None = None

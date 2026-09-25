@@ -50,6 +50,13 @@ FROZEN_EMBEDDING_REVISION = "7999e1d3359715c523056ef9478215996d62a620"
 EMBEDDING_DIMENSION = 512
 EMBEDDING_MAX_TOKENS = 512
 
+# 查询编码契约：BGE 中文模型的官方检索 instruction 前缀。前缀是独立的具名契约，不并入
+# modelRevision——仅凭 revision 无法识别 instruction 漂移。前缀只由服务端在编码前恰好追加
+# 一次，客户端只发送原始查询文本；用户输入本身以该文本开头时仍原样不改、不去重。改变前缀、
+# 追加位置或计数方式都必须新建版本并重新评估，不能静默切换。
+BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+QUERY_ENCODING_CONTRACT = "bge-zh-query-v1"
+
 # 容器内的默认本地模型目录；镜像需要提前把冻结 revision 的权重放到这里。
 DEFAULT_EMBEDDING_MODEL_PATH = Path("/models/bge-small-zh-v1.5")
 

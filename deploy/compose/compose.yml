@@ -8,7 +8,7 @@
 # dispatcher/业务 API 仍未实现。云 LLM 用量账本 llm_usage 由迁移 20260923_0004 落地；
 # 一次性真实探针 rag_backend.llm_probe 默认关闭、不随容器启动，已由用户执行一次真实
 # DeepSeek 成功调用并与 llm_usage 落账回读；Phase 0 工程底座退出条件据此达成。
-# 环境变量统一为无前缀裸名（如 MIGRATION_DB_PASSWORD、DATABASE_URL）；旧 CITEMIND_* 键已失效。
+# 环境变量统一为无前缀裸名（如 MIGRATION_DB_PASSWORD、DATABASE_URL）。
 # 命令（均从仓库根目录执行，单行）：
 #   docker compose --env-file .env.example -f deploy/compose/compose.yml config --quiet
 #   docker compose --env-file .env -f deploy/compose/compose.yml up -d --build --wait

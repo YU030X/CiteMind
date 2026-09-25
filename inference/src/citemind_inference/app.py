@@ -26,7 +26,12 @@ from citemind_inference.admission import (
     EmbeddingQueueTimeoutError,
     EmbeddingTaskRegistry,
 )
-from citemind_inference.config import Settings, get_settings
+from citemind_inference.config import (
+    BGE_ZH_QUERY_PREFIX,
+    QUERY_ENCODING_CONTRACT,
+    Settings,
+    get_settings,
+)
 from citemind_inference.embeddings import Embedder, EmbedderFactory
 from citemind_inference.schemas import (
     CapabilitiesResponse,
@@ -390,6 +395,8 @@ def create_app(
         "/internal/embed",
         dependencies=[Depends(require_inference_token)],
         response_model=EmbedResponse,
+        # None 字段不回传：document 响应不凭空多出 queryEncodingContract。
+        response_model_exclude_none=True,
         responses={
             status.HTTP_413_CONTENT_TOO_LARGE: {"model": ErrorResponse},
             status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
@@ -408,21 +415,29 @@ def create_app(
             )
 
         # 廉价语义检查：不需要模型，也不占用 CPU 许可。
+        # 查询编码在服务端恰好追加一次官方 instruction 前缀；文档路径完全不经过该分支。
+        # token 计数与向量都基于追加后的完整模型输入，因此 tokenCounts 含前缀与特殊 token。
         texts = payload.texts
-        if len(texts) > settings.embedding_max_batch_size:
+        model_texts = (
+            [f"{BGE_ZH_QUERY_PREFIX}{text}" for text in texts]
+            if payload.kind == "query"
+            else texts
+        )
+        if len(model_texts) > settings.embedding_max_batch_size:
             raise InferenceError(
                 status.HTTP_413_CONTENT_TOO_LARGE,
                 PAYLOAD_TOO_LARGE_CODE,
-                f"请求包含 {len(texts)} 条文本，超过单次上限 {settings.embedding_max_batch_size}",
+                f"请求包含 {len(model_texts)} 条文本，"
+                f"超过单次上限 {settings.embedding_max_batch_size}",
             )
-        total_bytes = sum(len(text.encode("utf-8")) for text in texts)
+        total_bytes = sum(len(text.encode("utf-8")) for text in model_texts)
         if total_bytes > settings.embedding_max_total_bytes:
             raise InferenceError(
                 status.HTTP_413_CONTENT_TOO_LARGE,
                 PAYLOAD_TOO_LARGE_CODE,
                 f"请求文本合计 {total_bytes} 字节，超过上限 {settings.embedding_max_total_bytes}",
             )
-        for index, text in enumerate(texts):
+        for index, text in enumerate(model_texts):
             if len(text) > settings.embedding_max_chars_per_text:
                 raise InferenceError(
                     status.HTTP_413_CONTENT_TOO_LARGE,
@@ -451,7 +466,7 @@ def create_app(
 
         registry: EmbeddingTaskRegistry = request.app.state.embedding_tasks
         # 许可由工作线程归还；这里 shield 任务，使请求取消不会连带取消 CPU 工作。
-        task = registry.start(encode_batch(embedder, settings, texts, gate))
+        task = registry.start(encode_batch(embedder, settings, model_texts, gate))
         try:
             outcome = await asyncio.shield(task)
         except EmbeddingInputTooLong as error:
@@ -478,6 +493,9 @@ def create_app(
             dimension=embedder.dimension,
             model_revision=embedder.model_revision,
             token_counts=outcome.token_counts,
+            query_encoding_contract=(
+                QUERY_ENCODING_CONTRACT if payload.kind == "query" else None
+            ),
         )
 
     return app
