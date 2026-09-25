@@ -10,6 +10,8 @@
 
 KB 成员授权的服务端判定已实现：`require_kb_role` 每次请求都从数据库 `kb_member` join `knowledge_base` 重新判定当前用户在指定 KB 的最小角色（READER<EDITOR<OWNER），不跨请求缓存；KB 不存在、属于其他组织、成员已撤销或角色不足统一返回不暴露存在性的 404 `KNOWLEDGE_BASE_NOT_FOUND`。`GET /knowledge-bases` 只列会话组织内有效成员 KB；`POST /knowledge-bases` 只允许 `user_account.is_admin`，强制 Origin 与 CSRF，并在同一事务写入创建者 OWNER；`PUT /knowledge-bases/{id}/members` 只允许 OWNER，强制 Origin 与 CSRF，做全量替换：缺席者软撤销、重加入者清空 `revoked_at`，空、重复、缺少 OWNER 或引用外组织用户都拒绝且无部分事务，事务内锁定知识库行序列化并发并在锁内复核调用者仍是 OWNER，只有实际变化才递增 `acl_revision`。请求体中 `organizationId` 不生效（即使提交也不被采用），角色与用户组织都由服务端核对。替换结果必须至少保留一名启用中的 OWNER：新加入或提升一名已禁用用户为 OWNER 会被拒绝（422 `KB_MEMBER_OWNER_DISABLED`），只保留已禁用 OWNER 而不搭配任何启用 OWNER 则返回 409 `LAST_OWNER_REQUIRED`。该约束是替换事务时点的应用校验，数据库没有对应的永久约束，直接写库禁用最后一个 OWNER 或把唯一 OWNER 指向已禁用用户会绕过它。禁用 `user_account` 不会软撤销其 `kb_member` 行：成员记录保留，成员列表可能包含已禁用用户，账号重新启用后原角色恢复。正确的顺序是在禁用账号前先完成所有权移交；如果唯一 OWNER 已被直接写库禁用，现有 API 无法把所有权移交给一个无法登录的已禁用账号，本切片也没有管理员接管或自动恢复能力（当前没有 CLI 恢复/禁用入口），只能由运维在数据库层把该账号重新置为 `enabled` 后，再由本人登录完成移交。知识库角色为 OWNER、EDITOR、READER：READER 可问答和查看可见原文，EDITOR 可导入/更新，OWNER 可管理成员与删除。MVP 以 KB 成员授权；完整范围的文档 ACL 只能进一步收紧。读规则为当前组织、KB 成员、满足文档允许列表（若存在）、未删除、当前有效索引；组织和成员身份都来自后端会话。客户端 `kbIds` 只能取交集。
 
+index profile 的登记入口 `ensure_default_index_profile` 只使用 `citemind_api` 对 `index_profile` 的 SELECT 与 INSERT：不可变契约由「不授予 UPDATE」强制，运行角色也没有 DELETE，worker 对该表只有 SELECT、无 INSERT；它不经任何业务 HTTP 入口暴露。该函数不 UPDATE `knowledge_base`、不回填 `active_index_profile_id`，不提交或回滚事务，并用 `session.no_autoflush` 抑制自动 flush。当前它没有真实调用方、没有 seed、没有新迁移，KB 的 `active_index_profile_id` 仍为 NULL，登记全局 profile 不改变任何 KB 的授权或可检索性。
+
 向量与关键词候选 SQL 复用同一授权 JOIN（尚未实现）：权限过滤不能拖到生成回答之后；reranker、LLM、日志和缓存也不得先收到越权内容。会话、检索调试、反馈、旧版本、引用和文件下载各自重新鉴权。撤权和删除先提交授权事实与 `acl_revision`/`kb_revision`，让后续访问立即失效，再做异步物理清理。权限查询 MVP 不跨请求缓存最终答案或授权结果。
 
 ## 输入与文件

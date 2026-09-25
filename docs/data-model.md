@@ -61,6 +61,8 @@
 - 登记一个全局 profile 只表示该编码契约可用，不代表任何 KB 可检索；KB 是否可检索由 `knowledge_base.active_index_profile_id` 决定。
 - `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile。新 KB 尚无 READY 索引时保持 NULL；仅首次 READY 发布事务（以及后续 KB 级 profile 切换）可以置位或改写。上传事务与全局 profile 登记都不得把它从 NULL 回填为默认 profile。指针为 NULL 的 KB 不可检索。
 
+默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口尚无真实调用方，本轮没有新迁移、没有 seed 任何 profile，`knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言仍待 worker 接线时前置，登记成功不代表任何 KB 可检索。
+
 ## 计划中：后续切片
 
 以下实体与字段仍未实现。
