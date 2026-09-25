@@ -1,9 +1,12 @@
-"""默认 index profile 的幂等登记（API 角色，只 SELECT + INSERT）。
+"""默认 index profile 的幂等登记与只读预检（API 角色，只 SELECT + INSERT）。
 
-本模块只提供一个函数 :func:`ensure_default_index_profile`：把冻结的默认编码契约登记进
-全局 ``index_profile`` 表。它是可单独调用的入口，**不接线任何业务路径**：不改 KB 创建、
-上传受理、``knowledge_base.active_index_profile_id``、worker 任务或迁移；登记成功不代表
-任何 KB 可检索，也不把 KB 指针从 NULL 回填。
+本模块提供两个入口：:func:`ensure_default_index_profile` 把冻结的默认编码契约登记进全局
+``index_profile`` 表；:func:`precheck_default_index_profile` 在发布 blob 前只读预检同
+``config_hash`` 的既有行是否与默认契约一致。``ensure_default_index_profile`` 已接入新
+Markdown 上传写路径：在同一个四表事务内登记/复用默认 profile 行并把它绑定到
+``ingest_job.profile_id``。两个入口都不改 KB 创建、不写
+``knowledge_base.active_index_profile_id``、不接 worker 任务或迁移；登记成功不代表任何 KB
+可检索，也不把 KB 指针从 NULL 回填。
 
 语义边界：
 
@@ -154,3 +157,24 @@ async def ensure_default_index_profile(session: AsyncSession) -> uuid.UUID:
         )
     _assert_same_contract(existing, contract)
     return existing.id
+
+
+async def precheck_default_index_profile(session: AsyncSession) -> None:
+    """发布 blob 前只读预检默认契约的既有行；不登记、不提交、不回滚。
+
+    只按默认契约的 ``config_hash`` 做一次 SELECT：命中既有行时用
+    :func:`_assert_same_contract` 逐项核对七个契约字段，不一致抛
+    :class:`IndexProfileConflictError`；没有行则正常返回，登记与复用仍由后续写事务内的
+    :func:`ensure_default_index_profile` 权威完成。函数不 INSERT、不 UPDATE，也不
+    ``commit`` / ``rollback``。
+
+    **事务归属**：本函数会开启一个只读事务并占用连接；调用方必须在 ``finally`` 中
+    ``rollback`` 释放它，避免后续阻塞操作（如 blob fsync）期间空占连接。这是与
+    :func:`ensure_default_index_profile` 的差异：后者的事务由调用方在写路径上一次提交。
+    """
+
+    contract = default_index_profile()
+    with session.no_autoflush:
+        existing = await _load_by_config_hash(session, contract.config_hash())
+    if existing is not None:
+        _assert_same_contract(existing, contract)

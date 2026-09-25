@@ -23,6 +23,7 @@ from rag_backend.ingestion.profile_repository import (
     IndexProfileNotFoundError,
     IndexProfileRegistrationError,
     ensure_default_index_profile,
+    precheck_default_index_profile,
 )
 from rag_backend.models.indexing import IndexProfile
 from rag_backend.models.profile_contract import IndexProfileContract, default_index_profile
@@ -181,6 +182,42 @@ async def test_conflict_without_readable_row_raises_explicit_failure() -> None:
 
     with pytest.raises(IndexProfileNotFoundError):
         await ensure_default_index_profile(cast(AsyncSession, session))
+
+
+@pytest.mark.anyio
+async def test_precheck_without_row_is_read_only_and_does_not_write() -> None:
+    """无既有行时预检正常返回：只 SELECT，不 INSERT/commit/rollback。"""
+
+    session = _FakeSession([None])
+
+    await precheck_default_index_profile(cast(AsyncSession, session))
+
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 0
+    assert session.no_autoflush_entered
+    assert len(session.statements) == 1
+
+
+@pytest.mark.anyio
+async def test_precheck_matching_row_is_reused_without_conflict() -> None:
+    existing = _existing_profile()
+    session = _FakeSession([existing])
+
+    await precheck_default_index_profile(cast(AsyncSession, session))
+
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 0
+    assert len(session.statements) == 1
+
+
+@pytest.mark.anyio
+async def test_precheck_tampered_row_raises_conflict() -> None:
+    session = _FakeSession([_existing_profile(embedding_model="other/model")])
+
+    with pytest.raises(IndexProfileConflictError):
+        await precheck_default_index_profile(cast(AsyncSession, session))
+
+    assert session.commit_calls == 0
 
 
 def test_registration_errors_share_a_common_base() -> None:

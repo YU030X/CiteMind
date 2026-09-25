@@ -9,10 +9,12 @@
 - 不同 key、相同内容创建新的 ``document``，但复用 KB 范围内的私有 blob；这不是
   “同文档重复上传”，而是两份独立文档共享同一份内容寻址文件。
 - 并发下唯一去重键冲突走回滚后重读，再按上述复用/冲突规则处理。
-- 新上传在同一事务里幂等登记/复用全局默认 ``index_profile``，并把 ``ingest_job.profile_id``
-  显式绑定到该行；该行只表示编码契约已登记，不代表任何文档可检索，也不回填 KB 的
-  ``active_index_profile_id``。既有旧任务的 ``profile_id`` 保持 NULL，本切片不自动补绑、
-  不重投、不处理。
+- 新上传在写事务前先用一次只读 SELECT 预检同 ``config_hash`` 的既有 profile 行：字段被篡改
+  时在 publish blob 前 fail closed；没有行则继续，再由写事务内幂等登记/复用全局默认
+  ``index_profile``，并把 ``ingest_job.profile_id`` 显式绑定到该行；该行只表示编码契约已
+  登记，不代表任何文档可检索，也不回填 KB 的 ``active_index_profile_id``。既有旧任务的
+  ``profile_id`` 保持 NULL，本切片不自动补绑、不重投、不处理。
+- 只有 ``uq_ingest_job_dedupe_key`` 的 23505 唯一冲突才回滚重读；其它完整性错误原样重抛。
 
 本切片不实现 dispatcher、worker 业务任务、解析、embedding、发布与检索。KB 配额没有对应
 的存储字段或实体，因此这里不实现配额判定，也不新增迁移或权限。已发布的最终 blob 在事务
@@ -33,7 +35,10 @@ from starlette.concurrency import run_in_threadpool
 from rag_backend.dispatch.protocol import INGEST_REQUESTED_EVENT_TYPE
 from rag_backend.ingestion.errors import DocumentTooLarge, IdempotencyConflict
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
-from rag_backend.ingestion.profile_repository import ensure_default_index_profile
+from rag_backend.ingestion.profile_repository import (
+    ensure_default_index_profile,
+    precheck_default_index_profile,
+)
 from rag_backend.ingestion.storage import DocumentBlobStore, content_hash
 from rag_backend.ingestion.validation import (
     MARKDOWN_MEDIA_TYPE,
@@ -55,6 +60,9 @@ OUTBOX_STATUS_PENDING = "PENDING"
 # outbox 只携带 job 引用与协议事件类型；不含正文、凭据或可执行路径。
 # 事件类型由 dispatch 协议统一定义，避免投递端与写入端各写一份字面量。
 OUTBOX_EVENT_TYPE = INGEST_REQUESTED_EVENT_TYPE
+# 并发去重冲突识别：只有该具名唯一约束的 23505 冲突才允许回读复用。
+DEDUPE_KEY_CONSTRAINT_NAME = "uq_ingest_job_dedupe_key"
+UNIQUE_VIOLATION_SQLSTATE = "23505"
 
 
 @dataclass(frozen=True)
@@ -113,8 +121,18 @@ async def create_markdown_document(
     # 预热并校验默认 profile 的关键词分析器：default_index_profile() 会按需构造 jieba，同步
     # 读取约 5MB 基础词典并做私有临时目录 IO（约 0.6s）。放进线程池避免阻塞事件循环，且置于
     # publish 之前——失败时不会留下新 blob 或 DB 行。lru_cache 使后续
-    # ensure_default_index_profile 在同一事务内秒回，不再阻塞事件循环。
+    # precheck_default_index_profile（只读短事务）与后续写事务里的
+    # ensure_default_index_profile 都可快速返回，不再阻塞事件循环。
     await run_in_threadpool(current_keyword_analyzer_version)
+
+    # publish 之前先用一次只读 SELECT 预检默认契约的既有行：同 config_hash 的旧行字段不一致
+    # 时在发布 blob 前 fail closed，避免该内容反复成为唯一孤儿。预检 SELECT 会开启只读事务并
+    # 占用连接，finally 里的 rollback 立即释放，避免随后 publish 的 fsync 期间空占连接；
+    # 幂等登记/复用仍由写事务内的 ensure_default_index_profile 权威完成。
+    try:
+        await precheck_default_index_profile(session)
+    finally:
+        await session.rollback()
 
     # publish 内部有 fsync 与 os.replace，是阻塞文件 I/O；放进线程池避免阻塞事件循环。
     # 仍在写事务之前完成（失败不落库），publish 自身按目标文件存在与否幂等。
@@ -145,6 +163,11 @@ async def _insert_upload(
     回滚，profile 行与入库事实同生共死；profile 行存在只代表契约已登记，**不代表任何 KB 可
     检索**，也不回填 ``knowledge_base.active_index_profile_id``。
 
+    **异常范围**：``ensure_default_index_profile`` 单独放在唯一去重键重读的 ``try`` 之外（仍在
+    同一事务内），因此它抛出的错误不会被误判为去重冲突。只有四表写入因
+    ``uq_ingest_job_dedupe_key`` 的唯一冲突（SQLSTATE ``23505``）失败时才回滚重读；其它完整性
+    错误原样重抛为静态 500，不复用现有 job。
+
     ``ingest_job.next_run_at`` 与 ``outbox_event.next_send_at`` 不传值，由数据库
     ``now()`` server_default 提供，避免应用时钟与 DB 时钟不一致导致投递后立即被补偿。
     """
@@ -153,10 +176,11 @@ async def _insert_upload(
     version_id = uuid.uuid4()
     job_id = uuid.uuid4()
     event_id = uuid.uuid4()
+    # 先登记/复用 profile：它使用 ``session.no_autoflush``，不会替调用方刷写待写对象；失败
+    # （哈希不一致或 PG 错误）直接抛出，不产生部分写入。它不在下面的去重冲突 ``try`` 内，
+    # 因此其异常（即使同为 IntegrityError）不会被误读为去重冲突。
+    profile_id = await ensure_default_index_profile(session)
     try:
-        # 先登记/复用 profile：它使用 ``session.no_autoflush``，不会替调用方刷写待写对象；
-        # 失败（哈希不一致或 PG 错误）直接抛出，由调用方 fail closed，不产生部分写入。
-        profile_id = await ensure_default_index_profile(session)
         # 无 ORM 关系时插入顺序不保证，按外键依赖逐条 flush。
         session.add(
             Document(
@@ -215,10 +239,13 @@ async def _insert_upload(
             )
         )
         await session.commit()
-    except IntegrityError:
-        # 同一去重键的并发插入由唯一约束拒绝；回滚后重读并按复用/冲突规则处理。
+    except IntegrityError as error:
+        # 回滚必须先行：只把 ``uq_ingest_job_dedupe_key`` 的 23505 冲突当作并发去重信号，
+        # 回读并按复用/冲突规则处理；其它完整性错误原样重抛为静态 500，不误读现有 job。
         # 已发布的最终 blob 不删除：并发其他事务可能已引用它，孤儿窗口留待 GC。
         await session.rollback()
+        if not _is_dedupe_key_conflict(error):
+            raise
         existing = await _load_existing_job(session, dedupe_key=dedupe_key, kb_id=kb_id)
         if existing is None:
             raise
@@ -259,6 +286,20 @@ async def _load_existing_job(
         title=title,
         file_hash=file_hash,
     )
+
+
+def _is_dedupe_key_conflict(error: IntegrityError) -> bool:
+    """只在 SQLSTATE ``23505`` 且约束名为 ``uq_ingest_job_dedupe_key`` 时判为去重冲突。
+
+    其它唯一约束、外键或非 23505 的完整性错误都返回 False，由调用方原样重抛，不得回读
+    现有 job。``orig`` 不是 psycopg 错误（缺 ``sqlstate`` / ``diag``）时同样返回 False。
+    """
+
+    original = error.orig
+    if getattr(original, "sqlstate", None) != UNIQUE_VIOLATION_SQLSTATE:
+        return False
+    diag = getattr(original, "diag", None)
+    return getattr(diag, "constraint_name", None) == DEDUPE_KEY_CONSTRAINT_NAME
 
 
 def _reuse_or_conflict(

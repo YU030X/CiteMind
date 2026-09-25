@@ -25,6 +25,7 @@ from rag_backend.database import create_session_factory
 from rag_backend.ingestion.profile_repository import (
     IndexProfileConflictError,
     ensure_default_index_profile,
+    precheck_default_index_profile,
 )
 from rag_backend.models.indexing import IndexProfile
 from rag_backend.models.profile_contract import default_index_profile
@@ -345,6 +346,55 @@ async def test_concurrent_registration_after_rollback_inserts_own_row(
     with profile_schema.connect() as connection:
         rows = connection.execute(text("SELECT id FROM index_profile")).all()
     assert [row[0] for row in rows] == [second_id]
+
+
+@pytest.mark.anyio
+async def test_precheck_reads_existing_row_and_rejects_tampered_row(
+    clean_profile_state: None, profile_schema: Engine, role_test_databases: RoleTestDatabases
+) -> None:
+    """只读预检：空表正常、合法行复用、同哈希篡改行冲突；都不写入。"""
+
+    engine = _api_engine(role_test_databases)
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as session:
+            # 空表：预检不报错、不写入（登记仍由 ensure 在写事务内完成）。
+            await precheck_default_index_profile(session)
+            assert await session.scalar(text("SELECT count(*) FROM index_profile")) == 0
+            await session.rollback()
+
+        async with factory() as session:
+            await ensure_default_index_profile(session)
+            await session.commit()
+
+        async with factory() as session:
+            # 合法既有行：预检通过且不改写既有行。
+            await precheck_default_index_profile(session)
+            await session.rollback()
+
+        contract = default_index_profile()
+        with profile_schema.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE index_profile SET embedding_model = 'tampered/model' "
+                    "WHERE config_hash = :config_hash"
+                ),
+                {"config_hash": contract.config_hash()},
+            )
+
+        async with factory() as session:
+            with pytest.raises(IndexProfileConflictError):
+                await precheck_default_index_profile(session)
+            await session.rollback()
+    finally:
+        await engine.dispose()
+
+    with profile_schema.connect() as connection:
+        rows = connection.execute(
+            text("SELECT embedding_model FROM index_profile")
+        ).scalars().all()
+    # 预检从不写入：篡改行仍原样保留，只登记了最初的一行。
+    assert rows == ["tampered/model"]
 
 
 def test_worker_role_cannot_insert_into_index_profile(

@@ -980,6 +980,11 @@ async def test_tampered_profile_fails_closed_without_partial_rows(
             assert count_rows(upload_schema, table) == before_count
         assert document_count_for_kb(upload_schema, kb_id) == 0
         assert job_count_for_kb(upload_schema, kb_id) == 0
+        # 预检在 publish 之前 fail closed：该 KB 的内容寻址最终 blob 从未出现。
+        digest = hashlib.sha256(MARKDOWN_BYTES).hexdigest()
+        assert not (blob_directory / str(kb_id) / digest).exists()
+        assert kb_blob_files(blob_directory, kb_id) == []
+        assert kb_active_profile(upload_schema, kb_id) is None
         # 失败路径不留临时文件（已发布的最终 blob 可能成为孤儿，本切片不 GC）。
         assert not list(blob_directory.rglob("*.tmp"))
     finally:

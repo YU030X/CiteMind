@@ -74,6 +74,7 @@ from rag_backend.knowledge.service import KbAccess
 from rag_backend.models.ingestion import IngestJob
 from rag_backend.models.knowledge import DocumentVersion
 from rag_backend.retrieval.keyword_analyzer import KeywordAnalyzerError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
@@ -546,8 +547,16 @@ async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
         warm_calls.append(object())
         return "analyzer"
 
+    precheck_calls: list[object] = []
+
+    async def record_precheck(session: AsyncSession) -> None:
+        precheck_calls.append(object())
+
     monkeypatch.setattr(
         ingestion_service, "current_keyword_analyzer_version", record_warm
+    )
+    monkeypatch.setattr(
+        ingestion_service, "precheck_default_index_profile", record_precheck
     )
 
     outcome = await ingestion_service.create_markdown_document(
@@ -565,8 +574,9 @@ async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
     assert outcome.version_id == existing.version_id
     assert outcome.job_id == existing.job_id
     assert write_calls == []
-    # 回放只复用旧 job：不预热分析器、不登记 profile、不改写旧行。
+    # 回放只复用旧 job：不预热分析器、不预检 profile、不登记 profile、不改写旧行。
     assert warm_calls == []
+    assert precheck_calls == []
 
 
 @pytest.mark.anyio
@@ -605,6 +615,9 @@ async def test_new_upload_warms_analyzer_in_threadpool_before_publishing_blob(
             reused=False,
         )
 
+    async def record_precheck(session: AsyncSession) -> None:
+        events.append(("precheck", threading.get_ident()))
+
     class _RollbackRecordingSession:
         rollback_calls = 0
 
@@ -613,6 +626,7 @@ async def test_new_upload_warms_analyzer_in_threadpool_before_publishing_blob(
 
     session = _RollbackRecordingSession()
     monkeypatch.setattr(ingestion_service, "current_keyword_analyzer_version", record_warm)
+    monkeypatch.setattr(ingestion_service, "precheck_default_index_profile", record_precheck)
     monkeypatch.setattr(DocumentBlobStore, "publish", recording_publish)
     monkeypatch.setattr(ingestion_service, "_load_existing_job", no_existing_job)
     monkeypatch.setattr(ingestion_service, "_insert_upload", fake_insert)
@@ -628,10 +642,12 @@ async def test_new_upload_warms_analyzer_in_threadpool_before_publishing_blob(
     )
 
     labels = [label for label, _ in events]
-    assert labels == ["warm", "publish"]
-    # 预热与发布都不在事件循环线程执行；幂等只读事务在慢操作前被释放。
-    assert all(thread != event_loop_thread for _, thread in events)
-    assert session.rollback_calls == 1
+    assert labels == ["warm", "precheck", "publish"]
+    # 预热与发布都不在事件循环线程执行；幂等只读事务与预检只读事务各被释放一次。
+    assert all(
+        thread != event_loop_thread for label, thread in events if label != "precheck"
+    )
+    assert session.rollback_calls == 2
 
 
 @pytest.mark.anyio
@@ -686,6 +702,252 @@ async def test_warmup_failure_leaves_no_blob_or_db_rows(
 
     assert publish_calls == []
     assert not list(tmp_path.rglob("*"))
+
+
+# --- 写入事务的异常范围收窄与孤儿 blob 窗口 ------------------------------------
+
+
+class _FakeDiagnostic:
+    """psycopg ``diag`` 替身：只提供 ``constraint_name``。"""
+
+    def __init__(self, constraint_name: str | None) -> None:
+        self.constraint_name = constraint_name
+
+
+class _FakePgError(Exception):
+    """psycopg 错误替身：只提供 ``sqlstate`` 与 ``diag``。"""
+
+    def __init__(self, *, sqlstate: str, constraint_name: str | None) -> None:
+        super().__init__("synthetic psycopg error")
+        self.sqlstate = sqlstate
+        self.diag = (
+            _FakeDiagnostic(constraint_name) if constraint_name is not None else None
+        )
+
+
+class _IntegritySession:
+    """四表写入在首次 flush 即抛预设 ``IntegrityError`` 的 session 替身。"""
+
+    def __init__(self, error: IntegrityError) -> None:
+        self._error = error
+        self.rollback_calls = 0
+
+    def add(self, instance: object) -> None:
+        return None
+
+    async def flush(self) -> None:
+        raise self._error
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+def _synthetic_integrity_error(
+    *, sqlstate: str, constraint_name: str | None
+) -> IntegrityError:
+    return IntegrityError(
+        "INSERT INTO ingest_job (...) VALUES (...)",
+        {},
+        _FakePgError(sqlstate=sqlstate, constraint_name=constraint_name),
+    )
+
+
+@pytest.mark.anyio
+async def test_profile_precheck_conflict_fails_before_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """同 config_hash 字段篡改时，冲突必须在 publish 之前发生：存储零调用。"""
+
+    publish_calls: list[object] = []
+
+    def recording_publish(
+        self: DocumentBlobStore, kb_id: uuid.UUID, file_hash: str, content: bytes
+    ) -> str:
+        publish_calls.append((kb_id, file_hash))
+        return "unused"
+
+    async def no_existing_job(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> None:
+        return None
+
+    async def conflict_precheck(session: AsyncSession) -> None:
+        raise IndexProfileConflictError("同 config_hash 的行字段不一致：embedding_model")
+
+    async def fail_insert(
+        session: AsyncSession, **kwargs: object
+    ) -> ingestion_service.UploadOutcome:
+        raise AssertionError("预检失败不应进入写事务")
+
+    class _RollbackOnlySession:
+        rollback_calls = 0
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    session = _RollbackOnlySession()
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", no_existing_job)
+    monkeypatch.setattr(
+        ingestion_service, "precheck_default_index_profile", conflict_precheck
+    )
+    monkeypatch.setattr(DocumentBlobStore, "publish", recording_publish)
+    monkeypatch.setattr(ingestion_service, "_insert_upload", fail_insert)
+
+    with pytest.raises(IndexProfileConflictError):
+        await ingestion_service.create_markdown_document(
+            cast(AsyncSession, session),
+            DocumentBlobStore(tmp_path),
+            kb_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            title="t",
+            content=b"# hi",
+            idempotency_key="k",
+        )
+
+    assert publish_calls == []
+    assert not list(tmp_path.rglob("*"))
+    # 一次释放幂等只读事务，一次在预检 finally 释放；冲突不进入写事务。
+    assert session.rollback_calls == 2
+
+
+@pytest.mark.anyio
+async def test_insert_upload_reuses_job_on_dedupe_key_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只有 ``uq_ingest_job_dedupe_key`` 的 23505 冲突才回滚并复用现有 job。"""
+
+    existing = ingestion_service._ExistingJob(
+        job_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        version_id=uuid.uuid4(),
+        title="t",
+        file_hash="hash",
+    )
+    load_calls: list[str] = []
+
+    async def load_existing(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> ingestion_service._ExistingJob:
+        load_calls.append(dedupe_key)
+        return existing
+
+    async def fake_profile(session: AsyncSession) -> uuid.UUID:
+        return uuid.uuid4()
+
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", load_existing)
+    monkeypatch.setattr(ingestion_service, "ensure_default_index_profile", fake_profile)
+
+    session = _IntegritySession(
+        _synthetic_integrity_error(
+            sqlstate="23505", constraint_name="uq_ingest_job_dedupe_key"
+        )
+    )
+    outcome = await ingestion_service._insert_upload(
+        cast(AsyncSession, session),
+        kb_id=uuid.uuid4(),
+        title="t",
+        file_ref="ref",
+        file_hash="hash",
+        dedupe_key="key",
+    )
+
+    assert outcome.reused is True
+    assert outcome.job_id == existing.job_id
+    assert session.rollback_calls == 1
+    assert load_calls == ["key"]
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "constraint_name"),
+    [
+        ("23503", "uq_ingest_job_dedupe_key"),
+        ("23505", "uq_other_constraint"),
+        ("42000", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_insert_upload_reraises_non_dedupe_integrity_error(
+    monkeypatch: pytest.MonkeyPatch, sqlstate: str, constraint_name: str | None
+) -> None:
+    """其它约束或非 23505 的完整性错误必须原样重抛，不得回读现有 job。"""
+
+    load_calls: list[object] = []
+
+    async def load_existing(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> None:
+        load_calls.append(object())
+
+    async def fake_profile(session: AsyncSession) -> uuid.UUID:
+        return uuid.uuid4()
+
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", load_existing)
+    monkeypatch.setattr(ingestion_service, "ensure_default_index_profile", fake_profile)
+
+    error = _synthetic_integrity_error(
+        sqlstate=sqlstate, constraint_name=constraint_name
+    )
+    session = _IntegritySession(error)
+    with pytest.raises(IntegrityError) as raised:
+        await ingestion_service._insert_upload(
+            cast(AsyncSession, session),
+            kb_id=uuid.uuid4(),
+            title="t",
+            file_ref="ref",
+            file_hash="hash",
+            dedupe_key="key",
+        )
+
+    assert raised.value is error
+    assert session.rollback_calls == 1
+    assert load_calls == []
+
+
+@pytest.mark.anyio
+async def test_published_blob_survives_db_failure_without_unlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """blob 已 publish 后写事务失败：不尝试删除（可能被并发共享），只留孤儿窗口。"""
+
+    content = b"# orphan"
+    kb_id = uuid.uuid4()
+    digest = content_hash(content)
+    target = tmp_path / f"{kb_id}/{digest}"
+
+    async def no_existing_job(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> None:
+        return None
+
+    async def precheck_ok(session: AsyncSession) -> None:
+        return None
+
+    async def fake_profile(session: AsyncSession) -> uuid.UUID:
+        return uuid.uuid4()
+
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", no_existing_job)
+    monkeypatch.setattr(ingestion_service, "precheck_default_index_profile", precheck_ok)
+    monkeypatch.setattr(ingestion_service, "ensure_default_index_profile", fake_profile)
+
+    session = _IntegritySession(
+        _synthetic_integrity_error(sqlstate="23503", constraint_name="fk_other")
+    )
+    with pytest.raises(IntegrityError):
+        await ingestion_service.create_markdown_document(
+            cast(AsyncSession, session),
+            DocumentBlobStore(tmp_path),
+            kb_id=kb_id,
+            organization_id=uuid.uuid4(),
+            title="t",
+            content=content,
+            idempotency_key="k",
+        )
+
+    assert target.read_bytes() == content
+    assert not list(tmp_path.rglob("*.tmp"))
 
 
 # --- 实际 ASGI 请求：multipart 解析错误映射 ------------------------------------
