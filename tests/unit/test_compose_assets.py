@@ -1,7 +1,12 @@
 """本地数据服务切片的静态检查：不启动容器，只校验仓库内的 Compose 与 initdb 文件。"""
 
+import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -12,6 +17,15 @@ DOCKERFILE = REPO_ROOT / "deploy" / "compose" / "Dockerfile"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 INITDB_SCRIPTS = sorted((REPO_ROOT / "deploy" / "compose" / "initdb").glob("*.sh"))
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
+
+# 真实 compose 配置渲染：只做静态插值，不启动容器；未安装 docker CLI 时跳过。
+DOCKER_EXECUTABLE = shutil.which("docker")
+COMPOSE_CONFIG_TIMEOUT_SECONDS = 60
+INGEST_PROCESSING_ENV_VAR = "INGEST_PROCESSING_ENABLED"
+# 这些进程环境键会改变 compose 的输入文件选择；渲染测试显式清掉以只读仓库文件。
+COMPOSE_ENV_OVERRIDE_KEYS = frozenset(
+    {INGEST_PROCESSING_ENV_VAR, "COMPOSE_ENV_FILES", "COMPOSE_FILE", "COMPOSE_PROJECT_NAME"}
+)
 
 # 项目自有变量去前缀后不再有统一前缀，正则只能按形态抓取，因此显式排除第三方环境变量名，
 # 避免未来第三方必填插值被误判成项目变量；当前 compose 的必填插值全部是项目变量。
@@ -408,3 +422,90 @@ def test_queue_override_adds_shared_marker_volume_and_one_shot_probe() -> None:
     # 验收命令必须显式只启动 queue-probe service，避免六服务其它容器干扰退出码。
     assert "--exit-code-from queue-probe queue-probe" in text
     assert "result_backend" not in text
+
+
+# --- worker 真实入库开关的 Compose 透传（默认关闭） -----------------------------
+
+
+def test_compose_worker_gets_ingest_processing_flag_and_api_does_not() -> None:
+    worker_block = compose_service_block("worker")
+    api_block = compose_service_block("api")
+
+    assert (
+        "INGEST_PROCESSING_ENABLED: ${INGEST_PROCESSING_ENABLED:-0}" in worker_block
+    ), "worker 必须透传真实入库开关，否则 .env 中的设置会被静默丢弃"
+    assert "INGEST_PROCESSING_ENABLED" not in api_block, "API 不执行入库管线，不得透传该开关"
+
+
+def render_compose_config(
+    *extra_files: Path, ingest_processing: str | None
+) -> dict[str, Any]:
+    """用真实 `docker compose config --format json` 渲染配置。
+
+    环境用进程环境的副本，只增删受测键，不修改 `os.environ`（因此天然恢复原值）；
+    不读取真实 `.env`，只显式读 `.env.example`。失败时只报告退出码，不回显 stderr，
+    避免插值后的 DSN/凭据进入测试输出。
+    """
+
+    if DOCKER_EXECUTABLE is None:
+        pytest.skip("未安装 docker CLI，跳过真实 compose 配置渲染")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in COMPOSE_ENV_OVERRIDE_KEYS
+    }
+    if ingest_processing is not None:
+        env[INGEST_PROCESSING_ENV_VAR] = ingest_processing
+    command = [
+        DOCKER_EXECUTABLE,
+        "compose",
+        "--env-file",
+        str(ENV_EXAMPLE),
+        "-f",
+        str(COMPOSE_FILE),
+    ]
+    for extra in extra_files:
+        command += ["-f", str(extra)]
+    command += ["config", "--format", "json"]
+    completed = subprocess.run(
+        command,
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=COMPOSE_CONFIG_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(f"docker compose config 渲染失败（退出码 {completed.returncode}）")
+    return cast(dict[str, Any], json.loads(completed.stdout))
+
+
+def service_environment(config: dict[str, Any], service: str) -> dict[str, str]:
+    environment = config["services"][service].get("environment", {})
+    assert isinstance(environment, dict)
+    return {str(key): str(value) for key, value in environment.items()}
+
+
+@pytest.mark.parametrize(
+    "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
+)
+def test_compose_config_defaults_ingest_processing_off_for_worker_only(
+    extra_files: tuple[Path, ...],
+) -> None:
+    config = render_compose_config(*extra_files, ingest_processing=None)
+
+    assert service_environment(config, "worker")[INGEST_PROCESSING_ENV_VAR] == "0"
+    assert INGEST_PROCESSING_ENV_VAR not in service_environment(config, "api")
+
+
+@pytest.mark.parametrize(
+    "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
+)
+def test_compose_config_passes_ingest_processing_enable_to_worker_only(
+    extra_files: tuple[Path, ...],
+) -> None:
+    config = render_compose_config(*extra_files, ingest_processing="1")
+
+    assert service_environment(config, "worker")[INGEST_PROCESSING_ENV_VAR] == "1"
+    assert INGEST_PROCESSING_ENV_VAR not in service_environment(config, "api")

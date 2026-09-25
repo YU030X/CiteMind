@@ -155,3 +155,23 @@ def resolve_role_test_databases(environment: Mapping[str, str]) -> RoleTestDatab
         port=expected_port,
         database_name=expected_database,
     )
+
+
+def assert_destructive_matches_roles(
+    destructive_url: str, roles: RoleTestDatabases
+) -> None:
+    """核对破坏性测试 DSN 与三角色 DSN 指向同一 host/port/database。
+
+    只比较三者不够：破坏性 DSN 是 upgrade/downgrade 的目标，若它与角色 DSN 指向不同实例，
+    夹具会把迁移打到别的库。不一致时抛 :class:`GuardError`，绝不回显 DSN 或密码。
+    """
+
+    try:
+        url = make_url(destructive_url)
+    except (ArgumentError, ValueError) as error:
+        raise GuardError("测试数据库 DSN 不是有效的数据库 URL") from error
+    location = (url.host, url.port or DEFAULT_POSTGRES_PORT, url.database)
+    if location != (roles.host, roles.port, roles.database_name):
+        raise GuardError(
+            "TEST_DATABASE_URL 必须与三个角色 DSN 指向同一 host、port 和 database"
+        )

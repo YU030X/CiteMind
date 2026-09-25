@@ -61,15 +61,33 @@
 
 因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库**不保证** `profile_id` 不可变，也不强制它与目标 generation 的 `profile_id` 一致；未来 worker 接线时写入事务必须自行限制对它的更改，并在提交前核对 `generation.profile_id` 一致。在实现与验收前不得声称该绑定已在结构上冻结。worker 侧另有纯身份预检模块 `rag_backend.ingestion.identity_preflight`（独立 reviewer APPROVED 与独立 tester 已验收）：只 import 标准库、不读写数据库，按调用方传入的 `ingest_job.profile_id`、`document.source_type`、`document_version.parser_version` 与 `index_profile` 行 DTO（id+七字段+`config_hash`）返回八类互斥静态判定，只有 row id、七字段、`config_hash`、parser 与来源全匹配才 `ALLOWED`；它当前未被 `worker.py` 调用，`ALLOWED` 也不代表 READY 或可检索，数据库层面 `profile_id` 的可变性与 generation 一致性仍无结构强制。
 
+## 已实现：第六切片（迁移 20260925_0007）
+
+迁移 `20260925_0007_worker_kb_publish_privileges` 紧接 `20260925_0006`，线性单 head，只给
+`citemind_worker` 增加 `knowledge_base` 两列的列级 UPDATE 权限：
+
+```sql
+GRANT UPDATE (active_index_profile_id, kb_revision) ON TABLE knowledge_base TO citemind_worker;
+```
+
+它刻意不授予全表 UPDATE，也不授予 INSERT/DELETE/TRUNCATE/REFERENCES/TRIGGER；不改表结构、
+不新增索引、不 seed、不改 api 角色或其它表授权。降级只 `REVOKE` 这两列权限。
+
+列级权限服务于首次 READY 发布事务：worker 需要在同一事务内把
+`knowledge_base.active_index_profile_id` 从 NULL 首次置为目标 generation 的 profile，并按
+[入库与版本](ingestion.md) 的规则原子递增 `kb_revision`。数据库仍不强制该指针与 generation
+profile 一致，发布事务必须用带谓词的条件 UPDATE 拒绝非 NULL 且与目标 profile 不同的 KB；
+本迁移不代替这些应用层校验。worker 侧真实入库管线已实现但**默认关闭**，其发布行为已由独立 tester 在隔离 PostgreSQL 17（pipeline 15 passed + 权限迁移 3 passed）与 Linux prefork concurrency 1 真离线模型整链上端到端验收 PG `0007` READY（见 [开发约定](development.md)）。
+
 ## index profile 契约与 KB active 可见性
 
-`index_profile` 契约已由纯标准库源码模块 `rag_backend.models.profile_contract` 实现（独立 review APPROVED、隔离 api+worker 镜像 tester 已验收：21 passed、非集成 828 passed/2 skipped；源码 SHA `0eabc8c6…`）；默认 `config_hash=4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa`、`tokenizer_revision` 摘要 `ca6e9808373afae7a8b131f50361c9b125ba5914eef0161b148b3ab6a105f9a8`，完整 golden 见 [入库与版本](ingestion.md)。KB 的 seed、发布事务与检索路径仍未实现，当前 `knowledge_base.active_index_profile_id` 全部为 NULL。
+`index_profile` 契约已由纯标准库源码模块 `rag_backend.models.profile_contract` 实现（独立 review APPROVED、隔离 api+worker 镜像 tester 已验收：21 passed、非集成 828 passed/2 skipped；源码 SHA `0eabc8c6…`）；默认 `config_hash=4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa`、`tokenizer_revision` 摘要 `ca6e9808373afae7a8b131f50361c9b125ba5914eef0161b148b3ab6a105f9a8`，完整 golden 见 [入库与版本](ingestion.md)。KB 的独立 seed 与检索路径仍未实现；发布事务已由默认关闭的真实入库管线实现并端到端验收（首次 READY 置位指针、`kb_revision` 递增），但 dev 库仍为 `20260923_0005` 且未部署，所以当前 `knowledge_base.active_index_profile_id` 仍全部为 NULL。
 
 - `index_profile` 是全局、不可变的编码契约登记表。七个契约字段为 `embedding_model`、`model_revision`、`dimension`、`normalize`、`tokenizer_revision`、`chunker_version`、`keyword_analyzer_version`；`config_hash` 是它们加 `schema_version='index-profile-v1'` 后规范化 JSON 的 SHA-256（算法、默认字段与完整 golden 见 [入库与版本](ingestion.md)）。`parser_version` 与来源相关字段刻意不属于 profile，也不参与 `config_hash`，保存在 `document_version`/`chunk`。
 - 登记一个全局 profile 只表示该编码契约可用，不代表任何 KB 可检索；KB 是否可检索由 `knowledge_base.active_index_profile_id` 决定。
 - `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile。新 KB 尚无 READY 索引时保持 NULL；仅首次 READY 发布事务（以及后续 KB 级 profile 切换）可以置位或改写。上传事务与全局 profile 登记都不得把它从 NULL 回填为默认 profile。指针为 NULL 的 KB 不可检索。
 
-默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口现已接入**新 Markdown 上传写路径**（同一四表事务内调用，已由独立 tester 验收），KB 创建与 worker 路径仍不调用；本切片没有新迁移、没有 seed 独立 profile，`knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言仍待 worker 接线时前置，登记成功不代表任何 KB 可检索。
+默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口现已接入**新 Markdown 上传写路径**（同一四表事务内调用，已由独立 tester 验收），KB 创建路径仍不调用；默认关闭的真实入库管线在领取任务后改用身份预检与 `worker_index_identity` 工厂、不调用本入口。该 profile 登记切片没有新迁移、没有 seed 独立 profile，dev 库 `knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言已前置到 `worker_index_identity` 工厂，登记成功不代表任何 KB 可检索。
 
 ## 计划中：后续切片
 

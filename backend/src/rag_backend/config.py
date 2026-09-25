@@ -216,6 +216,9 @@ class Settings(BaseSettings):
     inference_base_url: str = DEFAULT_INFERENCE_BASE_URL
     inference_timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS
     inference_token: SecretStr | None = None
+    # 是否在 worker 里执行真实入库（解析/切分/编码/发布）。默认 False，保持既有安全接收壳
+    # 行为；显式开启前不加载模型资产、不连 inference。开启时必须配置 INFERENCE_TOKEN。
+    ingest_processing_enabled: bool = False
 
     # 单组织标识；来自服务端配置，客户端请求体与查询参数都不能覆盖它。
     organization_id: uuid.UUID = DEFAULT_ORGANIZATION_ID
@@ -297,6 +300,9 @@ class Settings(BaseSettings):
         if self.inference_token is not None and not self.inference_token.get_secret_value().strip():
             # 空白值等于未配置；API 仍能启动，客户端构造时才失败。
             self.inference_token = None
+        if self.ingest_processing_enabled and self.inference_token is None:
+            # 真实处理必须能构造受限编码客户端；缺失 token 属启动期可独立判断的无效配置。
+            raise ValueError("开启 ingest_processing_enabled 必须配置 INFERENCE_TOKEN")
 
         origins = parse_allowed_origins(self.allowed_origins)
         trusted_proxies = parse_trusted_proxy_networks(self.trusted_proxy_cidrs)

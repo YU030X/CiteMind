@@ -15,6 +15,7 @@ from database_roles_guard import (
     WORKER_ROLE,
     GuardError,
     MissingTestDatabasesError,
+    assert_destructive_matches_roles,
     resolve_role_test_databases,
     validate_role_database_url,
 )
@@ -233,3 +234,34 @@ def test_role_fixture_returns_resolved_databases(monkeypatch: pytest.MonkeyPatch
     resolved = conftest.resolve_role_test_databases_or_skip_or_fail()
 
     assert resolved.database_name == TEST_DATABASE
+
+
+# --- 破坏性 DSN 与角色 DSN 的位置一致性（新集成夹具前置守卫） ---------------
+
+
+def test_destructive_dsn_matching_role_location_is_accepted() -> None:
+    roles = resolve_role_test_databases(configured())
+
+    # 同一 host/port/database 时必须放行。
+    assert_destructive_matches_roles(MIGRATOR_URL, roles)
+
+
+@pytest.mark.parametrize(
+    "destructive_url",
+    [
+        role_url(MIGRATOR_ROLE, host="10.0.0.9"),
+        role_url(MIGRATOR_ROLE, port="6000"),
+        role_url(MIGRATOR_ROLE, database="other_test"),
+    ],
+    ids=["host", "port", "database"],
+)
+def test_destructive_dsn_mismatch_is_rejected(destructive_url: str) -> None:
+    roles = resolve_role_test_databases(configured())
+
+    with pytest.raises(GuardError, match="TEST_DATABASE_URL") as info:
+        assert_destructive_matches_roles(destructive_url, roles)
+
+    # 错误只点名环境变量，不回显 DSN、host 或密码。
+    assert "citemind@" not in str(info.value)
+    assert "10.0.0.9" not in str(info.value)
+    assert "6000" not in str(info.value)

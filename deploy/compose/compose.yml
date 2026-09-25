@@ -157,8 +157,8 @@ services:
 
   worker:
     # 与 API 进程分离的 Celery worker；镜像由本仓库构建，基础镜像按 digest 固定。
-    # worker 运行时不依赖 inference：embedding 任务仍未实现。构建期只借用 inference
-    # 镜像里已校验的 tokenizer 四件产物做本地真实计数，不使用共享模型卷。
+    # 默认接收壳不调用 inference；开启真实入库后通过内部 HTTP 执行 embedding。
+    # 构建期从 inference 镜像复制已校验的 tokenizer 四件产物，不使用共享模型卷。
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile
@@ -171,13 +171,17 @@ services:
       ENVIRONMENT: development
       # broker 指向 Compose 网络内的 redis 服务，密码沿用 Redis 的认证变量。
       REDIS_URL: redis://:${REDIS_PASSWORD:?必须设置 REDIS_PASSWORD}@redis:6379/0
-      # worker 使用非特权的 citemind_worker 角色；probe 任务不写库，此 DSN 为后续入库事务预留。
+      # worker 使用非特权的 citemind_worker 角色执行接收与入库事务；probe 任务不写库。
       DATABASE_URL: postgresql+psycopg://citemind_worker:${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}@postgres:5432/citemind
       # worker 只读同容器路径的 api 存储卷来读取已登记原始文件；路径由服务端配置固定。
       DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
       # 内部 embedding 受限客户端使用同一 INFERENCE_TOKEN；基址默认为内部服务 9000 端口。
       # 本切片不向 inference 建立 depends_on：inference 故障时 worker 仍应能启动与消费。
       INFERENCE_TOKEN: ${INFERENCE_TOKEN:?必须设置 INFERENCE_TOKEN}
+      # 真实入库默认关闭；只有显式 INGEST_PROCESSING_ENABLED=1 才启用。开启前必须先成功
+      # 迁移到 20260925_0007（0006 缺 knowledge_base 两列 UPDATE）并配置 INFERENCE_TOKEN
+      # （见 docs/deployment.md）。0 时 worker 行为与既有安全接收壳一致。
+      INGEST_PROCESSING_ENABLED: ${INGEST_PROCESSING_ENABLED:-0}
     volumes:
       # 与 api 共用同一命名卷，但以只读方式挂载；worker 绝不写入或替换原文件。
       - api-documents:/var/lib/citemind/documents:ro

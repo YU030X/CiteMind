@@ -29,6 +29,7 @@ from rag_backend.database import (
     create_sync_session_factory,
 )
 from rag_backend.dispatch import protocol
+from rag_backend.ingestion.storage import DocumentBlobStore
 
 WORKER_APP_NAME: Final = "rag_backend"
 PROBE_TASK_NAME: Final = "rag_backend.probe"
@@ -354,10 +355,12 @@ def receive_ingest_event(
 
 
 def receive_ingest_request(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Celery 接收任务：解析 payload，把 eventId 与 jobId 交给行锁接收逻辑。
+    """Celery 接收任务：解析 payload，按配置走接收壳或真实入库管线。
 
-    正常返回前 marker 事务已提交；解析失败或数据库异常向上抛出，由 Celery 按失败语义
-    （``task_acks_on_failure_or_timeout``）确认而不无限重投，未确认投递交给 dispatcher 补偿。
+    默认 ``ingest_processing_enabled=False`` 时行为与既有接收壳完全一致：合格 job 只写
+    ``HANDLER_NOT_READY`` 接收标记、``status`` 仍为 ``QUEUED``，旧任务按已验收优先级处理。
+    只有显式开启真实处理后，才把已验证的 eventId/jobId 交给真实管线；解析失败或数据库异常
+    向上抛出，由 Celery 按失败语义确认而不无限重投。
     """
 
     request_id = getattr(current_task.request, "id", None)
@@ -368,10 +371,49 @@ def receive_ingest_request(payload: dict[str, Any] | None = None) -> dict[str, A
         return {"status": RECEIVE_STATUS_INVALID_PAYLOAD, "eventId": event_id}
     if event_id is None:
         raise ValueError("ingest 任务缺少 Celery task id，无法作为 outbox eventId")
+    if bool(current_app.conf.get("ingest_processing_enabled")):
+        return _run_processing_request(job_id=job_id, event_id=event_id)
     session_factory: Any = current_app.conf.get("ingest_session_factory")
     if session_factory is None:
         raise RuntimeError("worker 未配置 ingest_session_factory，无法写入接收 marker")
     status = receive_ingest_event(session_factory, job_id=job_id, event_id=event_id)
+    return {"status": status, "eventId": event_id, "jobId": str(job_id)}
+
+
+def _run_processing_request(*, job_id: uuid.UUID, event_id: str) -> dict[str, Any]:
+    """显式开启真实处理时的 Celery 执行体；依赖按需构造，不在启动期加载模型资产。"""
+
+    session_factory: Any = current_app.conf.get("ingest_session_factory")
+    if session_factory is None:
+        raise RuntimeError("worker 未配置 ingest_session_factory，无法执行入库管线")
+    settings: Any = current_app.conf.get("ingest_settings")
+    if settings is None:
+        raise RuntimeError("worker 未配置 ingest_settings，无法执行入库管线")
+
+    from rag_backend.ingestion.indexing_worker import (
+        PipelineDependencies,
+        PipelineDependencyUnavailable,
+        load_ingest_identity,
+        process_ingest_event,
+    )
+
+    storage = DocumentBlobStore(settings.document_storage_directory)
+
+    def embedder_factory(counter: Any) -> Any:
+        from rag_backend.ingestion.embedding_client import InternalEmbeddingClient
+
+        try:
+            return InternalEmbeddingClient.from_settings(settings, counter=counter)
+        except ValueError:
+            raise PipelineDependencyUnavailable() from None
+
+    dependencies = PipelineDependencies(
+        session_factory=session_factory,
+        storage=storage,
+        identity_provider=load_ingest_identity,
+        embedder_factory=embedder_factory,
+    )
+    status = process_ingest_event(dependencies, job_id=job_id, event_id=event_id)
     return {"status": status, "eventId": event_id, "jobId": str(job_id)}
 
 
@@ -402,6 +444,9 @@ def create_celery_app(settings: Settings) -> Celery:
         worker_send_task_events=False,
         # 仅当显式配置受信目录时，probe 才写诊断 marker。
         probe_marker_directory=settings.probe_marker_directory,
+        # 默认关闭真实入库；关闭时接收壳行为与既有安全接收完全一致。
+        ingest_processing_enabled=settings.ingest_processing_enabled,
+        ingest_settings=settings,
         # 接收任务用的同步 Session 工厂；创建时不建立连接，只在首次执行时连接。
         ingest_session_factory=create_sync_session_factory(
             create_sync_database_engine(settings)

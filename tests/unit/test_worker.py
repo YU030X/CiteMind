@@ -823,3 +823,87 @@ async def test_celery_publisher_closes_single_use_connection(
     # 传给 send_task 的受控连接在 publish 返回时已被关闭：
     # kombu Connection.__exit__ → release() → _close()。
     assert seen[0]._closed is True
+
+
+# --- 真实入库开关（默认仍是接收壳） --------------------------------------------
+
+
+def test_ingest_processing_is_disabled_by_default() -> None:
+    assert settings().ingest_processing_enabled is False
+    app = worker_app()
+    assert app.conf.ingest_processing_enabled is False
+
+
+def test_ingest_processing_requires_inference_token() -> None:
+    with pytest.raises(ValidationError, match="INFERENCE_TOKEN"):
+        settings(ingest_processing_enabled=True)
+
+
+def test_worker_app_records_processing_flag_and_settings() -> None:
+    resolved = settings(
+        redis_url=REDIS_URL,
+        ingest_processing_enabled=True,
+        inference_token="inference-token",
+    )
+    app = create_celery_app(resolved)
+
+    assert app.conf.ingest_processing_enabled is True
+    assert app.conf.ingest_settings is resolved
+
+
+def test_ingest_task_stays_receiver_only_when_processing_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = worker_app()
+    app.conf.task_always_eager = True
+    app.conf.task_eager_propagates = True
+    called: list[str] = []
+
+    def fake_processing(*, job_id: uuid.UUID, event_id: str) -> dict[str, Any]:
+        called.append("processing")
+        return {"status": "ready", "eventId": event_id, "jobId": str(job_id)}
+
+    monkeypatch.setattr("rag_backend.worker._run_processing_request", fake_processing)
+    monkeypatch.setattr(
+        "rag_backend.worker.receive_ingest_event",
+        lambda session_factory, *, job_id, event_id: RECEIVE_STATUS_RECEIVED,
+    )
+
+    result = app.tasks[INGEST_TASK_NAME].apply(
+        args=[{"protocolVersion": 1, "jobId": str(uuid.uuid4())}]
+    ).get()
+
+    assert result["status"] == RECEIVE_STATUS_RECEIVED
+    assert called == []
+
+
+def test_ingest_task_routes_to_processing_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_celery_app(
+        settings(
+            redis_url=REDIS_URL,
+            ingest_processing_enabled=True,
+            inference_token="inference-token",
+        )
+    )
+    app.conf.task_always_eager = True
+    app.conf.task_eager_propagates = True
+    seen: dict[str, object] = {}
+
+    def fake_processing(*, job_id: uuid.UUID, event_id: str) -> dict[str, Any]:
+        seen["job_id"] = job_id
+        seen["event_id"] = event_id
+        return {"status": "ready", "eventId": event_id, "jobId": str(job_id)}
+
+    monkeypatch.setattr("rag_backend.worker._run_processing_request", fake_processing)
+    job_id = uuid.uuid4()
+
+    result = app.tasks[INGEST_TASK_NAME].apply(
+        args=[{"protocolVersion": 1, "jobId": str(job_id)}]
+    ).get()
+
+    assert result["status"] == "ready"
+    assert result["jobId"] == str(job_id)
+    assert seen["job_id"] == job_id
+    assert seen["event_id"] == result["eventId"]

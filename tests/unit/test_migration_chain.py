@@ -17,6 +17,7 @@ SECOND_SLICE_REVISION = "20260922_0003"
 LLM_USAGE_REVISION = "20260923_0004"
 IDENTITY_REVISION = "20260923_0005"
 INGEST_JOB_PROFILE_REVISION = "20260925_0006"
+WORKER_KB_PUBLISH_REVISION = "20260925_0007"
 
 CORE_TABLES = (
     "index_profile",
@@ -82,6 +83,10 @@ IDENTITY_GRANTS = (
     "GRANT SELECT, INSERT, UPDATE ON TABLE auth_session TO citemind_api;",
     "GRANT SELECT, INSERT, UPDATE ON TABLE kb_member TO citemind_api;",
 )
+WORKER_KB_PUBLISH_GRANTS = (
+    "GRANT UPDATE (active_index_profile_id, kb_revision) ON TABLE knowledge_base "
+    "TO citemind_worker;",
+)
 
 
 def alembic_config() -> Config:
@@ -97,9 +102,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [INGEST_JOB_PROFILE_REVISION]
+    assert script_directory.get_heads() == [WORKER_KB_PUBLISH_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    worker_kb_publish = script_directory.get_revision(WORKER_KB_PUBLISH_REVISION)
     ingest_job_profile = script_directory.get_revision(INGEST_JOB_PROFILE_REVISION)
     identity = script_directory.get_revision(IDENTITY_REVISION)
     llm_usage = script_directory.get_revision(LLM_USAGE_REVISION)
@@ -107,8 +113,10 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert worker_kb_publish.down_revision == INGEST_JOB_PROFILE_REVISION
+    assert worker_kb_publish.nextrev == set()
     assert ingest_job_profile.down_revision == IDENTITY_REVISION
-    assert ingest_job_profile.nextrev == set()
+    assert ingest_job_profile.nextrev == {WORKER_KB_PUBLISH_REVISION}
     assert identity.down_revision == LLM_USAGE_REVISION
     assert identity.nextrev == {INGEST_JOB_PROFILE_REVISION}
     assert llm_usage.down_revision == SECOND_SLICE_REVISION
@@ -249,9 +257,47 @@ def test_offline_upgrade_sql_grants_the_business_tables_exactly(
         + len(SECOND_SLICE_GRANTS)
         + len(LLM_USAGE_GRANTS)
         + len(IDENTITY_GRANTS)
+        + len(WORKER_KB_PUBLISH_GRANTS)
     )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
+    for grant in WORKER_KB_PUBLISH_GRANTS:
+        assert grant in output
+
+
+def test_offline_upgrade_sql_grants_only_kb_publish_columns_to_worker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(), f"{INGEST_JOB_PROFILE_REVISION}:{WORKER_KB_PUBLISH_REVISION}", sql=True
+    )
+    output = capsys.readouterr().out
+
+    assert WORKER_KB_PUBLISH_GRANTS[0] in output
+    # 不给全表 UPDATE，也不新增结构或其它对象的授权。
+    assert "GRANT UPDATE ON TABLE knowledge_base" not in output
+    assert "GRANT SELECT" not in output
+    assert "GRANT INSERT" not in output
+    assert "ALTER TABLE" not in output
+    assert "CREATE " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_revokes_only_kb_publish_columns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(), f"{WORKER_KB_PUBLISH_REVISION}:{INGEST_JOB_PROFILE_REVISION}", sql=True
+    )
+    output = capsys.readouterr().out
+
+    assert (
+        "REVOKE UPDATE (active_index_profile_id, kb_revision) ON TABLE knowledge_base "
+        "FROM citemind_worker;" in output
+    )
+    assert "DROP TABLE" not in output
+    assert "ALTER TABLE" not in output
+    assert "GRANT " not in output
 
 
 def test_offline_upgrade_sql_grants_llm_usage_only_to_api(
