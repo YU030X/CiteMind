@@ -26,6 +26,6 @@ CiteMind 必须使用独占的 PostgreSQL database，不能与其他应用共享
 
 在线迁移只从 Alembic 配置项 `sqlalchemy.url` 或 `MIGRATION_DATABASE_URL` 读取 DSN，缺失时直接以非零状态失败，不回退到 API 运行用的 `DATABASE_URL`：迁移账号的高权限凭据不进入 API 与 worker 的运行配置。离线 `--sql` 只生成 SQL，不读取该 DSN。当前运行角色没有表权限；业务表落地时，每个 Alembic migration 必须按 API 与 worker 的实际职责显式 `GRANT`，不能依赖 PUBLIC 或笼统的默认表权限。
 
-JSON 结构化日志记录 requestId、queryRunId、ingestJobId、阶段耗时、候选数、版本、模型修订和失败类型，默认不记正文。`/metrics` 记录检索、模型、队列、用量和资源指标；低配 profile 不常驻完整 Grafana 栈。模型超时、broker 不可用、磁盘或 Redis 内存压力应有显式降级/拒绝新导入状态。Redis 可采用 `noeviction` 和 AOF，但仍由 PostgreSQL outbox 与 job 承担恢复事实。
+JSON 结构化日志记录 requestId、queryRunId、ingestJobId、阶段耗时、候选数、版本、模型修订和失败类型，默认不记正文。生产诊断不要打印 `Settings.model_dump()`/`model_dump_json()`，它会输出未脱敏的 `database_url`/`redis_url` 等连接串；需要排查配置时只核对存在性与一致性，不回显。`/metrics` 记录检索、模型、队列、用量和资源指标；低配 profile 不常驻完整 Grafana 栈。模型超时、broker 不可用、磁盘或 Redis 内存压力应有显式降级/拒绝新导入状态。Redis 可采用 `noeviction` 和 AOF，但仍由 PostgreSQL outbox 与 job 承担恢复事实。
 
 CI 计划用冻结的 uv 锁文件运行 Ruff、mypy、pytest、前端检查、`pip-audit` 与 SBOM 生成；为 API、worker、inference 分别构建最小依赖镜像，计划推送 GHCR。手动发布与备份恢复需独立运行验收。六服务 Compose 本地切片已建成并完成一次真实启动与网关验收，确切单行命令与静态检查见 [开发约定](development.md)；分角色生产镜像、查询侧 embedding、worker 写入事务、备份恢复与 GHCR 发布仍未建成。

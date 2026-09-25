@@ -3,10 +3,10 @@ import math
 import uuid
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import SplitResult, urlsplit
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import EnvSettingsSource
 from sqlalchemy.engine import URL, make_url
@@ -181,11 +181,13 @@ class Settings(BaseSettings):
 
     app_name: str = "CiteMind API"
     environment: Literal["development", "test", "production"] = "development"
-    database_url: str = DEFAULT_DATABASE_URL
+    # 两个 DSN 含连接凭据，诊断用的 repr/str 只保留字段名，屏蔽明文；字段原值、
+    # model_dump() 与连接逻辑不变（安全任务 #118）。
+    database_url: Annotated[str, Field(repr=False)] = DEFAULT_DATABASE_URL
     database_echo: bool = False
     # Redis 供两类用途：worker 的 Celery broker，以及 API 的登录限流。API 未配置时
     # 登录会返回 503（fail closed），而不是回退到进程内计数；生产环境必须配置。
-    redis_url: str | None = None
+    redis_url: Annotated[str | None, Field(repr=False)] = None
     # 仅当显式设置时，worker 才把 probe 执行结果写成受信目录下的诊断 marker；
     # 默认 None 表示纯回显，不产生文件副作用。路径由该目录与 Celery task id 推导，
     # payload 不能控制。
