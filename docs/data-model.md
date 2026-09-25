@@ -59,7 +59,7 @@
 
 迁移只增加这一列及其外键；本切片起，**新 Markdown 上传写路径**在同一个四表事务内先 `ensure_default_index_profile(session)` 登记/复用默认全局 profile，再把其行 id 显式写入新 `ingest_job.profile_id`（独立 tester 已验收）；worker 接收壳仍只写 `HANDLER_NOT_READY` 接收标记、不读也不写 `profile_id`。幂等回放命中既有任务时不改写其 `profile_id`：既有 `QUEUED`/`HANDLER_NOT_READY` 任务升级后保持 NULL，**不得**按新 default profile 契约自动处理、补绑、重投或视为已绑定 profile。该绑定不代表任何文档可检索（`knowledge_base.active_index_profile_id` 仍为 NULL），也不代表任务已 READY。
 
-因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库**不保证** `profile_id` 不可变，也不强制它与目标 generation 的 `profile_id` 一致；未来 worker 接线时写入事务必须自行限制对它的更改，并在提交前核对 `generation.profile_id` 一致。在实现与验收前不得声称该绑定已在结构上冻结。
+因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库**不保证** `profile_id` 不可变，也不强制它与目标 generation 的 `profile_id` 一致；未来 worker 接线时写入事务必须自行限制对它的更改，并在提交前核对 `generation.profile_id` 一致。在实现与验收前不得声称该绑定已在结构上冻结。worker 侧另有纯身份预检模块 `rag_backend.ingestion.identity_preflight`（独立 reviewer APPROVED 与独立 tester 已验收）：只 import 标准库、不读写数据库，按调用方传入的 `ingest_job.profile_id`、`document.source_type`、`document_version.parser_version` 与 `index_profile` 行 DTO（id+七字段+`config_hash`）返回八类互斥静态判定，只有 row id、七字段、`config_hash`、parser 与来源全匹配才 `ALLOWED`；它当前未被 `worker.py` 调用，`ALLOWED` 也不代表 READY 或可检索，数据库层面 `profile_id` 的可变性与 generation 一致性仍无结构强制。
 
 ## index profile 契约与 KB active 可见性
 
