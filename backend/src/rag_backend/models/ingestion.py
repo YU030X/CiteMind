@@ -2,9 +2,9 @@
 
 ``ingest_job`` 在第二切片新增可空的 ``generation_id``，在第五切片新增可空的
 ``profile_id`` 外键；租约由 owner/token/until 三列共同表达，三者必须同时为空
-或同时非空。``profile_id`` 当前没有应用写入路径，其业务语义（worker 核对任务
-profile 与目标 generation/profile 一致并限制更改）尚未接线，数据库也不阻止
-UPDATE。
+或同时非空。新 Markdown 上传已写入 ``profile_id``，既有任务仍可为 NULL；
+worker 核对任务 profile 与目标 generation/profile 一致并限制更改的处理路径尚未接线，
+数据库也不阻止 UPDATE。
 """
 
 import uuid

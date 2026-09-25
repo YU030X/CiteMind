@@ -26,15 +26,24 @@ from rag_backend.auth.tokens import CSRF_HEADER_NAME
 from rag_backend.config import Settings
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.validation import MAX_MARKDOWN_BYTES
+from rag_backend.models.profile_contract import default_index_profile
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session
-from test_core_migration import alembic_config, alembic_revision, business_tables
+from test_core_migration import (
+    alembic_config,
+    alembic_revision,
+    assert_statement_denied,
+    business_tables,
+)
 
 pytestmark = pytest.mark.integration
 
 # 上传事务的 ORM 会显式写入 ``ingest_job.profile_id``（可空），该列由 ``20260925_0006``
 # 新增；因此上传片必须建在上含该列的线性 schema 上，不能用 0005。
 SCHEMA_REVISION = "20260925_0006"
+
+# 默认 index profile 契约与其规范 JSON 的 SHA-256；与 profile 契约/登记聚焦测试一致。
+GOLDEN_CONFIG_HASH = "4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa"
 
 ORIGIN = "http://127.0.0.1"
 ORGANIZATION_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -162,6 +171,21 @@ async def api_client(settings: Settings) -> AsyncIterator[AsyncClient]:
             yield client
 
 
+@asynccontextmanager
+async def api_client_no_reraise(settings: Settings) -> AsyncIterator[AsyncClient]:
+    """同 ``api_client``，但关闭 ASGI 异常重抛，便于断言应用内 500 的静态错误体。"""
+
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(
+            app=app, client=("10.20.0.1", 12345), raise_app_exceptions=False
+        )
+        async with AsyncClient(
+            transport=transport, base_url=ORIGIN, headers={"Origin": ORIGIN}
+        ) as client:
+            yield client
+
+
 def unique_username() -> str:
     return f"user-{uuid.uuid4().hex[:12]}"
 
@@ -246,6 +270,10 @@ async def upload(
 def count_rows(engine: Engine, table: str) -> int:
     with engine.connect() as connection:
         return int(connection.scalar(text(f"SELECT count(*) FROM {table}")))
+
+
+def profile_count(engine: Engine) -> int:
+    return count_rows(engine, "index_profile")
 
 
 def blob_files(directory: Path) -> list[Path]:
@@ -341,7 +369,7 @@ def job_row(engine: Engine, job_id: uuid.UUID) -> dict[str, Any]:
     with engine.connect() as connection:
         row = connection.execute(
             text(
-                "SELECT status, attempt, generation_id, dedupe_key, error_code "
+                "SELECT status, attempt, generation_id, dedupe_key, error_code, profile_id "
                 "FROM ingest_job WHERE id = :id"
             ),
             {"id": job_id},
@@ -352,7 +380,38 @@ def job_row(engine: Engine, job_id: uuid.UUID) -> dict[str, Any]:
         "generation_id": row[2],
         "dedupe_key": row[3],
         "error_code": row[4],
+        "profile_id": row[5],
     }
+
+
+def profile_row(engine: Engine, profile_id: uuid.UUID) -> dict[str, Any]:
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT embedding_model, model_revision, dimension, normalize, "
+                "tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash "
+                "FROM index_profile WHERE id = :id"
+            ),
+            {"id": profile_id},
+        ).one()
+    return {
+        "embedding_model": row[0],
+        "model_revision": row[1],
+        "dimension": row[2],
+        "normalize": row[3],
+        "tokenizer_revision": row[4],
+        "chunker_version": row[5],
+        "keyword_analyzer_version": row[6],
+        "config_hash": row[7],
+    }
+
+
+def kb_active_profile(engine: Engine, kb_id: uuid.UUID) -> object:
+    with engine.connect() as connection:
+        return connection.scalar(
+            text("SELECT active_index_profile_id FROM knowledge_base WHERE id = :id"),
+            {"id": kb_id},
+        )
 
 
 def outbox_for_job(engine: Engine, job_id: uuid.UUID) -> dict[str, Any]:
@@ -420,7 +479,6 @@ async def test_editor_upload_writes_single_transaction_facts(
     assert job["error_code"] is None
     assert job["dedupe_key"] != key
     assert len(job["dedupe_key"]) == 64
-
     outbox = outbox_for_job(upload_schema, job_id)
     assert outbox == {
         "event_type": "ingest.requested",
@@ -444,6 +502,46 @@ async def test_editor_upload_writes_single_transaction_facts(
             {"id": kb_id},
         ).one()
     assert (row[0], row[1]) == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_editor_upload_binds_default_profile_and_leaves_kb_pointer_null(
+    upload_schema: Engine, upload_settings: Settings, blob_directory: Path
+) -> None:
+    """新上传在同一事务登记/复用唯一 profile 并把它绑定到 job；KB 指针仍为 NULL。"""
+
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        response = await upload(client, kb_id, idempotency_key=unique_key(), csrf=csrf)
+
+    assert response.status_code == 202, response.text
+    version_id = uuid.UUID(response.json()["versionId"])
+    job = job_row(upload_schema, uuid.UUID(response.json()["jobId"]))
+    assert job["profile_id"] is not None
+
+    # 全局默认 profile 只登记一行，job 绑定该行；登记不代表任何 KB 可检索。
+    assert profile_count(upload_schema) == 1
+    contract = default_index_profile()
+    assert contract.config_hash() == GOLDEN_CONFIG_HASH
+    assert profile_row(upload_schema, job["profile_id"]) == {
+        "embedding_model": contract.embedding_model,
+        "model_revision": contract.model_revision,
+        "dimension": contract.dimension,
+        "normalize": contract.normalize,
+        "tokenizer_revision": contract.tokenizer_revision,
+        "chunker_version": contract.chunker_version,
+        "keyword_analyzer_version": contract.keyword_analyzer_version,
+        "config_hash": contract.config_hash(),
+    }
+    assert kb_active_profile(upload_schema, kb_id) is None
+    assert version_row(upload_schema, version_id)["parser_version"] == MARKDOWN_PARSER_VERSION
+    assert kb_blob_files(blob_directory, kb_id)
+    assert not list(blob_directory.rglob("*.tmp"))
 
 
 @pytest.mark.anyio
@@ -545,7 +643,7 @@ async def test_idempotent_replay_returns_same_ids(
 async def test_idempotent_replay_does_not_upgrade_legacy_parser_version(
     upload_schema: Engine, upload_settings: Settings, blob_directory: Path
 ) -> None:
-    """回放只复用旧 job；既有旧行的 ``markdown-v1`` 不被就地迁移或升级。"""
+    """回放只复用旧 job：旧行的占位 parser 与 NULL profile 都不被就地补写。"""
 
     username = unique_username()
     user_id = seed_user(upload_schema, username=username)
@@ -558,8 +656,10 @@ async def test_idempotent_replay_does_not_upgrade_legacy_parser_version(
         first = await upload(client, kb_id, idempotency_key=key, csrf=csrf)
         assert first.status_code == 202, first.text
         version_id = uuid.UUID(first.json()["versionId"])
+        job_id = uuid.UUID(first.json()["jobId"])
+        profile_before = profile_count(upload_schema)
 
-        # 模拟旧切片留下的占位版本行，其余字段不动。
+        # 模拟旧切片留下的占位版本行与未绑定 profile 的旧 job，其余字段不动。
         with upload_schema.begin() as connection:
             connection.execute(
                 text(
@@ -568,6 +668,10 @@ async def test_idempotent_replay_does_not_upgrade_legacy_parser_version(
                 ),
                 {"id": version_id},
             )
+            connection.execute(
+                text("UPDATE ingest_job SET profile_id = NULL WHERE id = :id"),
+                {"id": job_id},
+            )
 
         second = await upload(client, kb_id, idempotency_key=key, csrf=csrf)
 
@@ -575,8 +679,10 @@ async def test_idempotent_replay_does_not_upgrade_legacy_parser_version(
     assert first.json() == second.json()
     assert document_count_for_kb(upload_schema, kb_id) == 1
     assert job_count_for_kb(upload_schema, kb_id) == 1
-    # 旧行版本保持原样：回放只复用 job，不假称旧数据已按新解析器处理。
+    # 旧行保持原样：回放只复用 job，不补绑 profile、不假称旧数据已按新解析器处理。
     assert version_row(upload_schema, version_id)["parser_version"] == "markdown-v1"
+    assert job_row(upload_schema, job_id)["profile_id"] is None
+    assert profile_count(upload_schema) == profile_before
 
 
 @pytest.mark.anyio
@@ -686,6 +792,11 @@ async def test_different_key_same_content_reuses_blob_with_new_document(
     first_version = version_row(upload_schema, uuid.UUID(first.json()["versionId"]))
     second_version = version_row(upload_schema, uuid.UUID(second.json()["versionId"]))
     assert first_version["file_ref"] == second_version["file_ref"]
+    # 两次登记都按 config_hash 幂等复用全局唯一 profile。
+    first_job = job_row(upload_schema, uuid.UUID(first.json()["jobId"]))
+    second_job = job_row(upload_schema, uuid.UUID(second.json()["jobId"]))
+    assert first_job["profile_id"] == second_job["profile_id"]
+    assert profile_count(upload_schema) == 1
 
 
 @pytest.mark.anyio
@@ -783,3 +894,117 @@ async def test_concurrent_same_key_creates_one_document(
     assert count_rows(upload_schema, "document") == before + 1
     assert document_count_for_kb(upload_schema, kb_id) == 1
     assert job_count_for_kb(upload_schema, kb_id) == 1
+    # 并发登记同一个默认契约只会留下一行 profile，两边都绑定它。
+    assert profile_count(upload_schema) == 1
+    job = job_row(upload_schema, uuid.UUID(first.json()["jobId"]))
+    assert job["profile_id"] is not None
+
+
+# 篡改用：同 config_hash 但字段不符的既有行不能被静默复用。
+BOOTSTRAP_PROFILE_SQL = text(
+    "INSERT INTO index_profile (id, embedding_model, model_revision, dimension, normalize, "
+    "tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash) "
+    "VALUES (:id, :embedding_model, :model_revision, :dimension, :normalize, "
+    ":tokenizer_revision, :chunker_version, :keyword_analyzer_version, :config_hash) "
+    "ON CONFLICT (config_hash) DO NOTHING"
+)
+
+
+@pytest.mark.anyio
+async def test_tampered_profile_fails_closed_without_partial_rows(
+    upload_schema: Engine, upload_settings: Settings, blob_directory: Path
+) -> None:
+    """同 config_hash 但字段被篡改时返回静态 500，四表无新行且响应不泄值。"""
+
+    contract = default_index_profile()
+    assert contract.config_hash() == GOLDEN_CONFIG_HASH
+
+    # 保证默认 profile 行存在后用迁移角色篡改其一个契约字段；api 角色只能 SELECT+INSERT。
+    with upload_schema.begin() as connection:
+        connection.execute(
+            BOOTSTRAP_PROFILE_SQL,
+            {
+                "id": uuid.uuid4(),
+                "embedding_model": contract.embedding_model,
+                "model_revision": contract.model_revision,
+                "dimension": contract.dimension,
+                "normalize": contract.normalize,
+                "tokenizer_revision": contract.tokenizer_revision,
+                "chunker_version": contract.chunker_version,
+                "keyword_analyzer_version": contract.keyword_analyzer_version,
+                "config_hash": contract.config_hash(),
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE index_profile SET embedding_model = 'tampered/model' "
+                "WHERE config_hash = :config_hash"
+            ),
+            {"config_hash": contract.config_hash()},
+        )
+
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+
+    counts_before = {
+        table: count_rows(upload_schema, table)
+        for table in ("document", "document_version", "ingest_job", "outbox_event")
+    }
+    profile_before = profile_count(upload_schema)
+    try:
+        async with api_client_no_reraise(upload_settings) as client:
+            csrf = await login_csrf(client, username)
+            response = await upload(
+                client, kb_id, idempotency_key=unique_key(), csrf=csrf
+            )
+
+        assert response.status_code == 500, response.text
+        payload = response.json()
+        assert payload["code"] == "INTERNAL_ERROR"
+        assert payload["message"] == "服务器内部错误"
+        # 响应绝不回显篡改值、契约摘要/词典身份或上传正文。
+        for leak in (
+            "tampered/model",
+            contract.config_hash(),
+            contract.keyword_analyzer_version,
+            contract.tokenizer_revision,
+            MARKDOWN_BYTES.decode(),
+        ):
+            assert leak not in response.text
+
+        # profile 冲突发生在写 document 之前：四表与 profile 行数都不变。
+        assert profile_count(upload_schema) == profile_before
+        for table, before_count in counts_before.items():
+            assert count_rows(upload_schema, table) == before_count
+        assert document_count_for_kb(upload_schema, kb_id) == 0
+        assert job_count_for_kb(upload_schema, kb_id) == 0
+        # 失败路径不留临时文件（已发布的最终 blob 可能成为孤儿，本切片不 GC）。
+        assert not list(blob_directory.rglob("*.tmp"))
+    finally:
+        # 还原被篡改的字段，避免影响后续用例。
+        with upload_schema.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE index_profile SET embedding_model = :embedding_model "
+                    "WHERE config_hash = :config_hash"
+                ),
+                {
+                    "embedding_model": contract.embedding_model,
+                    "config_hash": contract.config_hash(),
+                },
+            )
+
+
+def test_worker_role_cannot_register_index_profile(
+    upload_schema: Engine, role_test_databases: RoleTestDatabases
+) -> None:
+    """worker 角色只有 index_profile 的 SELECT，不能登记 profile 契约。"""
+
+    assert_statement_denied(
+        role_test_databases.worker_url,
+        "INSERT INTO index_profile (id, embedding_model, model_revision, dimension, normalize, "
+        "tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash) "
+        "VALUES ('00000000-0000-0000-0000-000000000099', 'm', 'r', 512, true, 't', 'c', 'k', 'h')",
+    )

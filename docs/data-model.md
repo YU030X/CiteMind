@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）只给 `ingest_job` 增加可空 `profile_id` 外键，不含应用写入路径（详见下文）；文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）给 `ingest_job` 增加可空 `profile_id` 外键，且新 Markdown 上传写路径已在同一四表事务内登记默认全局 profile 并显式绑定该列（独立 tester 已在隔离 PostgreSQL 17 + Redis 上验收，详见下文）；文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -57,7 +57,7 @@
 
 迁移 `20260925_0006_ingest_job_profile` 紧接 `20260923_0005`，线性单 head，只给 `ingest_job` 增加一个可空 UUID 列 `profile_id`，并建立指向 `index_profile(id)` 的具名外键 `fk_ingest_job_profile_id_index_profile`（`ON DELETE/UPDATE RESTRICT`）。迁移不加 server default、不回填、不 seed、不新建索引、不改授权，也不改写既有 `QUEUED`/`HANDLER_NOT_READY` 行；api/worker 对 `ingest_job` 的既有表级 UPDATE 授权本就覆盖新列，因此不新增 `GRANT`/`REVOKE`。SQLAlchemy 模型（`backend/src/rag_backend/models/ingestion.py`）与迁移结构同步。
 
-已实现的只是这一列及其外键；应用行为尚未接线：上传受理仍写 `profile_id=NULL`，worker 接收壳仍只写 `HANDLER_NOT_READY` 接收标记、不读也不写 `profile_id`，既有 `QUEUED`/`HANDLER_NOT_READY` 任务升级后保持 NULL，**不得**按新 default profile 契约自动处理、重投或视为已绑定 profile。该列当前没有业务含义，不代表任何任务已绑定或已可检索。
+迁移只增加这一列及其外键；本切片起，**新 Markdown 上传写路径**在同一个四表事务内先 `ensure_default_index_profile(session)` 登记/复用默认全局 profile，再把其行 id 显式写入新 `ingest_job.profile_id`（独立 tester 已验收）；worker 接收壳仍只写 `HANDLER_NOT_READY` 接收标记、不读也不写 `profile_id`。幂等回放命中既有任务时不改写其 `profile_id`：既有 `QUEUED`/`HANDLER_NOT_READY` 任务升级后保持 NULL，**不得**按新 default profile 契约自动处理、补绑、重投或视为已绑定 profile。该绑定不代表任何文档可检索（`knowledge_base.active_index_profile_id` 仍为 NULL），也不代表任务已 READY。
 
 因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库**不保证** `profile_id` 不可变，也不强制它与目标 generation 的 `profile_id` 一致；未来 worker 接线时写入事务必须自行限制对它的更改，并在提交前核对 `generation.profile_id` 一致。在实现与验收前不得声称该绑定已在结构上冻结。
 
@@ -69,7 +69,7 @@
 - 登记一个全局 profile 只表示该编码契约可用，不代表任何 KB 可检索；KB 是否可检索由 `knowledge_base.active_index_profile_id` 决定。
 - `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile。新 KB 尚无 READY 索引时保持 NULL；仅首次 READY 发布事务（以及后续 KB 级 profile 切换）可以置位或改写。上传事务与全局 profile 登记都不得把它从 NULL 回填为默认 profile。指针为 NULL 的 KB 不可检索。
 
-默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口尚无真实调用方，本轮没有新迁移、没有 seed 任何 profile，`knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言仍待 worker 接线时前置，登记成功不代表任何 KB 可检索。
+默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口现已接入**新 Markdown 上传写路径**（同一四表事务内调用，已由独立 tester 验收），KB 创建与 worker 路径仍不调用；本切片没有新迁移、没有 seed 独立 profile，`knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言仍待 worker 接线时前置，登记成功不代表任何 KB 可检索。
 
 ## 计划中：后续切片
 

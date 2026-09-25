@@ -9,9 +9,15 @@
 - 不同 key、相同内容创建新的 ``document``，但复用 KB 范围内的私有 blob；这不是
   “同文档重复上传”，而是两份独立文档共享同一份内容寻址文件。
 - 并发下唯一去重键冲突走回滚后重读，再按上述复用/冲突规则处理。
+- 新上传在同一事务里幂等登记/复用全局默认 ``index_profile``，并把 ``ingest_job.profile_id``
+  显式绑定到该行；该行只表示编码契约已登记，不代表任何文档可检索，也不回填 KB 的
+  ``active_index_profile_id``。既有旧任务的 ``profile_id`` 保持 NULL，本切片不自动补绑、
+  不重投、不处理。
 
 本切片不实现 dispatcher、worker 业务任务、解析、embedding、发布与检索。KB 配额没有对应
-的存储字段或实体，因此这里不实现配额判定，也不新增迁移或权限。
+的存储字段或实体，因此这里不实现配额判定，也不新增迁移或权限。已发布的最终 blob 在事务
+回滚或后续数据库异常时不删除（并发事务可能已引用），因此可能留下孤儿文件窗口；本切片不
+实现 GC，也绝不删除潜在共享的最终 blob。
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from starlette.concurrency import run_in_threadpool
 from rag_backend.dispatch.protocol import INGEST_REQUESTED_EVENT_TYPE
 from rag_backend.ingestion.errors import DocumentTooLarge, IdempotencyConflict
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.profile_repository import ensure_default_index_profile
 from rag_backend.ingestion.storage import DocumentBlobStore, content_hash
 from rag_backend.ingestion.validation import (
     MARKDOWN_MEDIA_TYPE,
@@ -38,6 +45,7 @@ from rag_backend.ingestion.validation import (
 )
 from rag_backend.models.ingestion import IngestJob, OutboxEvent
 from rag_backend.models.knowledge import Document, DocumentVersion
+from rag_backend.models.profile_contract import current_keyword_analyzer_version
 
 SOURCE_TYPE_MARKDOWN = "markdown"
 DOCUMENT_LIFECYCLE_CREATED = "CREATED"
@@ -97,6 +105,17 @@ async def create_markdown_document(
     if existing is not None:
         return _reuse_or_conflict(existing, title=normalized_title, file_hash=file_hash)
 
+    # 只有新路径才登记 profile；上面的幂等 SELECT 已开启一个只读事务并占用连接，这里先回滚
+    # 释放连接，避免在 jieba 预热与 blob fsync 期间长时间空占连接（该事务不锁写，但连接
+    # 仍被占用）。释放后并发同 key 仍由 _insert_upload 的唯一冲突回滚重读处理。
+    await session.rollback()
+
+    # 预热并校验默认 profile 的关键词分析器：default_index_profile() 会按需构造 jieba，同步
+    # 读取约 5MB 基础词典并做私有临时目录 IO（约 0.6s）。放进线程池避免阻塞事件循环，且置于
+    # publish 之前——失败时不会留下新 blob 或 DB 行。lru_cache 使后续
+    # ensure_default_index_profile 在同一事务内秒回，不再阻塞事件循环。
+    await run_in_threadpool(current_keyword_analyzer_version)
+
     # publish 内部有 fsync 与 os.replace，是阻塞文件 I/O；放进线程池避免阻塞事件循环。
     # 仍在写事务之前完成（失败不落库），publish 自身按目标文件存在与否幂等。
     file_ref = await run_in_threadpool(store.publish, kb_id, file_hash, content)
@@ -119,7 +138,12 @@ async def _insert_upload(
     file_hash: str,
     dedupe_key: str,
 ) -> UploadOutcome:
-    """写入四张表并提交；唯一去重键并发冲突时回滚后重读。
+    """写入 profile 与四张表并提交；唯一去重键并发冲突时回滚后重读。
+
+    事务归属是 ``session``：本函数在同一个事务里先登记/复用全局默认 ``index_profile``，再按
+    外键依赖写入四张表，最后一次 ``commit``。``ensure_default_index_profile`` 不提交也不
+    回滚，profile 行与入库事实同生共死；profile 行存在只代表契约已登记，**不代表任何 KB 可
+    检索**，也不回填 ``knowledge_base.active_index_profile_id``。
 
     ``ingest_job.next_run_at`` 与 ``outbox_event.next_send_at`` 不传值，由数据库
     ``now()`` server_default 提供，避免应用时钟与 DB 时钟不一致导致投递后立即被补偿。
@@ -130,6 +154,9 @@ async def _insert_upload(
     job_id = uuid.uuid4()
     event_id = uuid.uuid4()
     try:
+        # 先登记/复用 profile：它使用 ``session.no_autoflush``，不会替调用方刷写待写对象；
+        # 失败（哈希不一致或 PG 错误）直接抛出，由调用方 fail closed，不产生部分写入。
+        profile_id = await ensure_default_index_profile(session)
         # 无 ORM 关系时插入顺序不保证，按外键依赖逐条 flush。
         session.add(
             Document(
@@ -168,6 +195,7 @@ async def _insert_upload(
                 lease_token=None,
                 lease_until=None,
                 heartbeat_at=None,
+                profile_id=profile_id,
                 dedupe_key=dedupe_key,
                 error_code=None,
             )

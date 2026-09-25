@@ -33,6 +33,7 @@ from rag_backend.api.errors import (
     CODE_DOCUMENT_TOO_LARGE,
     CODE_IDEMPOTENCY_KEY_INVALID,
     CODE_IDEMPOTENCY_KEY_REUSED,
+    CODE_INTERNAL_ERROR,
     CODE_UNSUPPORTED_DOCUMENT_TYPE,
     CODE_UPLOAD_MALFORMED,
     ApiError,
@@ -53,6 +54,7 @@ from rag_backend.ingestion.errors import (
     TitleInvalid,
     UnsupportedDocumentType,
 )
+from rag_backend.ingestion.profile_repository import IndexProfileConflictError
 from rag_backend.ingestion.storage import (
     DocumentBlobStore,
     InvalidBlobReference,
@@ -69,7 +71,9 @@ from rag_backend.ingestion.validation import (
 )
 from rag_backend.knowledge.roles import KbRole
 from rag_backend.knowledge.service import KbAccess
+from rag_backend.models.ingestion import IngestJob
 from rag_backend.models.knowledge import DocumentVersion
+from rag_backend.retrieval.keyword_analyzer import KeywordAnalyzerError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
@@ -461,10 +465,13 @@ def test_service_declares_expected_status_constants() -> None:
 
 
 @pytest.mark.anyio
-async def test_insert_upload_registers_parser_implementation_version() -> None:
-    """新建上传把 ``document_version.parser_version`` 写成解析器真实版本。"""
+async def test_insert_upload_registers_parser_implementation_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新建上传把解析器真实版本写入 version，并把 job 绑定到登记的 profile。"""
 
     added: list[object] = []
+    profile_id = uuid.uuid4()
 
     class _RecordingSession:
         def add(self, instance: object) -> None:
@@ -475,6 +482,11 @@ async def test_insert_upload_registers_parser_implementation_version() -> None:
 
         async def commit(self) -> None:
             return None
+
+    async def fake_profile(session: AsyncSession) -> uuid.UUID:
+        return profile_id
+
+    monkeypatch.setattr(ingestion_service, "ensure_default_index_profile", fake_profile)
 
     outcome = await ingestion_service._insert_upload(
         cast(AsyncSession, _RecordingSession()),
@@ -490,6 +502,10 @@ async def test_insert_upload_registers_parser_implementation_version() -> None:
     assert len(versions) == 1
     assert versions[0].parser_version == "markdown-it-py-4.2.0-v1"
     assert versions[0].parser_version == parsing.MARKDOWN_PARSER_VERSION
+    # 同一事务写入的 job 显式绑定刚登记/复用的 profile 行。
+    jobs = [item for item in added if isinstance(item, IngestJob)]
+    assert len(jobs) == 1
+    assert jobs[0].profile_id == profile_id
 
 
 @pytest.mark.anyio
@@ -524,6 +540,16 @@ async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
     monkeypatch.setattr(ingestion_service, "_load_existing_job", load_existing)
     monkeypatch.setattr(ingestion_service, "_insert_upload", fail_insert)
 
+    warm_calls: list[object] = []
+
+    def record_warm() -> str:
+        warm_calls.append(object())
+        return "analyzer"
+
+    monkeypatch.setattr(
+        ingestion_service, "current_keyword_analyzer_version", record_warm
+    )
+
     outcome = await ingestion_service.create_markdown_document(
         cast(AsyncSession, object()),
         DocumentBlobStore(tmp_path),
@@ -539,22 +565,29 @@ async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
     assert outcome.version_id == existing.version_id
     assert outcome.job_id == existing.job_id
     assert write_calls == []
+    # 回放只复用旧 job：不预热分析器、不登记 profile、不改写旧行。
+    assert warm_calls == []
 
 
 @pytest.mark.anyio
-async def test_blob_publish_runs_off_the_event_loop_thread(
+async def test_new_upload_warms_analyzer_in_threadpool_before_publishing_blob(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """fsync 等阻塞 I/O 必须在线程池执行，不能阻塞异步路由的事件循环线程。"""
+    """fsync 等阻塞 I/O 与 jieba 预热都必须在线程池执行，且预热先于 blob 发布。"""
 
     event_loop_thread = threading.get_ident()
-    publish_threads: list[int] = []
+    events: list[tuple[str, int]] = []
+
+    def record_warm() -> str:
+        events.append(("warm", threading.get_ident()))
+        return "analyzer"
+
     real_publish = DocumentBlobStore.publish
 
     def recording_publish(
         self: DocumentBlobStore, kb_id: uuid.UUID, file_hash: str, content: bytes
     ) -> str:
-        publish_threads.append(threading.get_ident())
+        events.append(("publish", threading.get_ident()))
         return real_publish(self, kb_id, file_hash, content)
 
     async def no_existing_job(
@@ -572,12 +605,20 @@ async def test_blob_publish_runs_off_the_event_loop_thread(
             reused=False,
         )
 
+    class _RollbackRecordingSession:
+        rollback_calls = 0
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    session = _RollbackRecordingSession()
+    monkeypatch.setattr(ingestion_service, "current_keyword_analyzer_version", record_warm)
     monkeypatch.setattr(DocumentBlobStore, "publish", recording_publish)
     monkeypatch.setattr(ingestion_service, "_load_existing_job", no_existing_job)
     monkeypatch.setattr(ingestion_service, "_insert_upload", fake_insert)
 
     await ingestion_service.create_markdown_document(
-        cast(AsyncSession, object()),
+        cast(AsyncSession, session),
         DocumentBlobStore(tmp_path),
         kb_id=uuid.uuid4(),
         organization_id=uuid.uuid4(),
@@ -586,8 +627,65 @@ async def test_blob_publish_runs_off_the_event_loop_thread(
         idempotency_key="k",
     )
 
-    assert publish_threads
-    assert publish_threads[0] != event_loop_thread
+    labels = [label for label, _ in events]
+    assert labels == ["warm", "publish"]
+    # 预热与发布都不在事件循环线程执行；幂等只读事务在慢操作前被释放。
+    assert all(thread != event_loop_thread for _, thread in events)
+    assert session.rollback_calls == 1
+
+
+@pytest.mark.anyio
+async def test_warmup_failure_leaves_no_blob_or_db_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """jieba 预热失败必须 fail closed：不 publish blob、不进写事务。"""
+
+    publish_calls: list[object] = []
+
+    def fail_warm() -> str:
+        raise KeywordAnalyzerError("关键词分析器临时缓存目录不可用")
+
+    def recording_publish(
+        self: DocumentBlobStore, kb_id: uuid.UUID, file_hash: str, content: bytes
+    ) -> str:
+        publish_calls.append((kb_id, file_hash))
+        return "unused"
+
+    async def no_existing_job(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> None:
+        return None
+
+    async def fail_insert(
+        session: AsyncSession, **kwargs: object
+    ) -> ingestion_service.UploadOutcome:
+        raise AssertionError("预热失败不应进入写事务")
+
+    class _RollbackOnlySession:
+        rollback_calls = 0
+
+        async def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    session = _RollbackOnlySession()
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", no_existing_job)
+    monkeypatch.setattr(ingestion_service, "current_keyword_analyzer_version", fail_warm)
+    monkeypatch.setattr(DocumentBlobStore, "publish", recording_publish)
+    monkeypatch.setattr(ingestion_service, "_insert_upload", fail_insert)
+
+    with pytest.raises(KeywordAnalyzerError):
+        await ingestion_service.create_markdown_document(
+            cast(AsyncSession, session),
+            DocumentBlobStore(tmp_path),
+            kb_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            title="t",
+            content=b"# hi",
+            idempotency_key="k",
+        )
+
+    assert publish_calls == []
+    assert not list(tmp_path.rglob("*"))
 
 
 # --- 实际 ASGI 请求：multipart 解析错误映射 ------------------------------------
@@ -740,3 +838,44 @@ async def test_upload_maps_oversize_title_field_to_413() -> None:
     assert payload["code"] == CODE_DOCUMENT_TOO_LARGE
     assert payload["message"] == UPLOAD_TOO_LARGE_MESSAGE
     assert "19531" not in response.text
+
+
+@pytest.mark.anyio
+async def test_upload_profile_conflict_fails_closed_with_static_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """profile 登记失败必须 fail closed 返回静态 500，不回显内部字段或值。"""
+
+    async def fail_service(*args: object, **kwargs: object) -> object:
+        raise IndexProfileConflictError(
+            "同 config_hash 的 index_profile 行与默认契约字段不一致：embedding_model"
+        )
+
+    monkeypatch.setattr(ingestion_service, "create_markdown_document", fail_service)
+
+    app = build_upload_app()
+    body = multipart_body(
+        multipart_part("title", data="标题".encode()),
+        multipart_part("file", filename="a.md", data=b"# a"),
+    )
+    # 应用内 500 由 ServerErrorMiddleware 处理后会重新抛出，需关闭 re-raise 才能断言错误体。
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url=UPLOAD_ORIGIN,
+    ) as client:
+        response = await client.post(
+            f"/api/v1/knowledge-bases/{UPLOAD_KB_ID}/documents",
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={UPLOAD_BOUNDARY}",
+                "Origin": UPLOAD_ORIGIN,
+                "Idempotency-Key": "unit-upload-key",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["code"] == CODE_INTERNAL_ERROR
+    assert payload["message"] == "服务器内部错误"
+    assert "embedding_model" not in response.text
+    assert "config_hash" not in response.text
