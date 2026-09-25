@@ -3,7 +3,7 @@
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from celery import Celery
@@ -12,6 +12,7 @@ from kombu.exceptions import OperationalError
 from pydantic import ValidationError
 from rag_backend.config import DEFAULT_REDIS_PASSWORD, Settings
 from rag_backend.database import SyncSessionFactory
+from rag_backend.dispatch import protocol
 from rag_backend.dispatch.publisher import (
     BROKER_PUBLISH_TIMEOUT_SECONDS,
     CeleryPublisher,
@@ -20,10 +21,13 @@ from rag_backend.worker import (
     BROKER_VISIBILITY_TIMEOUT_SECONDS,
     INGEST_QUEUE_NAME,
     INGEST_TASK_NAME,
+    LEGACY_PARSER_VERSIONS,
     PROBE_TASK_NAME,
     RECEIVE_STATUS_ALREADY_RECEIVED,
     RECEIVE_STATUS_DELETED,
+    RECEIVE_STATUS_EXISTING_DIAGNOSTIC,
     RECEIVE_STATUS_INVALID_PAYLOAD,
+    RECEIVE_STATUS_LEGACY_UNSUPPORTED,
     RECEIVE_STATUS_NOT_QUEUED,
     RECEIVE_STATUS_RECEIVED,
     RECEIVE_STATUS_VERSION_MISMATCH,
@@ -33,6 +37,7 @@ from rag_backend.worker import (
     decide_receive_action,
     parse_ingest_payload,
     probe_marker_path,
+    receive_ingest_event,
     require_redis_url,
     write_probe_marker,
 )
@@ -249,20 +254,150 @@ def test_celery_app_acknowledges_failed_tasks_without_broker_retry() -> None:
     assert app.conf.result_backend is None
 
 
+QUEUED_PARSER_VERSION = "markdown-it-py-4.2.0-v1"
+LEGACY_PARSER_VERSION = "markdown-v1"
+
+
+def job_facts(
+    *,
+    status: str = "QUEUED",
+    deleted: bool = False,
+    version_matches: bool = True,
+    marker: bool = False,
+    profile_bound: bool = True,
+    parser_version: str = QUEUED_PARSER_VERSION,
+    error_code: str | None = None,
+) -> IngestJobFacts:
+    """按优先级矩阵需要的字段构造 job 事实，默认是可直接接收的新 job。"""
+
+    return IngestJobFacts(
+        status, deleted, version_matches, marker, profile_bound, parser_version, error_code
+    )
+
+
 @pytest.mark.parametrize(
     ("facts", "expected"),
     [
-        (IngestJobFacts("QUEUED", False, True, False), ReceiveAction.SET_MARKER),
-        (IngestJobFacts("QUEUED", False, True, True), ReceiveAction.ALREADY_RECEIVED),
-        (IngestJobFacts("QUEUED", True, True, False), ReceiveAction.DELETED),
-        (IngestJobFacts("QUEUED", False, False, False), ReceiveAction.VERSION_MISMATCH),
-        (IngestJobFacts("READY", False, True, False), ReceiveAction.NOT_QUEUED),
-        (IngestJobFacts("CANCELLED", False, True, True), ReceiveAction.NOT_QUEUED),
+        # 新 job：profile 已绑定、parser 真实、无诊断 → 写接收 marker。
+        (job_facts(), ReceiveAction.SET_MARKER),
+        # 已有接收 marker 优先于诊断与 legacy（含旧 job 上的 HANDLER_NOT_READY）。
+        (job_facts(marker=True), ReceiveAction.ALREADY_RECEIVED),
+        (
+            job_facts(
+                marker=True, profile_bound=False, parser_version=LEGACY_PARSER_VERSION
+            ),
+            ReceiveAction.ALREADY_RECEIVED,
+        ),
+        (
+            job_facts(
+                marker=True,
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+                error_code=protocol.DELIVERY_UNCONFIRMED,
+            ),
+            ReceiveAction.ALREADY_RECEIVED,
+        ),
+        # deleted / version-mismatch / 非 QUEUED 先于诊断与 legacy。
+        (
+            job_facts(
+                deleted=True, profile_bound=False, parser_version=LEGACY_PARSER_VERSION
+            ),
+            ReceiveAction.DELETED,
+        ),
+        (
+            job_facts(
+                deleted=True,
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+                error_code=protocol.DELIVERY_UNCONFIRMED,
+            ),
+            ReceiveAction.DELETED,
+        ),
+        (
+            job_facts(
+                version_matches=False,
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+            ),
+            ReceiveAction.VERSION_MISMATCH,
+        ),
+        (job_facts(status="READY"), ReceiveAction.NOT_QUEUED),
+        (
+            job_facts(
+                status="CANCELLED",
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+            ),
+            ReceiveAction.NOT_QUEUED,
+        ),
+        # 无 marker 但已有非 NULL 诊断：保持 QUEUED 原样，旧/新 profile 都是只读状态。
+        (
+            job_facts(
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+                error_code=protocol.DELIVERY_UNCONFIRMED,
+            ),
+            ReceiveAction.EXISTING_DIAGNOSTIC,
+        ),
+        (
+            job_facts(
+                profile_bound=False,
+                parser_version=LEGACY_PARSER_VERSION,
+                error_code=protocol.UNSUPPORTED_EVENT_TYPE,
+            ),
+            ReceiveAction.EXISTING_DIAGNOSTIC,
+        ),
+        (
+            job_facts(error_code=protocol.UNSUPPORTED_EVENT_TYPE),
+            ReceiveAction.EXISTING_DIAGNOSTIC,
+        ),
+        (
+            job_facts(
+                parser_version=LEGACY_PARSER_VERSION,
+                error_code=protocol.DELIVERY_UNCONFIRMED,
+            ),
+            ReceiveAction.EXISTING_DIAGNOSTIC,
+        ),
+        # 无诊断的 legacy：profile 未绑定或 parser 为已知占位版本（或两者）。
+        (job_facts(profile_bound=False), ReceiveAction.LEGACY_UNSUPPORTED),
+        (job_facts(parser_version=LEGACY_PARSER_VERSION), ReceiveAction.LEGACY_UNSUPPORTED),
+        (
+            job_facts(profile_bound=False, parser_version=LEGACY_PARSER_VERSION),
+            ReceiveAction.LEGACY_UNSUPPORTED,
+        ),
     ],
-    ids=["queued", "received", "deleted", "version-mismatch", "ready", "cancelled"],
+    ids=[
+        "queued",
+        "received",
+        "received-legacy",
+        "received-with-diagnostic",
+        "deleted",
+        "deleted-with-diagnostic",
+        "version-mismatch",
+        "ready",
+        "cancelled",
+        "existing-diagnostic-legacy-both",
+        "existing-diagnostic-legacy-unsupported-event",
+        "existing-diagnostic-new-profile",
+        "existing-diagnostic-legacy-parser",
+        "legacy-unbound-profile",
+        "legacy-placeholder-parser",
+        "legacy-both",
+    ],
 )
 def test_decide_receive_action(facts: IngestJobFacts, expected: ReceiveAction) -> None:
     assert decide_receive_action(facts) is expected
+
+
+def test_legacy_parser_versions_only_contains_the_known_placeholder() -> None:
+    assert LEGACY_PARSER_VERSIONS == frozenset({"markdown-v1"})
+
+
+def test_ingest_payload_protocol_version_and_shape_are_unchanged() -> None:
+    assert protocol.PROTOCOL_VERSION == 1
+    payload = protocol.build_dispatch_payload(uuid.uuid4())
+    assert set(payload) == {"protocolVersion", "jobId"}
+    assert payload["protocolVersion"] == 1
 
 
 def test_parse_ingest_payload_accepts_only_job_and_protocol_version() -> None:
@@ -335,8 +470,99 @@ def test_receive_status_constants_are_distinct() -> None:
         RECEIVE_STATUS_DELETED,
         RECEIVE_STATUS_VERSION_MISMATCH,
         RECEIVE_STATUS_INVALID_PAYLOAD,
+        RECEIVE_STATUS_LEGACY_UNSUPPORTED,
+        RECEIVE_STATUS_EXISTING_DIAGNOSTIC,
     }
-    assert len(statuses) == 6
+    assert len(statuses) == 8
+    assert RECEIVE_STATUS_LEGACY_UNSUPPORTED == "legacy_unsupported"
+    assert RECEIVE_STATUS_EXISTING_DIAGNOSTIC == "existing_diagnostic"
+
+
+def test_receive_ingest_event_rejects_invalid_event_id_before_any_database_work() -> None:
+    opened: list[str] = []
+
+    def exploding_factory() -> Any:
+        opened.append("session")
+        raise AssertionError("非法 event id 不得打开数据库会话")
+
+    factory = cast(SyncSessionFactory, exploding_factory)
+    with pytest.raises(ValueError, match="event id"):
+        receive_ingest_event(factory, job_id=uuid.uuid4(), event_id="not-a-uuid")
+    assert opened == []
+
+
+class _FakeRowResult:
+    def __init__(self, row: tuple[Any, ...] | None) -> None:
+        self._row = row
+
+    def first(self) -> tuple[Any, ...] | None:
+        return self._row
+
+
+class _RecordingSession:
+    """只实现接收逻辑用到的最小接口，记录执行过的语句与是否回滚。"""
+
+    def __init__(self, row: tuple[Any, ...] | None) -> None:
+        self._row = row
+        self.executed: list[str] = []
+        self.rolled_back = False
+
+    def execute(self, statement: Any, parameters: Any = None) -> _FakeRowResult:
+        self.executed.append(str(statement))
+        return _FakeRowResult(self._row)
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+    def __enter__(self) -> "_RecordingSession":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _diagnostic_row(
+    *, profile_bound: bool, parser_version: str
+) -> tuple[Any, ...]:
+    # (status, deleted_at, dv.document_id, j.document_id, lease_owner, heartbeat_at,
+    #  profile_id, parser_version, error_code)：无 marker 且两条 document_id 相同。
+    document_id = uuid.uuid4()
+    profile_id = uuid.uuid4() if profile_bound else None
+    return (
+        "QUEUED",
+        None,
+        document_id,
+        document_id,
+        None,
+        None,
+        profile_id,
+        parser_version,
+        "DELIVERY_UNCONFIRMED",
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile_bound", "parser_version"),
+    [(False, LEGACY_PARSER_VERSION), (True, QUEUED_PARSER_VERSION)],
+    ids=["old-legacy", "new-profile"],
+)
+def test_receive_ingest_event_with_existing_diagnostic_never_writes(
+    profile_bound: bool, parser_version: str
+) -> None:
+    fake = _RecordingSession(
+        _diagnostic_row(profile_bound=profile_bound, parser_version=parser_version)
+    )
+    factory = cast(SyncSessionFactory, lambda: fake)
+
+    status = receive_ingest_event(
+        factory, job_id=uuid.uuid4(), event_id=str(uuid.uuid4())
+    )
+
+    assert status == RECEIVE_STATUS_EXISTING_DIAGNOSTIC
+    # 只读了 FOR UPDATE 行锁，没有执行任何 UPDATE/marker 语句，也没提交。
+    assert len(fake.executed) == 1
+    assert "FOR UPDATE" in fake.executed[0]
+    assert fake.rolled_back is True
 
 
 # --- dispatcher 配置与 API lifespan 接线 -----------------------------------------

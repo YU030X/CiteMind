@@ -126,6 +126,11 @@ RECEIVE_STATUS_NOT_FOUND: Final = "not_found"
 RECEIVE_STATUS_DELETED: Final = "deleted"
 RECEIVE_STATUS_VERSION_MISMATCH: Final = "version_mismatch"
 RECEIVE_STATUS_INVALID_PAYLOAD: Final = "invalid_payload"
+# 无接收标记的旧 job 被静态拒绝为 FAILED，且不补绑 profile、不重投。
+RECEIVE_STATUS_LEGACY_UNSUPPORTED: Final = "legacy_unsupported"
+# 无接收标记但已有非 NULL 诊断错误码（如 DELIVERY_UNCONFIRMED）的 job 保持 QUEUED 原样，
+# 交由既有手工恢复守卫处理；这是纯只读状态，不写任何字段。
+RECEIVE_STATUS_EXISTING_DIAGNOSTIC: Final = "existing_diagnostic"
 
 
 class ReceiveAction(Enum):
@@ -136,6 +141,8 @@ class ReceiveAction(Enum):
     NOT_QUEUED = "NOT_QUEUED"
     DELETED = "DELETED"
     VERSION_MISMATCH = "VERSION_MISMATCH"
+    LEGACY_UNSUPPORTED = "LEGACY_UNSUPPORTED"
+    EXISTING_DIAGNOSTIC = "EXISTING_DIAGNOSTIC"
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,9 @@ class IngestJobFacts:
     document_deleted: bool
     version_matches_document: bool
     receive_marker_present: bool
+    profile_bound: bool
+    parser_version: str
+    existing_error_code: str | None
 
 
 _RECEIVE_ACTION_STATUS: Final[dict[ReceiveAction, str]] = {
@@ -153,9 +163,16 @@ _RECEIVE_ACTION_STATUS: Final[dict[ReceiveAction, str]] = {
     ReceiveAction.NOT_QUEUED: RECEIVE_STATUS_NOT_QUEUED,
     ReceiveAction.DELETED: RECEIVE_STATUS_DELETED,
     ReceiveAction.VERSION_MISMATCH: RECEIVE_STATUS_VERSION_MISMATCH,
+    ReceiveAction.LEGACY_UNSUPPORTED: RECEIVE_STATUS_LEGACY_UNSUPPORTED,
+    ReceiveAction.EXISTING_DIAGNOSTIC: RECEIVE_STATUS_EXISTING_DIAGNOSTIC,
 }
 
-# 行锁读取 job、其文档 tombstone 与版本归属；只锁定 ingest_job 行。
+# 旧切片遗留、当前实现不再处理的 parser_version 占位值。只有这些精确占位值，或
+# profile 未绑定，才判为旧 job；真实实现版本（如 ``markdown-it-py-4.2.0-v1``）仍走 marker。
+LEGACY_PARSER_VERSIONS: Final = frozenset({"markdown-v1"})
+
+# 行锁读取 job、其文档 tombstone、版本归属与接收判定所需的 profile/解析器身份；只锁定
+# ingest_job 行。
 SELECT_INGEST_JOB_FOR_UPDATE_SQL: Final = text(
     """
     SELECT j.status,
@@ -163,7 +180,10 @@ SELECT_INGEST_JOB_FOR_UPDATE_SQL: Final = text(
            dv.document_id,
            j.document_id,
            j.lease_owner,
-           j.heartbeat_at
+           j.heartbeat_at,
+           j.profile_id,
+           dv.parser_version,
+           j.error_code
     FROM ingest_job AS j
     JOIN document AS d ON d.id = j.document_id
     JOIN document_version AS dv ON dv.id = j.version_id
@@ -192,9 +212,28 @@ SET_INGEST_RECEIVE_MARKER_SQL: Final = text(
     """
 )
 
+# 静态拒绝无接收标记的旧 job（profile 未绑定或 parser_version 为已知占位值且无既有诊断）：
+# 只把 status 置为 FAILED 并写静态 error_code，保留 attempt、租约/heartbeat、next_run_at、
+# profile 绑定与文档/版本/outbox/KB。CAS 谓词与前面的行锁共同保证只有仍 QUEUED、无任何
+# 接收标记且 error_code IS NULL 的行被拒绝；重复消息或已有诊断/标记都落到只读状态。
+REJECT_LEGACY_INGEST_JOB_SQL: Final = text(
+    """
+    UPDATE ingest_job
+    SET status = 'FAILED',
+        error_code = :error_code,
+        updated_at = clock_timestamp()
+    WHERE id = :job_id
+      AND status = 'QUEUED'
+      AND lease_owner IS NULL
+      AND heartbeat_at IS NULL
+      AND error_code IS NULL
+    RETURNING id
+    """
+)
+
 
 def decide_receive_action(facts: IngestJobFacts) -> ReceiveAction:
-    """判定接收动作；已接收或无可处理状态时不制造新进度。"""
+    """判定接收动作；已接收、已有诊断或无可处理状态时均不制造新进度。"""
 
     if facts.status != WORKER_JOB_STATUS_QUEUED:
         return ReceiveAction.NOT_QUEUED
@@ -204,6 +243,12 @@ def decide_receive_action(facts: IngestJobFacts) -> ReceiveAction:
         return ReceiveAction.VERSION_MISMATCH
     if facts.receive_marker_present:
         return ReceiveAction.ALREADY_RECEIVED
+    # 已有非 NULL 诊断（如 DELIVERY_UNCONFIRMED）的无 marker job 保持 QUEUED 原样；
+    # 既不改写静态失败码也不写接收 marker。标记优先于诊断，诊断优先于 legacy。
+    if facts.existing_error_code is not None:
+        return ReceiveAction.EXISTING_DIAGNOSTIC
+    if not facts.profile_bound or facts.parser_version in LEGACY_PARSER_VERSIONS:
+        return ReceiveAction.LEGACY_UNSUPPORTED
     return ReceiveAction.SET_MARKER
 
 
@@ -223,15 +268,27 @@ def parse_ingest_payload(payload: object) -> uuid.UUID:
         raise ValueError("ingest 任务 jobId 不是合法 UUID") from error
 
 
+def _parse_event_id(event_id: str) -> uuid.UUID:
+    """把 Celery task id 校验为 UUID；必须在任何数据库状态改变之前调用。"""
+
+    try:
+        return uuid.UUID(event_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("ingest 任务 event id 不是合法 UUID") from error
+
+
 def receive_ingest_event(
     session_factory: SyncSessionFactory, *, job_id: uuid.UUID, event_id: str
 ) -> str:
     """在同一事务中行锁校验并写入 job 级接收 marker，提交后才返回。
 
-    ``event_id`` 来自 Celery task id（即 ``outbox.id``）；重复消息命中已有 marker 时不写
-    任何字段，因此不会制造处理进度。
+    ``event_id`` 来自 Celery task id（即 ``outbox.id``），先校验为合法 UUID 再接触数据库；
+    重复消息命中已有 marker 时不写任何字段。无接收标记但已有非 NULL 诊断错误码的 job 保持
+    QUEUED 原样且只读返回；无接收标记且无诊断的旧 job（profile 未绑定或 parser 为已知占位
+    版本）被静态拒绝为 FAILED，不补绑、不重投。
     """
 
+    event_uuid = _parse_event_id(event_id)
     with session_factory() as session:
         row = session.execute(
             SELECT_INGEST_JOB_FOR_UPDATE_SQL, {"job_id": job_id}
@@ -243,8 +300,31 @@ def receive_ingest_event(
             document_deleted=row[1] is not None,
             version_matches_document=row[2] == row[3],
             receive_marker_present=row[4] is not None or row[5] is not None,
+            profile_bound=row[6] is not None,
+            parser_version=row[7],
+            existing_error_code=row[8],
         )
         action = decide_receive_action(facts)
+        if action is ReceiveAction.LEGACY_UNSUPPORTED:
+            rejected = session.execute(
+                REJECT_LEGACY_INGEST_JOB_SQL,
+                {"job_id": job_id, "error_code": protocol.LEGACY_JOB_UNSUPPORTED},
+            ).first()
+            if rejected is None:
+                # 行锁下 SELECT 已确认仍 QUEUED、无接收标记且 error_code IS NULL；CAS 落空
+                # 说明本事务读到的事实已失效，按未处理处理，不制造新进度。
+                session.rollback()
+                return RECEIVE_STATUS_NOT_QUEUED
+            session.commit()
+            # 只把 job 置 FAILED 并写静态码；不改 attempt/租约/heartbeat/next_run_at、
+            # 文档/版本/outbox/KB 或 profile 绑定，也不自动重投。
+            logger.info(
+                "ingest legacy job rejected job_id=%s event_id=%s error_code=%s",
+                job_id,
+                event_id,
+                protocol.LEGACY_JOB_UNSUPPORTED,
+            )
+            return RECEIVE_STATUS_LEGACY_UNSUPPORTED
         if action is not ReceiveAction.SET_MARKER:
             session.rollback()
             return _RECEIVE_ACTION_STATUS[action]
@@ -252,7 +332,7 @@ def receive_ingest_event(
             SET_INGEST_RECEIVE_MARKER_SQL,
             {
                 "job_id": job_id,
-                "lease_owner": protocol.receive_marker_owner(uuid.UUID(event_id)),
+                "lease_owner": protocol.receive_marker_owner(event_uuid),
                 "lease_token": uuid.uuid4().hex,
                 "lease_seconds": protocol.LEASE_DURATION_SECONDS,
                 "error_code": protocol.HANDLER_NOT_READY,

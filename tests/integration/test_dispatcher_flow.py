@@ -39,6 +39,8 @@ from rag_backend.dispatch.service import (
     OutboxDispatcher,
     compensate_unconfirmed_jobs,
 )
+from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.profile_repository import ensure_default_index_profile
 from rag_backend.worker import (
     RECEIVE_STATUS_ALREADY_RECEIVED,
     RECEIVE_STATUS_DELETED,
@@ -52,7 +54,11 @@ from test_core_migration import alembic_config, alembic_revision, business_table
 
 pytestmark = pytest.mark.integration
 
-IDENTITY_REVISION = "20260923_0005"
+# 上传受理与 worker 接收所需的 ``ingest_job.profile_id`` 由 ``20260925_0006`` 新增，
+# 因此本模块钉在含该列的线性 schema 上；每个模块独立运行，不与 0005 混用。
+SCHEMA_REVISION = "20260925_0006"
+# 旧占位解析器版本；仅显式构造旧任务属性时使用，新接收壳会静态拒绝。
+LEGACY_PARSER_VERSION = "markdown-v1"
 
 BUSINESS_TABLES_CLEANUP = (
     "TRUNCATE outbox_event, ingest_job, document_version, document, knowledge_base CASCADE"
@@ -77,7 +83,7 @@ def dispatcher_schema(destructive_test_database: DestructiveTestDatabase) -> Ite
             )
             assert alembic_revision(connection) is None
             assert business_tables(connection) == set()
-        command.upgrade(config, IDENTITY_REVISION)
+        command.upgrade(config, SCHEMA_REVISION)
         yield engine
     finally:
         command.downgrade(config, "base")
@@ -114,13 +120,25 @@ async def insert_job(
     error_code: str | None = None,
     receive_marker: bool = False,
     document_deleted: bool = False,
+    legacy: bool = False,
 ) -> uuid.UUID:
-    """按外键顺序写入 KB/document/version/job；只使用 API 角色被授予的 DML。"""
+    """按外键顺序写入 KB/document/version/job；只使用 API 角色被授予的 DML。
+
+    默认构造新接收壳可处理的 job：同一事务内登记/复用默认全局 profile 并绑定到
+    ``ingest_job.profile_id``，parser 用真实实现版本。``legacy=True`` 显式构造 0005 时代
+    属性（``profile_id`` NULL 且 parser 为旧占位），供只关心任务属性的 claim/补偿用例使用。
+    """
 
     kb_id = uuid.uuid4()
     document_id = uuid.uuid4()
     version_id = uuid.uuid4()
     job_id = uuid.uuid4()
+    profile_id: uuid.UUID | None = None
+    parser_version = MARKDOWN_PARSER_VERSION
+    if legacy:
+        parser_version = LEGACY_PARSER_VERSION
+    else:
+        profile_id = await ensure_default_index_profile(session)
     await session.execute(
         text(
             "INSERT INTO knowledge_base (id, organization_id, name) "
@@ -140,10 +158,14 @@ async def insert_job(
         text(
             "INSERT INTO document_version "
             "(id, document_id, version_no, file_ref, file_hash, mime, parser_version, status) "
-            "VALUES (:id, :document_id, 1, 'ref', 'hash', 'text/markdown', 'markdown-v1', "
+            "VALUES (:id, :document_id, 1, 'ref', 'hash', 'text/markdown', :parser_version, "
             "'PENDING')"
         ),
-        {"id": version_id, "document_id": document_id},
+        {
+            "id": version_id,
+            "document_id": document_id,
+            "parser_version": parser_version,
+        },
     )
     lease_owner: str | None = None
     lease_token: str | None = None
@@ -157,15 +179,17 @@ async def insert_job(
     await session.execute(
         text(
             "INSERT INTO ingest_job "
-            "(id, document_id, version_id, status, attempt, next_run_at, dedupe_key, "
-            " error_code, lease_owner, lease_token, lease_until, heartbeat_at) "
-            "VALUES (:id, :document_id, :version_id, :status, 0, now(), :dedupe_key, "
-            f" :error_code, :lease_owner, :lease_token, {lease_until_sql}, {heartbeat_sql})"
+            "(id, document_id, version_id, profile_id, status, attempt, next_run_at, "
+            " dedupe_key, error_code, lease_owner, lease_token, lease_until, heartbeat_at) "
+            "VALUES (:id, :document_id, :version_id, :profile_id, :status, 0, now(), "
+            f" :dedupe_key, :error_code, :lease_owner, :lease_token, {lease_until_sql}, "
+            f"{heartbeat_sql})"
         ),
         {
             "id": job_id,
             "document_id": document_id,
             "version_id": version_id,
+            "profile_id": profile_id,
             "status": status,
             "dedupe_key": uuid.uuid4().hex,
             "error_code": error_code,

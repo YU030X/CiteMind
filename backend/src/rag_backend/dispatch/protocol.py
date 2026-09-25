@@ -40,6 +40,9 @@ UNSUPPORTED_EVENT_TYPE = "UNSUPPORTED_EVENT_TYPE"
 # 或 ``heartbeat_at`` 任一出现即视为已接收，dispatcher 不再重复投递。
 JOB_RECEIVE_MARKER_PREFIX = "event:"
 HANDLER_NOT_READY = "HANDLER_NOT_READY"
+# 无接收标记的旧 job（``profile_id`` 未绑定或 ``parser_version`` 为已知占位版本）不再由
+# 接收壳处理：worker 把它们静态标记为 ``FAILED``，既不补绑 profile 也不重投。
+LEGACY_JOB_UNSUPPORTED = "LEGACY_JOB_UNSUPPORTED"
 
 
 def build_dispatch_payload(job_id: uuid.UUID) -> dict[str, object]:

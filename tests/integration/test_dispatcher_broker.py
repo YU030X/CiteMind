@@ -51,6 +51,8 @@ from rag_backend.dispatch.repository import (
     SqlOutboxRepository,
 )
 from rag_backend.dispatch.service import DispatchOutcome, OutboxDispatcher, dispatch_one
+from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.profile_repository import ensure_default_index_profile
 from rag_backend.worker import INGEST_TASK_NAME, PROBE_TASK_NAME, create_celery_app
 from redis import Redis
 from sqlalchemy import Engine, create_engine, text
@@ -61,7 +63,9 @@ from test_worker_broker import delete_queue, terminate_process, wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.broker]
 
-IDENTITY_REVISION = "20260923_0005"
+# 上传受理与 worker 接收所需的 ``ingest_job.profile_id`` 由 ``20260925_0006`` 新增；
+# 本模块独立运行，不与 0005 混用。
+SCHEMA_REVISION = "20260925_0006"
 DEFAULT_QUEUE = "celery"
 WORKER_READY_TIMEOUT_SECONDS = 60.0
 TASK_TIMEOUT_SECONDS = 60.0
@@ -136,7 +140,7 @@ def dispatcher_broker_schema(
             )
             assert alembic_revision(connection) is None
             assert business_tables(connection) == set()
-        command.upgrade(config, IDENTITY_REVISION)
+        command.upgrade(config, SCHEMA_REVISION)
         yield engine
     finally:
         command.downgrade(config, "base")
@@ -269,13 +273,18 @@ class JobMarker:
 
 
 async def insert_job(factory: SessionFactory) -> uuid.UUID:
-    """按外键顺序写入 KB/document/version/job；只使用 api 角色被授予的 DML。"""
+    """按外键顺序写入 KB/document/version/job；只使用 api 角色被授予的 DML。
+
+    同一事务内登记/复用默认全局 profile 并绑定到 ``ingest_job.profile_id``，parser 用真实
+    实现版本，使新接收壳写下 ``HANDLER_NOT_READY`` marker；本模块不构造旧任务。
+    """
 
     kb_id = uuid.uuid4()
     document_id = uuid.uuid4()
     version_id = uuid.uuid4()
     job_id = uuid.uuid4()
     async with factory() as session:
+        profile_id = await ensure_default_index_profile(session)
         await session.execute(
             text(
                 "INSERT INTO knowledge_base (id, organization_id, name) "
@@ -293,22 +302,30 @@ async def insert_job(factory: SessionFactory) -> uuid.UUID:
         await session.execute(
             text(
                 "INSERT INTO document_version "
-                "(id, document_id, version_no, file_ref, file_hash, mime, parser_version, status) "
-                "VALUES (:id, :document_id, 1, 'ref', 'hash', 'text/markdown', 'markdown-v1', "
-                "'PENDING')"
+                "(id, document_id, version_no, file_ref, file_hash, mime, parser_version, "
+                " status) "
+                "VALUES (:id, :document_id, 1, 'ref', 'hash', 'text/markdown', "
+                ":parser_version, 'PENDING')"
             ),
-            {"id": version_id, "document_id": document_id},
+            {
+                "id": version_id,
+                "document_id": document_id,
+                "parser_version": MARKDOWN_PARSER_VERSION,
+            },
         )
         await session.execute(
             text(
                 "INSERT INTO ingest_job "
-                "(id, document_id, version_id, status, attempt, next_run_at, dedupe_key) "
-                "VALUES (:id, :document_id, :version_id, 'QUEUED', 0, now(), :dedupe_key)"
+                "(id, document_id, version_id, profile_id, status, attempt, next_run_at, "
+                " dedupe_key) "
+                "VALUES (:id, :document_id, :version_id, :profile_id, 'QUEUED', 0, now(), "
+                " :dedupe_key)"
             ),
             {
                 "id": job_id,
                 "document_id": document_id,
                 "version_id": version_id,
+                "profile_id": profile_id,
                 "dedupe_key": uuid.uuid4().hex,
             },
         )
