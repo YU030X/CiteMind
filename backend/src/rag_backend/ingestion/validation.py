@@ -27,8 +27,6 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 255
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 # 服务端判定的规范化 MIME；不采用客户端声明的值，客户端 MIME 只作为兼容输入被忽略。
 MARKDOWN_MEDIA_TYPE = "text/markdown"
-# 声明的解析器版本。本切片不解析正文，仅登记契约版本；真正解析实现后应换用对应版本。
-MARKDOWN_PARSER_VERSION = "markdown-v1"
 
 # 允许出现在文本中的 C0 控制字符；其余 C0 与 DEL 视为伪装成文本的二进制。
 # 这些值在 UTF-8 中只可能以单字节 ASCII 出现，因此可直接在字节层扫描。

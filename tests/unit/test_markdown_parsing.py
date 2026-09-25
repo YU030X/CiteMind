@@ -23,7 +23,6 @@ from rag_backend.ingestion.chunking import (
     chunk_markdown,
 )
 from rag_backend.ingestion.parsing import ParsedDocument, parse_markdown
-from rag_backend.ingestion.validation import MARKDOWN_PARSER_VERSION as UPLOAD_PLACEHOLDER
 
 
 class CharacterCounter:
@@ -57,10 +56,11 @@ def _segments(chunk: Chunk) -> list[dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 
-def test_parser_version_differs_from_upload_placeholder() -> None:
+def test_parser_version_pins_implementation_not_legacy_placeholder() -> None:
+    """解析器版本是真实实现版本，不再是上传阶段的占位值。"""
+
     assert parsing.MARKDOWN_PARSER_VERSION == "markdown-it-py-4.2.0-v1"
-    assert parsing.MARKDOWN_PARSER_VERSION != UPLOAD_PLACEHOLDER
-    assert UPLOAD_PLACEHOLDER == "markdown-v1"
+    assert parsing.MARKDOWN_PARSER_VERSION != "markdown-v1"
 
 
 def test_source_hash_follows_raw_bytes_not_decoded_text() -> None:

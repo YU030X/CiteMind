@@ -26,10 +26,10 @@ from starlette.concurrency import run_in_threadpool
 
 from rag_backend.dispatch.protocol import INGEST_REQUESTED_EVENT_TYPE
 from rag_backend.ingestion.errors import DocumentTooLarge, IdempotencyConflict
+from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore, content_hash
 from rag_backend.ingestion.validation import (
     MARKDOWN_MEDIA_TYPE,
-    MARKDOWN_PARSER_VERSION,
     MAX_MARKDOWN_BYTES,
     build_dedupe_key,
     decode_markdown_content,

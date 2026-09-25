@@ -18,9 +18,9 @@
 原始 HTML（``html_block``/``html_inline``）只被识别、从不执行；本切片把它们排除在正文
 之外，避免把可执行标记写入 chunk 文本。图片只保留 alt 文本，绝不抓取 URL。
 
-解析器版本与上传事务当前登记的占位版本（``validation.MARKDOWN_PARSER_VERSION``）是
-两个不同的契约：后者是上传时写入 ``document_version.parser_version`` 的登记值，本切片
-不修改上传事务，也不静默改写既有任务的解析器版本。这里定义真正解析实现使用的版本。
+解析器版本是上传事务与解析实现共用的单一真源：``MARKDOWN_PARSER_VERSION`` 既由上传事务
+写入 ``document_version.parser_version``，也是解析结果声明的版本。既有旧行的占位值
+``markdown-v1`` 不做就地迁移或升级，解析器不静默改写既有任务的解析器版本。
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ from dataclasses import dataclass
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-# 真正解析实现使用的版本；与上传事务占位 ``markdown-v1`` 不同，本切片不改后者。
-# 版本名包含所锁定的 markdown-it-py 精确版本，升级依赖时必须同步评审。
+# 上传事务与解析实现共用的解析器版本；上传写入 ``document_version.parser_version`` 的
+# 即是本值。版本名包含所锁定的 markdown-it-py 精确版本，升级依赖时必须同步评审。
 MARKDOWN_PARSER_VERSION = "markdown-it-py-4.2.0-v1"
 
 # 容器块：进入时快照标题栈，退出时恢复，使引用块/列表内部的标题不渗到外层。

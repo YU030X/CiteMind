@@ -24,6 +24,7 @@ from rag_backend.app import create_app
 from rag_backend.auth.accounts import create_account
 from rag_backend.auth.tokens import CSRF_HEADER_NAME
 from rag_backend.config import Settings
+from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.validation import MAX_MARKDOWN_BYTES
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session
@@ -31,7 +32,9 @@ from test_core_migration import alembic_config, alembic_revision, business_table
 
 pytestmark = pytest.mark.integration
 
-IDENTITY_REVISION = "20260923_0005"
+# 上传事务的 ORM 会显式写入 ``ingest_job.profile_id``（可空），该列由 ``20260925_0006``
+# 新增；因此上传片必须建在上含该列的线性 schema 上，不能用 0005。
+SCHEMA_REVISION = "20260925_0006"
 
 ORIGIN = "http://127.0.0.1"
 ORGANIZATION_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -48,27 +51,55 @@ def anyio_backend() -> tuple[str, dict[str, Any]]:
     return ("asyncio", {"loop_factory": asyncio.SelectorEventLoop})
 
 
-@pytest.fixture(scope="module")
-def upload_schema(destructive_test_database: DestructiveTestDatabase) -> Iterator[Engine]:
+def assert_empty_schema(engine: Engine) -> None:
+    """核对库处于空 schema：无 ``alembic_version`` 且 public schema 无任何业务表。"""
+
+    with engine.connect() as connection:
+        assert alembic_revision(connection) is None
+        # business_tables 只排除 alembic_version，空集即 public schema 无表。
+        assert business_tables(connection) == set()
+
+
+def open_upload_schema(
+    destructive_test_database: DestructiveTestDatabase,
+) -> Iterator[Engine]:
+    """真实上传 schema 生命周期；fixture 只是它的薄包装，单元测试直接驱动本函数。
+
+    ``owns_schema`` 初始为 False，只有升级前的库名与空 schema 核对全部通过后才置
+    True。前置条件不干净（库不是本 fixture 独占的空库）时不做任何 downgrade，避免
+    误删不属于本 fixture 的数据。
+    """
+
     config = alembic_config(destructive_test_database.url)
     engine = create_engine(destructive_test_database.url, pool_pre_ping=True)
+    owns_schema = False
     try:
         with engine.connect() as connection:
             assert (
                 connection.scalar(text("SELECT current_database()"))
                 == destructive_test_database.database_name
             )
-            assert alembic_revision(connection) is None
-            assert business_tables(connection) == set()
+        assert_empty_schema(engine)
+        owns_schema = True
 
-        command.upgrade(config, IDENTITY_REVISION)
+        command.upgrade(config, SCHEMA_REVISION)
         yield engine
     finally:
-        command.downgrade(config, "base")
-        with engine.connect() as connection:
-            assert alembic_revision(connection) is None
-            assert business_tables(connection) == set()
-        engine.dispose()
+        try:
+            if owns_schema:
+                # best-effort：即使升级/前置之后的步骤失败，也必须尝试降回 base。
+                command.downgrade(config, "base")
+                assert_empty_schema(engine)
+        finally:
+            # dispose 在任何分支都必须执行。
+            engine.dispose()
+
+
+@pytest.fixture(scope="module")
+def upload_schema(destructive_test_database: DestructiveTestDatabase) -> Iterator[Engine]:
+    """模块级 fixture；实现见 ``open_upload_schema``（单测直接驱动它）。"""
+
+    yield from open_upload_schema(destructive_test_database)
 
 
 @pytest.fixture(scope="module")
@@ -378,7 +409,7 @@ async def test_editor_upload_writes_single_transaction_facts(
         "file_ref": f"{kb_id}/{digest}",
         "file_hash": digest,
         "mime": "text/markdown",
-        "parser_version": "markdown-v1",
+        "parser_version": MARKDOWN_PARSER_VERSION,
         "status": "PENDING",
     }
 
@@ -508,6 +539,44 @@ async def test_idempotent_replay_returns_same_ids(
     assert job_count_for_kb(upload_schema, kb_id) == 1
     assert outbox_count_for_kb(upload_schema, kb_id) == 1
     assert len(kb_blob_files(blob_directory, kb_id)) == 1
+
+
+@pytest.mark.anyio
+async def test_idempotent_replay_does_not_upgrade_legacy_parser_version(
+    upload_schema: Engine, upload_settings: Settings, blob_directory: Path
+) -> None:
+    """回放只复用旧 job；既有旧行的 ``markdown-v1`` 不被就地迁移或升级。"""
+
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+    key = unique_key()
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        first = await upload(client, kb_id, idempotency_key=key, csrf=csrf)
+        assert first.status_code == 202, first.text
+        version_id = uuid.UUID(first.json()["versionId"])
+
+        # 模拟旧切片留下的占位版本行，其余字段不动。
+        with upload_schema.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE document_version SET parser_version = 'markdown-v1' "
+                    "WHERE id = :id"
+                ),
+                {"id": version_id},
+            )
+
+        second = await upload(client, kb_id, idempotency_key=key, csrf=csrf)
+
+    assert second.status_code == 202, second.text
+    assert first.json() == second.json()
+    assert document_count_for_kb(upload_schema, kb_id) == 1
+    assert job_count_for_kb(upload_schema, kb_id) == 1
+    # 旧行版本保持原样：回放只复用 job，不假称旧数据已按新解析器处理。
+    assert version_row(upload_schema, version_id)["parser_version"] == "markdown-v1"
 
 
 @pytest.mark.anyio

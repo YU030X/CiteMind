@@ -41,6 +41,7 @@ from rag_backend.app import create_app
 from rag_backend.auth.dependencies import require_csrf
 from rag_backend.config import DEFAULT_ORGANIZATION_ID, Settings
 from rag_backend.database import get_database_session
+from rag_backend.ingestion import parsing
 from rag_backend.ingestion import service as ingestion_service
 from rag_backend.ingestion.errors import (
     DocumentEmpty,
@@ -68,6 +69,7 @@ from rag_backend.ingestion.validation import (
 )
 from rag_backend.knowledge.roles import KbRole
 from rag_backend.knowledge.service import KbAccess
+from rag_backend.models.knowledge import DocumentVersion
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
@@ -456,6 +458,87 @@ def test_service_declares_expected_status_constants() -> None:
     assert ingestion_service.DOCUMENT_LIFECYCLE_CREATED == "CREATED"
     assert ingestion_service.VERSION_STATUS_PENDING == "PENDING"
     assert ingestion_service.SOURCE_TYPE_MARKDOWN == "markdown"
+
+
+@pytest.mark.anyio
+async def test_insert_upload_registers_parser_implementation_version() -> None:
+    """新建上传把 ``document_version.parser_version`` 写成解析器真实版本。"""
+
+    added: list[object] = []
+
+    class _RecordingSession:
+        def add(self, instance: object) -> None:
+            added.append(instance)
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    outcome = await ingestion_service._insert_upload(
+        cast(AsyncSession, _RecordingSession()),
+        kb_id=uuid.uuid4(),
+        title="t",
+        file_ref="ref",
+        file_hash="hash",
+        dedupe_key="key",
+    )
+
+    assert outcome.reused is False
+    versions = [item for item in added if isinstance(item, DocumentVersion)]
+    assert len(versions) == 1
+    assert versions[0].parser_version == "markdown-it-py-4.2.0-v1"
+    assert versions[0].parser_version == parsing.MARKDOWN_PARSER_VERSION
+
+
+@pytest.mark.anyio
+async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """回放已有任务只复用旧 job，不重新插入，也不就地升级其 parser_version。
+
+    旧行的 ``markdown-v1`` 属于历史事实，接口回放不读取也不改写 version 行，因此不能
+    据此宣称旧数据已按新解析器处理完成。
+    """
+
+    content = b"# hi"
+    existing = ingestion_service._ExistingJob(
+        job_id=uuid.uuid4(),
+        document_id=uuid.uuid4(),
+        version_id=uuid.uuid4(),
+        title="t",
+        file_hash=content_hash(content),
+    )
+    write_calls: list[object] = []
+
+    async def load_existing(
+        session: AsyncSession, *, dedupe_key: str, kb_id: uuid.UUID
+    ) -> ingestion_service._ExistingJob:
+        return existing
+
+    async def fail_insert(session: AsyncSession, **kwargs: object) -> object:
+        write_calls.append(kwargs)
+        raise AssertionError("幂等回放不应重新插入入库事实")
+
+    monkeypatch.setattr(ingestion_service, "_load_existing_job", load_existing)
+    monkeypatch.setattr(ingestion_service, "_insert_upload", fail_insert)
+
+    outcome = await ingestion_service.create_markdown_document(
+        cast(AsyncSession, object()),
+        DocumentBlobStore(tmp_path),
+        kb_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        title="t",
+        content=content,
+        idempotency_key="k",
+    )
+
+    assert outcome.reused is True
+    assert outcome.document_id == existing.document_id
+    assert outcome.version_id == existing.version_id
+    assert outcome.job_id == existing.job_id
+    assert write_calls == []
 
 
 @pytest.mark.anyio
