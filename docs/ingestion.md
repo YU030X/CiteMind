@@ -115,4 +115,6 @@ MVP 冻结 index profile。更换 embedding 模型、维度、切分器或分词
 
 `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile：新 KB 尚无 READY 索引时为 NULL，只有首次 READY 发布事务（以及后续 KB 级 profile 切换）才置位；上传受理本身既不置位也不把 NULL 回填为默认 profile。检索必须按该指针关联 READY generation 与 `chunk_embedding`，指针为 NULL 的 KB 不可检索。当前没有 seed 任何 profile、没有发布路径，上述发布与检索行为仍是契约设计而非已实现行为。
 
+`ingest_job.profile_id` 已由迁移 `20260925_0006` 增加（可空 UUID 外键 → `index_profile(id)`，`ON DELETE/UPDATE RESTRICT`，无默认/回填/seed/索引/新授权），但当前只有 schema，没有应用写入路径：上传受理仍写 NULL，worker 接收壳仍不读不写。既有 `QUEUED`/`HANDLER_NOT_READY` 任务在升级后保持 NULL，**不得**按最新 default profile 契约自动处理、重投或视为已绑定 profile。因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库不保证该列不可变，也不强制它与目标 generation 的 profile 一致；未来 worker 接线时写入事务必须在提交前限制对它的更改并核对 `generation.profile_id` 一致，否则不能声称 profile 绑定已冻结。
+
 必测故障：事务提交后 Redis 断连、投递成功但 SENT 回写失败、worker 在构建中被杀、broker 重启、重复消息、解析超时和旧 dispatcher 租约过期后迟到回写。详见 [评估与验收](evaluation.md)。

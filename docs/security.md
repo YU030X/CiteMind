@@ -12,6 +12,8 @@ KB 成员授权的服务端判定已实现：`require_kb_role` 每次请求都�
 
 index profile 的登记入口 `ensure_default_index_profile` 只使用 `citemind_api` 对 `index_profile` 的 SELECT 与 INSERT：不可变契约由「不授予 UPDATE」强制，运行角色也没有 DELETE，worker 对该表只有 SELECT、无 INSERT；它不经任何业务 HTTP 入口暴露。该函数不 UPDATE `knowledge_base`、不回填 `active_index_profile_id`，不提交或回滚事务，并用 `session.no_autoflush` 抑制自动 flush。当前它没有真实调用方、没有 seed、没有新迁移，KB 的 `active_index_profile_id` 仍为 NULL，登记全局 profile 不改变任何 KB 的授权或可检索性。
 
+`ingest_job.profile_id` 迁移 `20260925_0006` 只增加一个可空外键，不为它单独授权：`citemind_api` 与 `citemind_worker` 对 `ingest_job` 的既有表级 UPDATE 授权本就覆盖该列，迁移不新增 `GRANT`/`REVOKE`。这意味着**数据库层面不保证 `profile_id` 不可变**——持有该表 UPDATE 的运行角色都能改写它，也不会自动核对它与目标 generation 的 profile 一致。当前没有应用写入路径，未来 worker 接线必须在写入事务内限制对它的更改并在提交前核对 `generation.profile_id`；在实现与验收前不得声称 profile 绑定已冻结。该迁移不做 backfill/seed，旧 `QUEUED`/`HANDLER_NOT_READY` 行保持 NULL，不得被新 default profile 契约自动处理或重投。
+
 向量与关键词候选 SQL 复用同一授权 JOIN（尚未实现）：权限过滤不能拖到生成回答之后；reranker、LLM、日志和缓存也不得先收到越权内容。会话、检索调试、反馈、旧版本、引用和文件下载各自重新鉴权。撤权和删除先提交授权事实与 `acl_revision`/`kb_revision`，让后续访问立即失效，再做异步物理清理。权限查询 MVP 不跨请求缓存最终答案或授权结果。
 
 ## 输入与文件

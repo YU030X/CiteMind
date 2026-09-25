@@ -16,6 +16,7 @@ CORE_REVISION = "20260922_0002"
 SECOND_SLICE_REVISION = "20260922_0003"
 LLM_USAGE_REVISION = "20260923_0004"
 IDENTITY_REVISION = "20260923_0005"
+INGEST_JOB_PROFILE_REVISION = "20260925_0006"
 
 CORE_TABLES = (
     "index_profile",
@@ -96,16 +97,20 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [IDENTITY_REVISION]
+    assert script_directory.get_heads() == [INGEST_JOB_PROFILE_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    ingest_job_profile = script_directory.get_revision(INGEST_JOB_PROFILE_REVISION)
     identity = script_directory.get_revision(IDENTITY_REVISION)
     llm_usage = script_directory.get_revision(LLM_USAGE_REVISION)
     second_slice = script_directory.get_revision(SECOND_SLICE_REVISION)
     core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert ingest_job_profile.down_revision == IDENTITY_REVISION
+    assert ingest_job_profile.nextrev == set()
     assert identity.down_revision == LLM_USAGE_REVISION
+    assert identity.nextrev == {INGEST_JOB_PROFILE_REVISION}
     assert llm_usage.down_revision == SECOND_SLICE_REVISION
     assert llm_usage.nextrev == {IDENTITY_REVISION}
     assert second_slice.down_revision == CORE_REVISION
@@ -189,6 +194,44 @@ def test_offline_upgrade_sql_has_vector_gin_partial_unique_and_ingest_job_fk(
         "ADD CONSTRAINT fk_ingest_job_generation_id_index_generation "
         "FOREIGN KEY(generation_id) REFERENCES index_generation (id)" in output
     )
+    assert (
+        "ADD CONSTRAINT fk_ingest_job_profile_id_index_profile "
+        "FOREIGN KEY(profile_id) REFERENCES index_profile (id)" in output
+    )
+
+
+def test_offline_upgrade_sql_adds_only_a_nullable_profile_id_column(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(), f"{IDENTITY_REVISION}:{INGEST_JOB_PROFILE_REVISION}", sql=True
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE ingest_job ADD COLUMN profile_id UUID;" in output
+    assert "ADD CONSTRAINT fk_ingest_job_profile_id_index_profile" in output
+    # 不加 server default、不回填、不 seed、不建索引、不改授权。
+    assert "DEFAULT" not in output
+    assert "UPDATE ingest_job" not in output
+    assert "CREATE INDEX" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_removes_only_the_profile_id_fk_and_column(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(), f"{INGEST_JOB_PROFILE_REVISION}:{IDENTITY_REVISION}", sql=True
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP CONSTRAINT fk_ingest_job_profile_id_index_profile" in output
+    assert "DROP COLUMN profile_id" in output
+    # 降级只删外键与列，不对其它表或 ACL 做任何事。
+    assert "DROP TABLE" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
 
 
 def test_offline_upgrade_sql_grants_the_business_tables_exactly(

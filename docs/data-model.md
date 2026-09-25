@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）只给 `ingest_job` 增加可空 `profile_id` 外键，不含应用写入路径（详见下文）；文档 ACL、缓存、问答表与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -12,7 +12,7 @@
 | `knowledge_base` | id, organization_id, name, active_index_profile_id, kb_revision, acl_revision, created_at, updated_at | `organization_id` 暂不建组织外键；两个 revision 默认 0 且 `>= 0`；`active_index_profile_id` 可空、外键 RESTRICT（语义见下文“index profile 契约与 KB active 可见性”）；api SELECT+INSERT+UPDATE，worker SELECT |
 | `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`(kb_id, lifecycle_status)` 索引；本切片不建 `acl_mode`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `document_version` | id, document_id, version_no, file_ref, file_hash, mime, parser_version, status, created_at, updated_at | `version_no > 0`；`status IN (PENDING, READY, FAILED, NEEDS_OCR)`；`(document_id, version_no)` 唯一；本切片不添加解析警告字段；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
-| `ingest_job` | id, document_id, version_id, status, attempt, lease_owner, lease_token, lease_until, heartbeat_at, next_run_at, dedupe_key, error_code, created_at, updated_at | `status IN (QUEUED, PARSING, CHUNKING, EMBEDDING, INDEXING, READY, FAILED, CANCELLED)`；`attempt >= 0`；租约 owner/token/until 三列全空或全非空；`dedupe_key` 唯一；`(status, next_run_at)` 索引；第一切片不含 `generation_id` 与独立 progress，第二切片补加可空 `generation_id`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
+| `ingest_job` | id, document_id, version_id, status, attempt, lease_owner, lease_token, lease_until, heartbeat_at, next_run_at, dedupe_key, error_code, created_at, updated_at | `status IN (QUEUED, PARSING, CHUNKING, EMBEDDING, INDEXING, READY, FAILED, CANCELLED)`；`attempt >= 0`；租约 owner/token/until 三列全空或全非空；`dedupe_key` 唯一；`(status, next_run_at)` 索引；第一切片不含 `generation_id` 与独立 progress，第二切片补加可空 `generation_id`，第五切片（`20260925_0006`）再补加可空 `profile_id`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `outbox_event` | id, job_id, event_type, status, dispatch_attempt, next_send_at, lease_owner, lease_token, lease_until, sent_at, created_at, updated_at | `status IN (PENDING, SENT, FAILED)`；`dispatch_attempt >= 0`；租约三列全空或全非空；`job_id` 不唯一；不建 payload；`(status, next_send_at)` 索引；api SELECT+INSERT+UPDATE，worker 无权限 |
 
 外键默认 `ON DELETE RESTRICT` 与 `ON UPDATE RESTRICT`；`document.active_version_id` 指向 `document_version` 且 `ON DELETE SET NULL`，在 `document_version` 建表后再补加该外键。运行角色只获得 SELECT/INSERT/UPDATE 的按表子集，从不获得 DELETE、TRUNCATE、REFERENCES、TRIGGER 或 sequence 权限；`index_profile` 的不可变性由“不授予 UPDATE”实现，而不是触发器。
@@ -53,6 +53,14 @@
 
 `kb_member` 的 `kb_id` 与 `user_id` 只是各自指向 `knowledge_base` 与 `user_account` 的两个独立外键，数据库**不保证**两者属于同一组织，也不保证成员所属组织与 `knowledge_base.organization_id` 一致；该不变量必须由业务写入事务在提交前核对（本切片 `create_knowledge_base` 与 `replace_knowledge_base_members` 在事务内按会话组织校验用户，读取路径也按 KB 组织过滤），当前没有触发器或复合外键在结构上强制它。同样，“替换后至少保留一名启用中的 OWNER”与“不得新加入或提升已禁用用户为 OWNER”都是替换事务内的应用校验，数据库没有对应约束；直接写库（例如禁用最后一个 OWNER）可以绕过，只能由运维在库层修正。
 
+## 已实现：第五切片（迁移 20260925_0006）
+
+迁移 `20260925_0006_ingest_job_profile` 紧接 `20260923_0005`，线性单 head，只给 `ingest_job` 增加一个可空 UUID 列 `profile_id`，并建立指向 `index_profile(id)` 的具名外键 `fk_ingest_job_profile_id_index_profile`（`ON DELETE/UPDATE RESTRICT`）。迁移不加 server default、不回填、不 seed、不新建索引、不改授权，也不改写既有 `QUEUED`/`HANDLER_NOT_READY` 行；api/worker 对 `ingest_job` 的既有表级 UPDATE 授权本就覆盖新列，因此不新增 `GRANT`/`REVOKE`。SQLAlchemy 模型（`backend/src/rag_backend/models/ingestion.py`）与迁移结构同步。
+
+已实现的只是这一列及其外键；应用行为尚未接线：上传受理仍写 `profile_id=NULL`，worker 接收壳仍只写 `HANDLER_NOT_READY` 接收标记、不读也不写 `profile_id`，既有 `QUEUED`/`HANDLER_NOT_READY` 任务升级后保持 NULL，**不得**按新 default profile 契约自动处理、重投或视为已绑定 profile。该列当前没有业务含义，不代表任何任务已绑定或已可检索。
+
+因为 api/worker 对 `ingest_job` 拥有表级 UPDATE，数据库**不保证** `profile_id` 不可变，也不强制它与目标 generation 的 `profile_id` 一致；未来 worker 接线时写入事务必须自行限制对它的更改，并在提交前核对 `generation.profile_id` 一致。在实现与验收前不得声称该绑定已在结构上冻结。
+
 ## index profile 契约与 KB active 可见性
 
 `index_profile` 契约已由纯标准库源码模块 `rag_backend.models.profile_contract` 实现（独立 review APPROVED、隔离 api+worker 镜像 tester 已验收：21 passed、非集成 828 passed/2 skipped；源码 SHA `0eabc8c6…`）；默认 `config_hash=4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa`、`tokenizer_revision` 摘要 `ca6e9808373afae7a8b131f50361c9b125ba5914eef0161b148b3ab6a105f9a8`，完整 golden 见 [入库与版本](ingestion.md)。KB 的 seed、发布事务与检索路径仍未实现，当前 `knowledge_base.active_index_profile_id` 全部为 NULL。
@@ -83,7 +91,7 @@
 
 第一切片已实现的索引与唯一约束：`document(kb_id,lifecycle_status)`、`ingest_job(status,next_run_at)`、`outbox_event(status,next_send_at)` 三个二级索引，以及 `index_profile(config_hash)`、`document_version(document_id,version_no)`、`ingest_job(dedupe_key)` 三个唯一约束。所有表的主键都是 `pk_<table>`，全部具名 CHECK、外键与索引遵循同一命名规则。
 
-第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。其中部分唯一索引是并发发布的最后约束。第四切片已实现的唯一约束：`auth_session(token_hash)`、`user_account(organization_id, username)` 与 `kb_member(kb_id, user_id)`；这三张表都不建额外二级索引。以下仍是计划，尚未实现：面向“按用户列出可访问 KB”的 `kb_member(user_id,kb_id)` 二级索引和 `query_run(user_id,created_at)`。第三切片的 `llm_usage` 不建二级索引与唯一约束，只有主键与具名 CHECK。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
+第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。其中部分唯一索引是并发发布的最后约束。第四切片已实现的唯一约束：`auth_session(token_hash)`、`user_account(organization_id, username)` 与 `kb_member(kb_id, user_id)`；这三张表都不建额外二级索引。以下仍是计划，尚未实现：面向“按用户列出可访问 KB”的 `kb_member(user_id,kb_id)` 二级索引和 `query_run(user_id,created_at)`。第三切片的 `llm_usage` 不建二级索引与唯一约束，只有主键与具名 CHECK。第五切片只增列与具名外键 `fk_ingest_job_profile_id_index_profile`，不新增任何二级索引、唯一约束或 ACL。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
 
 文件、向量、聊天与审计按用途分开保留，保留策略尚未实现。演示环境计划保留原文及最近 3 版索引、查询明细 30 天、脱敏汇总 90 天；删除文档先禁止访问，再按保留策略清理文件、chunk、向量缓存和引用正文。保留期限和清理作业须在实现时由配置与测试固定，不能仅靠本页文字生效。
 

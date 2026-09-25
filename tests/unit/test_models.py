@@ -73,6 +73,7 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "fk_ingest_job_document_id_document",
         "fk_ingest_job_version_id_document_version",
         "fk_ingest_job_generation_id_index_generation",
+        "fk_ingest_job_profile_id_index_profile",
         "uq_ingest_job_dedupe_key",
         "ck_ingest_job_status",
         "ck_ingest_job_attempt_non_negative",
@@ -287,6 +288,20 @@ def test_ingest_job_generation_id_is_a_nullable_restrict_foreign_key() -> None:
     foreign_key = next(iter(column.foreign_keys))
     assert foreign_key.column.table.name == "index_generation"
     assert foreign_key.ondelete == "RESTRICT"
+
+
+def test_ingest_job_profile_id_is_a_nullable_restrict_foreign_key() -> None:
+    column = metadata.tables["ingest_job"].columns["profile_id"]
+
+    assert column.nullable is True
+    assert column.server_default is None
+    assert column.default is None
+    foreign_key = next(iter(column.foreign_keys))
+    assert foreign_key.column.table.name == "index_profile"
+    assert foreign_key.ondelete == "RESTRICT"
+    assert foreign_key.onupdate == "RESTRICT"
+    assert foreign_key.constraint is not None
+    assert foreign_key.constraint.name == "fk_ingest_job_profile_id_index_profile"
 
 
 def test_chunk_embedding_vector_dimension_is_fixed_at_512() -> None:

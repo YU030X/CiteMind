@@ -1,7 +1,10 @@
 """入库任务与 outbox 事件模型。
 
-``ingest_job`` 在第二切片新增可空的 ``generation_id``；租约由
-owner/token/until 三列共同表达，三者必须同时为空或同时非空。
+``ingest_job`` 在第二切片新增可空的 ``generation_id``，在第五切片新增可空的
+``profile_id`` 外键；租约由 owner/token/until 三列共同表达，三者必须同时为空
+或同时非空。``profile_id`` 当前没有应用写入路径，其业务语义（worker 核对任务
+profile 与目标 generation/profile 一致并限制更改）尚未接线，数据库也不阻止
+UPDATE。
 """
 
 import uuid
@@ -59,6 +62,11 @@ class IngestJob(CreatedAtMixin, UpdatedAtMixin, Base):
     generation_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid,
         ForeignKey("index_generation.id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=True,
+    )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("index_profile.id", ondelete="RESTRICT", onupdate="RESTRICT"),
         nullable=True,
     )
     status: Mapped[str] = mapped_column(Text, nullable=False)

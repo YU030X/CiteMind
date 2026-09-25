@@ -28,13 +28,13 @@ flowchart LR
 
 ## 两条主链
 
-1. **入库（目标流程）**：API 校验编辑权限和文件限额，保存原文件，并在一个事务中创建版本、`ingest_job` 和 `outbox_event`；dispatcher 投递 `jobId`；worker 解析、切分、编码并写入暂存 generation；校验完成后事务切换有效版本（首次 READY 发布同时把 KB 的 `active_index_profile_id` 置为该 profile）。当前已实现：API 受理与四表写入（单个事务，返回 `202`）已落地，outbox dispatcher 与 worker 接收壳已由 HEAD `be61f2b` 落地并在隔离 PostgreSQL/Redis/Celery 上验收（物理 Redis 停启与 Windows solo worker kill 后补偿由仓库外隔离手工探针实测，不计入 pytest 自动用例，Linux prefork 业务故障未验收），worker 侧本地真实 token 计数器（从 inference 镜像复制固定 BGE tokenizer 四件、按大小+SHA256 校验后离线加载）也已实现，但尚无 worker 读取 blob、落库 `chunk`/`generation`、索引发布，这些均为未接线前置能力。接收壳只写 `HANDLER_NOT_READY` 接收标记、状态仍为 `QUEUED`，outbox `SENT` 也不等于解析/入库，当前 dev 六服务未部署该新代码，因此上传后仍不可检索。详见 [入库与版本](ingestion.md)。
+1. **入库（目标流程）**：API 校验编辑权限和文件限额，保存原文件，并在一个事务中创建版本、`ingest_job` 和 `outbox_event`；dispatcher 投递 `jobId`；worker 解析、切分、编码并写入暂存 generation；校验完成后事务切换有效版本（首次 READY 发布同时把 KB 的 `active_index_profile_id` 置为该 profile）。当前已实现：API 受理与四表写入（单个事务，返回 `202`）已落地，outbox dispatcher 与 worker 接收壳已由 HEAD `be61f2b` 落地并在隔离 PostgreSQL/Redis/Celery 上验收（物理 Redis 停启与 Windows solo worker kill 后补偿由仓库外隔离手工探针实测，不计入 pytest 自动用例，Linux prefork 业务故障未验收），worker 侧本地真实 token 计数器（从 inference 镜像复制固定 BGE tokenizer 四件、按大小+SHA256 校验后离线加载）也已实现，但尚无 worker 读取 blob、落库 `chunk`/`generation`、索引发布，这些均为未接线前置能力；`ingest_job.profile_id` 已由迁移 `20260925_0006` 增加可空外键，但无应用写入路径，既有 `QUEUED`/`HANDLER_NOT_READY` 任务保持 NULL，不得按新 default profile 契约自动处理或重投。接收壳只写 `HANDLER_NOT_READY` 接收标记、状态仍为 `QUEUED`，outbox `SENT` 也不等于解析/入库，当前 dev 六服务未部署该新代码，因此上传后仍不可检索。详见 [入库与版本](ingestion.md)。
 2. **问答**：API 校验会话与 KB 范围，必要时改写追问；检索服务用同一授权和版本快照运行向量与关键词两路，融合并限量选择证据；授权复核后调用 LLM；校验回答结构、引用与当前权限后保存并返回。详见 [检索与问答](retrieval.md)。
 
 ## 一致性和信任边界
 
 - 每个检索候选都必须属于当前组织、授权 KB、未删除文档的当前版本和 READY generation，且所用 profile 等于该 KB 的 `active_index_profile_id`（指针为 NULL 的 KB 不可检索）。权限过滤发生在两路 SQL 内；后置 Python filter 只能增加防护。
-- 同一文档更新时，旧版继续服务至新版完整就绪。发布事务锁定文档，核对期望版本与租约，退役旧 generation，发布新 generation 并更新指针。模型 profile 切换属于独立的 KB 级操作。`knowledge_base.active_index_profile_id` 只表示该 KB 已发布索引当前使用的 profile；尚无 READY 索引的 KB 保持 NULL，全局登记的默认 profile 不使其可检索，上传事务不得回填该指针。
+- 同一文档更新时，旧版继续服务至新版完整就绪。发布事务锁定文档，核对期望版本与租约，退役旧 generation，发布新 generation 并更新指针。模型 profile 切换属于独立的 KB 级操作。`knowledge_base.active_index_profile_id` 只表示该 KB 已发布索引当前使用的 profile；尚无 READY 索引的 KB 保持 NULL，全局登记的默认 profile 不使其可检索，上传事务不得回填该指针。`ingest_job.profile_id` 目前只是 schema 列，数据库不保证其不可变或与 generation 一致；worker 接线时须在写入事务内限制更改并核对 `generation.profile_id`，不得将其当作已冻结的绑定。
 - 查询记录所用版本；回答前若相关版本变化，最多重新检索一次。持续变化返回可重试状态。撤权后新请求和历史访问都失效；已经传给外部模型或客户端的字节无法撤回。
 - 原文是低信任数据；任何其中的“指令”都不改变系统权限、工具或输出 schema。云模型请求只包含必要的、经授权的证据。
 - 单组织内隔离是计划范围。`organization_id` 从会话得到；没有跨租户安全验收前不声称多租户 SaaS 能力。
