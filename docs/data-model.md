@@ -8,8 +8,8 @@
 
 | 表 | 主要字段 | 关键约束与 ACL |
 | --- | --- | --- |
-| `index_profile` | id, embedding_model, model_revision, tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash, dimension, normalize, created_at | `dimension = 512` 的具名 CHECK、`config_hash` 唯一、不可变（无 UPDATE 授权）；api SELECT+INSERT，worker SELECT |
-| `knowledge_base` | id, organization_id, name, active_index_profile_id, kb_revision, acl_revision, created_at, updated_at | `organization_id` 暂不建组织外键；两个 revision 默认 0 且 `>= 0`；`active_index_profile_id` 外键 RESTRICT；api SELECT+INSERT+UPDATE，worker SELECT |
+| `index_profile` | id, embedding_model, model_revision, tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash, dimension, normalize, created_at | `dimension = 512` 的具名 CHECK、`config_hash` 唯一、不可变（无 UPDATE 授权）；它是全局编码契约登记表，登记一个 profile 不代表任何 KB 可检索；api SELECT+INSERT，worker SELECT |
+| `knowledge_base` | id, organization_id, name, active_index_profile_id, kb_revision, acl_revision, created_at, updated_at | `organization_id` 暂不建组织外键；两个 revision 默认 0 且 `>= 0`；`active_index_profile_id` 可空、外键 RESTRICT（语义见下文“index profile 契约与 KB active 可见性”）；api SELECT+INSERT+UPDATE，worker SELECT |
 | `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`(kb_id, lifecycle_status)` 索引；本切片不建 `acl_mode`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `document_version` | id, document_id, version_no, file_ref, file_hash, mime, parser_version, status, created_at, updated_at | `version_no > 0`；`status IN (PENDING, READY, FAILED, NEEDS_OCR)`；`(document_id, version_no)` 唯一；本切片不添加解析警告字段；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `ingest_job` | id, document_id, version_id, status, attempt, lease_owner, lease_token, lease_until, heartbeat_at, next_run_at, dedupe_key, error_code, created_at, updated_at | `status IN (QUEUED, PARSING, CHUNKING, EMBEDDING, INDEXING, READY, FAILED, CANCELLED)`；`attempt >= 0`；租约 owner/token/until 三列全空或全非空；`dedupe_key` 唯一；`(status, next_run_at)` 索引；第一切片不含 `generation_id` 与独立 progress，第二切片补加可空 `generation_id`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
@@ -52,6 +52,14 @@
 外键默认 `ON DELETE/UPDATE RESTRICT`。`kb_member` 的软撤销复用同一行（重新加入时清空 `revoked_at` 并更新 `role`），所以 `(kb_id, user_id)` 保持全表唯一。`kb_member` 的软撤销与 `user_account.enabled` 是两个维度：禁用账号不会撤销其成员行，成员列表可能包含已禁用用户，账号重新启用后原角色恢复。`auth_session` 只保存 token 与 CSRF token 的 hash，不保存原令牌；原令牌只存在于客户端 Cookie，服务端按 hash 校验并以服务端密钥与会话令牌派生的 CSRF 令牌配合，该会话/CSRF 逻辑已由 auth API 实现。运行角色没有 DELETE 权限，当前也没有会话清理作业，已撤销与已过期会话行会继续保留，清理期限与维护作业尚未实现。三张表都不建额外二级索引。
 
 `kb_member` 的 `kb_id` 与 `user_id` 只是各自指向 `knowledge_base` 与 `user_account` 的两个独立外键，数据库**不保证**两者属于同一组织，也不保证成员所属组织与 `knowledge_base.organization_id` 一致；该不变量必须由业务写入事务在提交前核对（本切片 `create_knowledge_base` 与 `replace_knowledge_base_members` 在事务内按会话组织校验用户，读取路径也按 KB 组织过滤），当前没有触发器或复合外键在结构上强制它。同样，“替换后至少保留一名启用中的 OWNER”与“不得新加入或提升已禁用用户为 OWNER”都是替换事务内的应用校验，数据库没有对应约束；直接写库（例如禁用最后一个 OWNER）可以绕过，只能由运维在库层修正。
+
+## index profile 契约与 KB active 可见性
+
+`index_profile` 契约已由纯标准库源码模块 `rag_backend.models.profile_contract` 实现（独立 review APPROVED、隔离 api+worker 镜像 tester 已验收：21 passed、非集成 828 passed/2 skipped；源码 SHA `0eabc8c6…`）；默认 `config_hash=4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa`、`tokenizer_revision` 摘要 `ca6e9808373afae7a8b131f50361c9b125ba5914eef0161b148b3ab6a105f9a8`，完整 golden 见 [入库与版本](ingestion.md)。KB 的 seed、发布事务与检索路径仍未实现，当前 `knowledge_base.active_index_profile_id` 全部为 NULL。
+
+- `index_profile` 是全局、不可变的编码契约登记表。七个契约字段为 `embedding_model`、`model_revision`、`dimension`、`normalize`、`tokenizer_revision`、`chunker_version`、`keyword_analyzer_version`；`config_hash` 是它们加 `schema_version='index-profile-v1'` 后规范化 JSON 的 SHA-256（算法、默认字段与完整 golden 见 [入库与版本](ingestion.md)）。`parser_version` 与来源相关字段刻意不属于 profile，也不参与 `config_hash`，保存在 `document_version`/`chunk`。
+- 登记一个全局 profile 只表示该编码契约可用，不代表任何 KB 可检索；KB 是否可检索由 `knowledge_base.active_index_profile_id` 决定。
+- `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile。新 KB 尚无 READY 索引时保持 NULL；仅首次 READY 发布事务（以及后续 KB 级 profile 切换）可以置位或改写。上传事务与全局 profile 登记都不得把它从 NULL 回填为默认 profile。指针为 NULL 的 KB 不可检索。
 
 ## 计划中：后续切片
 
