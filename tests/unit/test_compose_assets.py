@@ -432,17 +432,20 @@ def test_queue_override_adds_shared_marker_volume_and_one_shot_probe() -> None:
     assert "result_backend" not in text
 
 
-# --- worker 真实入库开关的 Compose 透传（默认关闭） -----------------------------
+# --- worker 真实入库开关的 Compose 透传（默认关闭；api 侧恢复扫描共用同一开关） ---
 
 
-def test_compose_worker_gets_ingest_processing_flag_and_api_does_not() -> None:
-    worker_block = compose_service_block("worker")
+INGEST_PROCESSING_FLAG_LINE = "INGEST_PROCESSING_ENABLED: ${INGEST_PROCESSING_ENABLED:-0}"
+
+
+def test_compose_api_and_worker_share_ingest_processing_flag() -> None:
     api_block = compose_service_block("api")
+    worker_block = compose_service_block("worker")
 
-    assert (
-        "INGEST_PROCESSING_ENABLED: ${INGEST_PROCESSING_ENABLED:-0}" in worker_block
-    ), "worker 必须透传真实入库开关，否则 .env 中的设置会被静默丢弃"
-    assert "INGEST_PROCESSING_ENABLED" not in api_block, "API 不执行入库管线，不得透传该开关"
+    # api 侧 dispatcher 的处理中任务过期租约恢复与 worker 真实处理共用该开关，
+    # 两侧必须一致；否则 api 不会回收卡住的活动任务。
+    assert INGEST_PROCESSING_FLAG_LINE in api_block, "api 侧恢复扫描必须透传入库开关"
+    assert INGEST_PROCESSING_FLAG_LINE in worker_block, "worker 必须透传真实入库开关"
 
 
 def render_compose_config(
@@ -502,25 +505,25 @@ def service_environment(config: dict[str, Any], service: str) -> dict[str, str]:
 @pytest.mark.parametrize(
     "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
 )
-def test_compose_config_defaults_ingest_processing_off_for_worker_only(
+def test_compose_config_defaults_ingest_processing_off_for_api_and_worker(
     extra_files: tuple[Path, ...],
 ) -> None:
     config = render_compose_config(*extra_files, ingest_processing=None)
 
+    assert service_environment(config, "api")[INGEST_PROCESSING_ENV_VAR] == "0"
     assert service_environment(config, "worker")[INGEST_PROCESSING_ENV_VAR] == "0"
-    assert INGEST_PROCESSING_ENV_VAR not in service_environment(config, "api")
 
 
 @pytest.mark.parametrize(
     "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
 )
-def test_compose_config_passes_ingest_processing_enable_to_worker_only(
+def test_compose_config_passes_ingest_processing_enable_to_api_and_worker(
     extra_files: tuple[Path, ...],
 ) -> None:
     config = render_compose_config(*extra_files, ingest_processing="1")
 
+    assert service_environment(config, "api")[INGEST_PROCESSING_ENV_VAR] == "1"
     assert service_environment(config, "worker")[INGEST_PROCESSING_ENV_VAR] == "1"
-    assert INGEST_PROCESSING_ENV_VAR not in service_environment(config, "api")
 
 
 # --- 问答生成 token 预算的 Compose 透传（只在 api） -----------------------------
