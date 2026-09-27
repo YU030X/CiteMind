@@ -416,10 +416,12 @@ async def test_body_limit_counts_stream_without_content_length() -> None:
 
 
 def test_upload_route_has_no_fastapi_body_params() -> None:
+    # 同一路径下另有 GET 列表端点；只取 POST 上传端点，检验的才是真实 upload 路由。
     routes = [
         route
         for route in router.routes
         if getattr(route, "path", "").endswith("/documents")
+        and "POST" in (getattr(route, "methods", None) or ())
     ]
     assert len(routes) == 1
     dependant = getattr(routes[0], "dependant")
