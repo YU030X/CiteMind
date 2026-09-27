@@ -191,6 +191,7 @@ def _citation_response(view: CitationView) -> CitationResponse:
         version=view.version,
         locator=view.locator,
         quote=view.quote,
+        is_current_version=view.is_current_version,
     )
 
 

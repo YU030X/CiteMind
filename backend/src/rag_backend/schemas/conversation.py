@@ -91,6 +91,7 @@ class CitationResponse(CamelModel):
     version: int
     locator: dict[str, Any]
     quote: str
+    is_current_version: bool
 
 
 class ConversationMessageResponse(CamelModel):

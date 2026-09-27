@@ -63,7 +63,7 @@ from test_retrieval_flow import (
 
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260927_0009"
+SCHEMA_REVISION = "20260927_0011"
 ORIGIN = "http://127.0.0.1"
 CSRF_TOKEN = "integration-conversation-csrf"
 
@@ -145,7 +145,9 @@ def _context(user_id: uuid.UUID, organization_id: uuid.UUID) -> AuthContext:
 
 
 class FakeEstimator:
-    def estimate_chat_tokens(self, messages: Sequence[Any]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[Any], *, thinking: Any = None
+    ) -> int:
         return sum(1 + len(message.content) for message in messages)
 
 
@@ -172,7 +174,14 @@ class FakeGenerator:
         self.answer_messages: list[tuple[Any, ...]] = []
         self.rewrite_messages: list[tuple[Any, ...]] = []
 
-    def generate(self, messages: Sequence[Any], *, max_output_tokens: int) -> GenerationOutcome:
+    def generate(
+        self,
+        messages: Sequence[Any],
+        *,
+        model: str,
+        max_output_tokens: int,
+        thinking: Any = None,
+    ) -> GenerationOutcome:
         captured = tuple(messages)
         self.messages.append(captured)
         self.calls += 1
@@ -416,6 +425,7 @@ async def test_full_http_flow_maps_citations_and_records_usage(
         assert citation["locator"] == json.loads(LOCATOR)
         assert citation["quote"] == CHUNK_TEXT[:500]
         assert citation["version"] == 1
+        assert citation["isCurrentVersion"] is True
         assert citation["documentTitle"].startswith("doc-")
         # 本地估算与 provider 实际用量分开呈现。
         assert payload["usage"]["localInputTokens"] is not None
@@ -996,6 +1006,7 @@ async def test_version_updated_history_keeps_old_answer_with_old_version_marker(
         assert first.status_code == 200, first.text
         first_citation = first.json()["citations"][0]
         assert first_citation["version"] == 1
+        assert first_citation["isCurrentVersion"] is True
 
         with conversation_schema.connect() as connection:
             document_id = connection.scalar(
@@ -1020,10 +1031,12 @@ async def test_version_updated_history_keeps_old_answer_with_old_version_marker(
         assert [message["role"] for message in messages] == ["user", "assistant"]
         assert messages[1]["content"] == "制度规定。"
         assert messages[1]["citations"][0]["version"] == 1
+        assert messages[1]["citations"][0]["isCurrentVersion"] is False
 
         detail = await client.get(f"/api/v1/citations/{first_citation['citationId']}")
         assert detail.status_code == 200, detail.text
         assert detail.json()["version"] == 1
+        assert detail.json()["isCurrentVersion"] is False
 
         second = await _ask(client, conversation_id, "hello 第二问")
 
@@ -1035,6 +1048,7 @@ async def test_version_updated_history_keeps_old_answer_with_old_version_marker(
     assert "制度规定。" in second_prompt
     # 当前回答引用的是切换后的新版本，而不是把旧答案当当前事实。
     assert second.json()["citations"][0]["version"] == 2
+    assert second.json()["citations"][0]["isCurrentVersion"] is True
 
 
 @pytest.mark.anyio

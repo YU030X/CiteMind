@@ -91,6 +91,11 @@ export function sourceTypeLabel(sourceType: SourceType): string {
   return SOURCE_TYPE_LABELS[sourceType] ?? sourceType;
 }
 
+/** 引用版本标识：旧版本引用仍可展示，但必须标清文档已更新、不能当作当前事实。 */
+export function citationVersionLabel(isCurrentVersion: boolean): string {
+  return isCurrentVersion ? "当前版本" : "旧版本（已更新）";
+}
+
 export function jobErrorLabel(errorCode: string | null): string {
   if (errorCode === null || errorCode === "") return "";
   const known = JOB_ERROR_LABELS[errorCode];

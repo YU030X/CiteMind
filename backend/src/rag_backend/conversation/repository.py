@@ -137,7 +137,11 @@ _LIST_MESSAGES_SQL = text(
 _CITATION_COLUMNS = (
     "ci.id AS citation_id, ci.message_id, ci.display_label, ci.chunk_id, ci.version_id, "
     "ci.locator_snapshot, ci.quote, ci.quote_hash, dv.version_no AS version_no, "
-    "d.id AS document_id, d.title AS document_title"
+    "d.id AS document_id, d.title AS document_title, "
+    # 是否仍是文档当前版本：以权威 ``document.active_version_id`` 对比引用快照的 ``version_id``，
+    # 两者都为 NULL 时才可能相等，显式要求 active 非 NULL，避免把已清空指针当成匹配。
+    "(d.active_version_id IS NOT NULL AND d.active_version_id = ci.version_id) "
+    "AS is_current_version"
 )
 
 _LIST_CITATIONS_SQL = text(
@@ -283,6 +287,7 @@ class StoredCitation:
     locator: dict[str, Any]
     quote: str
     quote_hash: str
+    is_current_version: bool
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -752,6 +757,7 @@ class SqlConversationRepository:
             locator=dict(row["locator_snapshot"]),
             quote=str(row["quote"]),
             quote_hash=str(row["quote_hash"]),
+            is_current_version=bool(row["is_current_version"]),
         )
 
 

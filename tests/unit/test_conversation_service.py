@@ -295,6 +295,7 @@ class FakeConversationRepository:
                 locator=record.locator,
                 quote=record.quote,
                 quote_hash=record.quote_hash,
+                is_current_version=True,
             )
         )
 
@@ -592,6 +593,7 @@ async def test_happy_path_maps_server_side_citation_and_records_usage() -> None:
     assert citation.locator == {"page": 3, "start_line": 5}
     assert citation.quote == "制度原文很长。"
     assert citation.version == 2
+    assert citation.is_current_version is True
     assert generator.calls == 1
     # 每次真实尝试恰好一行 provider 事实，且 model 来自配置。
     assert len(repository.usage) == 1
@@ -779,7 +781,9 @@ async def test_version_change_after_model_twice_returns_retryable_failure() -> N
 # --- 历史与所有者隔离 --------------------------------------------------------
 
 
-def _prior_turn(answer: str) -> tuple[StoredMessage, StoredMessage, StoredCitation]:
+def _prior_turn(
+    answer: str, *, is_current_version: bool = True
+) -> tuple[StoredMessage, StoredMessage, StoredCitation]:
     run_id = uuid.uuid4()
     user = StoredMessage(
         id=uuid.uuid4(),
@@ -809,6 +813,7 @@ def _prior_turn(answer: str) -> tuple[StoredMessage, StoredMessage, StoredCitati
         locator={"page": 1},
         quote="旧引文",
         quote_hash="h",
+        is_current_version=is_current_version,
     )
     return user, assistant, citation
 

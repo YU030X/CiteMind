@@ -25,7 +25,7 @@ import { Textarea } from "@/components/ui/textarea";
 import CitationPanel from "@/components/CitationPanel.vue";
 import ConversationList from "@/components/ConversationList.vue";
 import KnowledgeBaseSelect from "@/components/KnowledgeBaseSelect.vue";
-import { kbRoleLabel, formatTime } from "@/labels";
+import { kbRoleLabel, citationVersionLabel, formatTime } from "@/labels";
 import { renderMarkdown } from "@/lib/markdown";
 import type { ReasoningEffort } from "@/api/types";
 import {
@@ -279,7 +279,7 @@ function cite(citationId: string): void {
                   :key="citation.citationId"
                   type="button"
                   class="citation-chip"
-                  :title="`查看引用：${citation.documentTitle} v${citation.version}`"
+                  :title="`查看引用：${citation.documentTitle} v${citation.version}（${citationVersionLabel(citation.isCurrentVersion)}）`"
                   @click="cite(citation.citationId)"
                 >
                   {{ citation.displayLabel }}

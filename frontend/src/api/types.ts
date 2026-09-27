@@ -137,6 +137,8 @@ export interface Citation {
   version: number;
   locator: Record<string, unknown>;
   quote: string;
+  /** 引用版本是否仍是文档当前版本；否表示文档已更新，只能作为历史展示。 */
+  isCurrentVersion: boolean;
 }
 
 export interface ConversationMessage {

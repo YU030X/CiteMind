@@ -200,6 +200,34 @@ async def test_history_returns_visible_citations_for_authorized_source(
     assistant_message = payload["messages"][1]
     assert assistant_message["citations"][0]["citationId"] == str(citation.id)
     assert assistant_message["citations"][0]["displayLabel"] == "E1"
+    assert assistant_message["citations"][0]["isCurrentVersion"] is True
+
+
+@pytest.mark.anyio
+async def test_history_marks_superseded_citation_as_not_current(
+    conversation_app: Any,
+) -> None:
+    from test_conversation_service import _prior_turn
+
+    user, assistant, citation = _prior_turn("旧回答", is_current_version=False)
+    repository = FakeConversationRepository(
+        _conversation(), messages=[user, assistant], citations=[citation]
+    )
+    evidence = FakeEvidenceRepository(
+        [], states=[_state(CHUNK_ID, version_id=VERSION_ID)]
+    )
+    conversation_app.dependency_overrides[get_conversation_repository] = lambda: repository
+    conversation_app.dependency_overrides[get_evidence_repository] = lambda: evidence
+
+    async with conversation_app.router.lifespan_context(conversation_app):
+        async with _client(conversation_app) as client:
+            response = await client.get(
+                f"/api/v1/conversations/{CONVERSATION_ID}/messages"
+            )
+
+    assert response.status_code == 200, response.text
+    assistant_message = response.json()["messages"][1]
+    assert assistant_message["citations"][0]["isCurrentVersion"] is False
 
 
 @pytest.mark.anyio
@@ -265,6 +293,7 @@ async def test_citation_detail_maps_locator_for_authorized_source(
     assert payload["citationId"] == str(citation.id)
     assert payload["documentTitle"] == "制度文档"
     assert payload["version"] == 1
+    assert payload["isCurrentVersion"] is True
     assert payload["quote"] == "旧引文"
     assert payload["locator"] == {"page": 1}
 

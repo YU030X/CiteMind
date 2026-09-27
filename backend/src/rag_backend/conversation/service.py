@@ -139,6 +139,7 @@ class CitationView:
     version: int
     locator: dict[str, Any]
     quote: str
+    is_current_version: bool
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -670,6 +671,7 @@ def _citation_view(citation: StoredCitation) -> CitationView:
         version=citation.version_no,
         locator=citation.locator,
         quote=citation.quote,
+        is_current_version=citation.is_current_version,
     )
 
 
@@ -1105,6 +1107,9 @@ async def _persist_turn(
                 version=draft.version_no,
                 locator=draft.locator,
                 quote=draft.quote,
+                # 本次回答的证据来自检索时的 active version，且交付前已复核版本未变；
+                # 刚生成的引用必然是当前版本。
+                is_current_version=True,
             )
         )
     await repository.commit()

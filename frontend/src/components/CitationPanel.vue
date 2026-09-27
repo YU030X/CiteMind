@@ -6,7 +6,7 @@ import { Separator } from "@/components/ui/separator";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Citation } from "@/api/types";
-import { describeLocator } from "@/labels";
+import { citationVersionLabel, describeLocator } from "@/labels";
 import { state } from "@/state/store";
 
 /**
@@ -40,7 +40,12 @@ const locator = computed(() =>
 
       <dl class="grid grid-cols-[4rem_1fr] gap-y-1 text-xs">
         <dt class="text-muted-foreground">版本</dt>
-        <dd>v{{ citation.version }}</dd>
+        <dd class="flex flex-wrap items-center gap-1">
+          <span>v{{ citation.version }}</span>
+          <Badge :variant="citation.isCurrentVersion ? 'secondary' : 'outline'">
+            {{ citationVersionLabel(citation.isCurrentVersion) }}
+          </Badge>
+        </dd>
         <dt class="text-muted-foreground">定位</dt>
         <dd>{{ locator?.text }}</dd>
         <dt class="text-muted-foreground">引用 ID</dt>

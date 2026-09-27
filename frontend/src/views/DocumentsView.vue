@@ -106,7 +106,37 @@ function versionLine(item: DocumentSummary): string {
     active === null ? "无可用版本" : `可用 v${active.versionNo}（${versionLabel(active.status)}）`;
   if (latest === null) return activeText;
   const latestText = `最新 v${latest.versionNo}（${versionLabel(latest.status)}）`;
-  return latest.id === active?.id ? `${latestText} · 已发布` : `${activeText} · 最新 ${latestText}`;
+  return latest.id === active?.id ? `${latestText} · 已发布` : `${activeText} · ${latestText}`;
+}
+
+/**
+ * 状态单元格补充说明：窄屏下「版本」与「最新任务」列会被隐藏，这里复用现有 labels
+ * 把最新一次失败或需 OCR 的原因放到始终可见的状态列，并区分首版失败与更新失败。
+ */
+function statusDetail(item: DocumentSummary): string {
+  const latest = item.latestVersion;
+  if (latest === null) return "";
+  const job = item.latestJob;
+  const error = job === null ? "" : jobErrorLabel(job.errorCode);
+  // 首版就失败或需要 OCR：当前没有可用版本，直接显示原因。
+  if (item.activeVersion === null) {
+    if (latest.status === "FAILED" || latest.status === "NEEDS_OCR") {
+      return error === "" ? versionLabel(latest.status) : error;
+    }
+    return "";
+  }
+  // 已有可用版本但新版本更新失败或需 OCR：明确区分更新原因与「旧版本仍可用」。
+  if (latest.id !== item.activeVersion.id) {
+    if (latest.status === "FAILED") {
+      const reason = error === "" ? versionLabel(latest.status) : error;
+      return `更新失败：${reason}（旧版本 v${item.activeVersion.versionNo} 仍可用）`;
+    }
+    if (latest.status === "NEEDS_OCR") {
+      const reason = error === "" ? versionLabel(latest.status) : error;
+      return `更新需 OCR：${reason}（旧版本 v${item.activeVersion.versionNo} 仍可用）`;
+    }
+  }
+  return "";
 }
 
 function pendingWorkLabel(item: DocumentSummary): string {
@@ -501,9 +531,14 @@ async function confirmDelete(): Promise<void> {
               <Badge variant="outline">{{ sourceTypeLabel(item.sourceType) }}</Badge>
             </TableCell>
             <TableCell>
-              <Badge :variant="lifecycleBadgeVariant(item.lifecycleStatus)">
-                {{ lifecycleLabel(item.lifecycleStatus) }}
-              </Badge>
+              <div class="flex flex-col gap-1">
+                <Badge :variant="lifecycleBadgeVariant(item.lifecycleStatus)">
+                  {{ lifecycleLabel(item.lifecycleStatus) }}
+                </Badge>
+                <span v-if="statusDetail(item) !== ''" class="text-xs text-destructive">
+                  {{ statusDetail(item) }}
+                </span>
+              </div>
             </TableCell>
             <TableCell class="hidden text-muted-foreground md:table-cell">
               {{ versionLine(item) }}
