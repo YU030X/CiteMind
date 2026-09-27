@@ -21,6 +21,7 @@ from rag_backend.dispatch.repository import (
     CompensationCandidate,
     CompensationResult,
     OutboxRepository,
+    PipelineRecoveryResult,
     SqlOutboxRepository,
 )
 
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # 补偿扫描每轮最多处理的 job 数量，避免一次锁住过多行。
 DEFAULT_COMPENSATION_LIMIT = 50
+# 处理中任务过期租约恢复扫描每轮最多处理的 job 数量；与补偿共用同一后台周期。
+DEFAULT_RECOVERY_LIMIT = 50
 # 后台循环的轮询间隔与每轮最多投递事件数；低配单进程下不让一次 cron 卡住事件循环。
 DISPATCH_POLL_SECONDS = 5.0
 DISPATCH_BATCH_PER_CYCLE = 50
@@ -186,14 +189,18 @@ async def compensate_unconfirmed_jobs(
     *,
     limit: int = DEFAULT_COMPENSATION_LIMIT,
     max_attempts: int = protocol.MAX_DELIVERY_ATTEMPTS,
+    grace_seconds: int = protocol.RECEIVE_GRACE_SECONDS,
 ) -> CompensationResult:
     """锁住到期未确认的 QUEUED job，按计划补投或标记未确认。
 
     候选行在同一个事务里被 ``FOR UPDATE SKIP LOCKED`` 锁定，插入新 PENDING 前后都不会有
-    第二个 dispatcher 对同一 job 重复补偿。任何失败都回滚，不把 job 置为其他状态。
+    第二个 dispatcher 对同一 job 重复补偿。接收宽限由候选 SQL 根据最近 SENT 的 ``sent_at``
+    判定。任何失败都回滚，不把 job 置为其他状态。
     """
 
-    candidates = await repo.lock_compensation_candidates(limit=limit)
+    candidates = await repo.lock_compensation_candidates(
+        limit=limit, grace_seconds=grace_seconds
+    )
     plan = plan_compensation(candidates, max_attempts=max_attempts)
     if not plan.followup_job_ids and not plan.unconfirmed_job_ids:
         await repo.commit()
@@ -213,6 +220,50 @@ async def compensate_unconfirmed_jobs(
     return CompensationResult(created, flagged)
 
 
+async def recover_expired_pipeline_jobs(
+    repo: OutboxRepository,
+    *,
+    limit: int = DEFAULT_RECOVERY_LIMIT,
+    max_attempts: int = protocol.MAX_PIPELINE_ATTEMPTS,
+) -> PipelineRecoveryResult:
+    """锁住租约已过期的处理中任务，重排为 QUEUED 或耗尽后静态失败。
+
+    ``attempt`` 达到 ``max_attempts`` 的任务不再重排，而是置 ``FAILED`` +
+    ``PIPELINE_RETRY_EXHAUSTED`` 并同事务同步 version/document（仅当文档没有 active version
+    时才置 document FAILED）。未达上限的任务清租约、写退避 ``next_run_at`` 并原子
+    新建 PENDING 事件；``attempt`` 由下一次 claim 递增，不由本函数回写。整批在单个事务内
+    完成，任何失败都整体回滚，不半落账。
+    """
+
+    candidates = await repo.lock_expired_pipeline_jobs(limit=limit)
+    if not candidates:
+        await repo.commit()
+        return PipelineRecoveryResult((), ())
+    requeued: list[uuid.UUID] = []
+    exhausted: list[uuid.UUID] = []
+    try:
+        for candidate in candidates:
+            if candidate.attempt < max_attempts:
+                delay = protocol.pipeline_retry_delay_seconds(candidate.attempt)
+                event_id = await repo.requeue_expired_pipeline_job(
+                    candidate.job_id, delay_seconds=delay
+                )
+                if event_id is not None:
+                    requeued.append(candidate.job_id)
+            elif await repo.exhaust_expired_pipeline_job(candidate.job_id):
+                exhausted.append(candidate.job_id)
+        await repo.commit()
+    except Exception:
+        await repo.rollback()
+        raise
+    if exhausted:
+        logger.warning(
+            "ingest pipeline retry exhausted job_ids=%s",
+            ",".join(str(job_id) for job_id in exhausted),
+        )
+    return PipelineRecoveryResult(tuple(requeued), tuple(exhausted))
+
+
 class OutboxDispatcher:
     """按调用构造独立 Session 的 dispatcher；不持有长事务，也不持有网络连接。"""
 
@@ -223,11 +274,14 @@ class OutboxDispatcher:
         publisher: Publisher,
         owner: str | None = None,
         compensation_limit: int = DEFAULT_COMPENSATION_LIMIT,
+        recovery_enabled: bool = False,
     ) -> None:
         self._session_factory = session_factory
         self._publisher = publisher
         self._owner = owner if owner is not None else protocol.default_lease_owner()
         self._compensation_limit = compensation_limit
+        # 恢复只处理真实处理开关开启后可能出现的活动阶段任务；由调用方按双门控传入。
+        self._recovery_enabled = recovery_enabled
 
     async def dispatch_once(self) -> DispatchOutcome:
         async with self._session_factory() as session:
@@ -237,7 +291,15 @@ class OutboxDispatcher:
     async def compensate(self) -> CompensationResult:
         async with self._session_factory() as session:
             repo = SqlOutboxRepository(session)
-            return await compensate_unconfirmed_jobs(repo, limit=self._compensation_limit)
+            result = await compensate_unconfirmed_jobs(
+                repo, limit=self._compensation_limit
+            )
+            if self._recovery_enabled:
+                # 与补偿共用同一后台周期和生命周期；bounded、SKIP LOCKED、失败整体回滚。
+                await recover_expired_pipeline_jobs(
+                    repo, limit=self._compensation_limit
+                )
+            return result
 
     async def run(self) -> None:
         """后台循环：每轮投递一批到期事件后补偿一次；任何异常都不终止循环。

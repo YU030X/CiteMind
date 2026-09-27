@@ -586,15 +586,18 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.mark.parametrize("processing_enabled", [True, False])
 @pytest.mark.anyio
 async def test_lifespan_starts_and_cancels_dispatcher_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
+    processing_enabled: bool,
 ) -> None:
     import asyncio
 
     from rag_backend import app as app_module
 
     events: list[str] = []
+    seen_recovery: list[bool] = []
 
     class FakePublisher:
         def __init__(self, celery_app: object) -> None:
@@ -607,8 +610,15 @@ async def test_lifespan_starts_and_cancels_dispatcher_when_enabled(
             events.append("publisher_closed")
 
     class FakeDispatcher:
-        def __init__(self, *, session_factory: object, publisher: object) -> None:
+        def __init__(
+            self,
+            *,
+            session_factory: object,
+            publisher: object,
+            recovery_enabled: bool = False,
+        ) -> None:
             events.append("dispatcher")
+            seen_recovery.append(recovery_enabled)
 
         async def run(self) -> None:
             events.append("run")
@@ -626,6 +636,8 @@ async def test_lifespan_starts_and_cancels_dispatcher_when_enabled(
         dispatcher_enabled=True,
         redis_url=REDIS_URL,
         session_cookie_secure=False,
+        ingest_processing_enabled=processing_enabled,
+        inference_token="inference-token",
     )
     application = app_module.create_app(resolved)
     async with application.router.lifespan_context(application):
@@ -633,6 +645,7 @@ async def test_lifespan_starts_and_cancels_dispatcher_when_enabled(
         assert "run" in events
 
     assert "cancelled" in events
+    assert seen_recovery == [processing_enabled]
     assert events[-1] == "publisher_closed"
 
 
@@ -645,6 +658,9 @@ async def test_lifespan_does_not_start_dispatcher_when_disabled(
     created: list[str] = []
     monkeypatch.setattr(
         app_module, "CeleryPublisher", lambda celery_app: created.append("publisher")
+    )
+    monkeypatch.setattr(
+        app_module, "OutboxDispatcher", lambda **kwargs: created.append("dispatcher")
     )
 
     resolved = settings(session_cookie_secure=False)

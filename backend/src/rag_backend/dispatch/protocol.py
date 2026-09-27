@@ -36,6 +36,11 @@ DELIVERY_UNCONFIRMED = "DELIVERY_UNCONFIRMED"
 # 未知事件类型不是可投递事件；显式落到 job.error_code，避免任务静默停在 QUEUED。
 UNSUPPORTED_EVENT_TYPE = "UNSUPPORTED_EVENT_TYPE"
 
+# 处理中任务（活动阶段）的租约过期自动恢复上限：只计被 claim 领取的总次数。
+# 达到该次数后仍持有过期活动租约的任务静态失败为 PIPELINE_RETRY_EXHAUSTED，不再重排。
+MAX_PIPELINE_ATTEMPTS = 3
+PIPELINE_RETRY_EXHAUSTED = "PIPELINE_RETRY_EXHAUSTED"
+
 # job 级“已接收”标记的形状，由 worker 在原子领取 job 租约时写入；``lease_owner`` 前缀
 # 或 ``heartbeat_at`` 任一出现即视为已接收，dispatcher 不再重复投递。
 JOB_RECEIVE_MARKER_PREFIX = "event:"
@@ -64,6 +69,19 @@ def retry_delay_seconds(dispatch_attempt: int) -> int:
         raise ValueError("dispatch_attempt 必须为正整数")
     # 指数只用于增长到上限；提前封顶避免极大 attempt 生成巨大整数。
     exponent = min(dispatch_attempt - 1, 16)
+    return min(RETRY_BASE_SECONDS * (1 << exponent), RETRY_MAX_SECONDS)
+
+
+def pipeline_retry_delay_seconds(attempt: int) -> int:
+    """按处理中任务已发生的领取次数返回下一次投递的退避秒数（5s 指数、300s 封顶）。
+
+    ``attempt`` 是任务被 claim 领取过的次数（``ingest_job.attempt``）；崩溃恢复不回写
+    ``attempt``，由下一次 claim 递增，因此这里用当前值决定本次重排的等待。
+    """
+
+    if attempt < 1:
+        raise ValueError("attempt 必须为正整数")
+    exponent = min(attempt - 1, 16)
     return min(RETRY_BASE_SECONDS * (1 << exponent), RETRY_MAX_SECONDS)
 
 

@@ -123,6 +123,8 @@ PROCESS_STATUS_EXISTING_DIAGNOSTIC: Final = "existing_diagnostic"
 PROCESS_STATUS_UNSUPPORTED_UPDATE: Final = "unsupported_update"
 # 陈旧 expected：可解析的 expected 已不等于文档当前 active，本任务永远无法发布，领取期静态拒绝。
 PROCESS_STATUS_STALE_EXPECTED: Final = "stale_expected"
+# 恢复后的退避尚未到期：不领取，但也不改状态；旧 Redis 重投不能绕过该门槛。
+PROCESS_STATUS_NOT_DUE: Final = "not_due"
 PROCESS_STATUS_FAILED: Final = "failed"
 PROCESS_STATUS_LEASE_LOST: Final = "lease_lost"
 # 数据库持续不可用、无法落任何终态：诚实上报，不当作成功，也不谎报 FAILED。
@@ -265,6 +267,7 @@ SELECT_JOB_FOR_CLAIM_SQL: Final = text(
         d.lifecycle_status,
         d.source_type,
         d.kb_id,
+        j.next_run_at <= clock_timestamp() AS next_run_due,
         kb.organization_id,
         kb.active_index_profile_id,
         EXISTS (
@@ -296,6 +299,7 @@ CLAIM_JOB_SQL: Final = text(
       AND heartbeat_at IS NULL
       AND error_code IS NULL
       AND profile_id IS NOT NULL
+      AND next_run_at <= clock_timestamp()
     RETURNING id
     """
 )
@@ -328,6 +332,7 @@ class ClaimAction(Enum):
     LEGACY_UNSUPPORTED = "LEGACY_UNSUPPORTED"
     UNSUPPORTED_UPDATE = "UNSUPPORTED_UPDATE"
     STALE_EXPECTED = "STALE_EXPECTED"
+    NOT_DUE = "NOT_DUE"
 
 
 _CLAIM_ACTION_STATUS: Final[dict[ClaimAction, str]] = {
@@ -339,6 +344,7 @@ _CLAIM_ACTION_STATUS: Final[dict[ClaimAction, str]] = {
     ClaimAction.LEGACY_UNSUPPORTED: PROCESS_STATUS_LEGACY_UNSUPPORTED,
     ClaimAction.UNSUPPORTED_UPDATE: PROCESS_STATUS_UNSUPPORTED_UPDATE,
     ClaimAction.STALE_EXPECTED: PROCESS_STATUS_STALE_EXPECTED,
+    ClaimAction.NOT_DUE: PROCESS_STATUS_NOT_DUE,
 }
 
 # 领取期静态拒绝动作到具名 error_code 的固定映射；只有这些动作才写入 FAILED 终态。
@@ -365,6 +371,7 @@ class ClaimFacts:
     document_active_version_id: uuid.UUID | None
     ready_generation_present: bool
     expected_active_version_id: uuid.UUID | None
+    next_run_due: bool
 
 
 def decide_claim_action(facts: ClaimFacts) -> ClaimAction:
@@ -400,17 +407,20 @@ def decide_claim_action(facts: ClaimFacts) -> ClaimAction:
     if facts.version_no == 1:
         if facts.document_active_version_id is not None or facts.ready_generation_present:
             return ClaimAction.UNSUPPORTED_UPDATE
-        return ClaimAction.CLAIM
-    # 文档新版本：必须有可解析的 expected active，且文档已有 active version。
-    if (
-        facts.expected_active_version_id is None
-        or facts.document_active_version_id is None
-        or facts.ready_generation_present
-    ):
-        return ClaimAction.UNSUPPORTED_UPDATE
-    if facts.expected_active_version_id != facts.document_active_version_id:
-        # expected 已被更早的发布超越；active 只前进不回退，本任务不可能成功。
-        return ClaimAction.STALE_EXPECTED
+    else:
+        # 文档新版本：必须有可解析的 expected active，且文档已有 active version。
+        if (
+            facts.expected_active_version_id is None
+            or facts.document_active_version_id is None
+            or facts.ready_generation_present
+        ):
+            return ClaimAction.UNSUPPORTED_UPDATE
+        if facts.expected_active_version_id != facts.document_active_version_id:
+            # expected 已被更早的发布超越；active 只前进不回退，本任务不可能成功。
+            return ClaimAction.STALE_EXPECTED
+    if not facts.next_run_due:
+        # 恢复后的退避未到期：不领取，也不改状态；旧 Redis 重投无法绕过。
+        return ClaimAction.NOT_DUE
     return ClaimAction.CLAIM
 
 
@@ -483,6 +493,7 @@ def claim_ingest_job(
             expected_active_version_id=(
                 parsed_dedupe[1] if parsed_dedupe is not None else None
             ),
+            next_run_due=bool(row["next_run_due"]),
         )
         action = decide_claim_action(facts)
         if action in _REJECT_ERROR_CODE:
@@ -1787,6 +1798,7 @@ __all__ = [
     "PipelineDependencyUnavailable",
     "PROCESS_STATUS_PERSIST_UNCONFIRMED",
     "PROCESS_STATUS_STALE_EXPECTED",
+    "PROCESS_STATUS_NOT_DUE",
     "PublishOutcome",
     "ResolveOutcome",
     "ResolvedIdentity",

@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -38,7 +39,9 @@ from rag_backend.dispatch.service import (
     DispatchOutcome,
     OutboxDispatcher,
     compensate_unconfirmed_jobs,
+    recover_expired_pipeline_jobs,
 )
+from rag_backend.ingestion import indexing_worker as iw
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.profile_repository import ensure_default_index_profile
 from rag_backend.worker import (
@@ -486,7 +489,7 @@ async def test_dispatcher_marks_sent_and_uses_ingest_queue(
 
 
 @pytest.mark.anyio
-async def test_mark_sent_pushes_receive_grace_and_blocks_compensation(
+async def test_recent_sent_blocks_compensation_until_grace_elapses(
     role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
 ) -> None:
     async with api_sessions(role_test_databases.api_url) as factory:
@@ -504,26 +507,29 @@ async def test_mark_sent_pushes_receive_grace_and_blocks_compensation(
             row = (
                 await session.execute(
                     text(
-                        "SELECT (next_run_at - now()) > interval '55 seconds' AS pushed "
-                        "FROM ingest_job WHERE id = :id"
+                        "SELECT j.next_run_at <= now(), e.sent_at "
+                        "FROM ingest_job AS j "
+                        "JOIN outbox_event AS e ON e.job_id = j.id "
+                        "WHERE j.id = :id AND e.id = :event_id"
                     ),
-                    {"id": job_id},
+                    {"id": job_id, "event_id": event_id},
                 )
             ).first()
-            assert row is not None and row[0] is True
+            # mark_sent 不再改写 job.next_run_at；接收宽限由 SENT.sent_at 判定。
+            assert row is not None and row[0] is True and row[1] is not None
 
             # 60s 宽限内事件为 SENT 且无 PENDING，补偿不得新建。
             repo = SqlOutboxRepository(session)
             assert (await compensate_unconfirmed_jobs(repo)).created_event_ids == ()
 
-        # 模拟宽限到期后才允许补投一次。
+        # 把最近 SENT 的 sent_at 回拨到宽限之前，才允许补投一次。
         async with factory() as session:
             await session.execute(
                 text(
-                    "UPDATE ingest_job SET next_run_at = now() - interval '1 second' "
+                    "UPDATE outbox_event SET sent_at = now() - interval '61 seconds' "
                     "WHERE id = :id"
                 ),
-                {"id": job_id},
+                {"id": event_id},
             )
             await session.commit()
             repo = SqlOutboxRepository(session)
@@ -532,11 +538,8 @@ async def test_mark_sent_pushes_receive_grace_and_blocks_compensation(
             assert created[0] != event_id
 
 
-# 回归：job 行被外部长事务锁住时，mark_sent 第二条语句等锁期间真实时间已流逝。
-# 旧实现用事务开始时的 now() 计算宽限，等锁越久吞掉的宽限越多；这里等锁至少 4 秒。
+# 外部事务持锁时，被阻塞语句必须的有界等待上限；避免用例无限阻塞。
 LOCK_WAIT_DEADLINE_SECONDS = 10.0
-MARK_SENT_LOCK_WAIT_SECONDS = 4.0
-MARK_SENT_MIN_GRACE = timedelta(seconds=protocol.RECEIVE_GRACE_SECONDS - 2)
 # 释放行锁后等待被阻塞工作真正结束的上限；避免清理阶段无限阻塞，也避免 engine.dispose
 # 与仍在执行的连接竞态。
 WORKER_JOIN_TIMEOUT_SECONDS = 10.0
@@ -590,156 +593,6 @@ async def _release_lock_and_finish_thread(
 
 
 @pytest.mark.anyio
-async def test_mark_sent_computes_grace_from_real_clock_after_job_lock_wait(
-    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
-) -> None:
-    """外部持有 job 行锁时，mark_sent 的接收宽限与 sent_at 必须反映真实时刻。
-
-    租约先缩短到 2 秒；语句 1（MARK_SENT_SQL）在租约仍有效时评估并成功，随后语句 2
-    在 job 行锁上等待超过 4 秒，真实租约此时已过期。租约校验只应在语句 1 发生，整体仍
-    应记 SENT。宽限与 sent_at 相对「解锁前记录的 unlock_time」与事务开始时刻判断，而不
-    相对一个可能被 CI 拖后的检查时刻，避免忙时假失败。
-    """
-
-    async with api_sessions(role_test_databases.api_url) as factory:
-        async with factory() as setup:
-            job_id = await insert_job(setup)
-            event_id = await insert_event(setup, job_id)
-
-        observer_engine = create_async_engine(
-            role_test_databases.migrator_url, pool_pre_ping=True
-        )
-        try:
-            observer_factory = create_session_factory(observer_engine)
-            async with (
-                factory() as repo_session,
-                observer_factory() as locker,
-                observer_factory() as observer,
-            ):
-                repo = SqlOutboxRepository(repo_session)
-                claim = await repo.claim_due_event(owner="dispatcher:clock")
-                assert claim is not None and claim.event_id == event_id
-                repo_pid = (
-                    await repo_session.execute(text("SELECT pg_backend_pid()"))
-                ).scalar_one()
-                # 显式缩短租约；owner/token 不变，CAS 仍应成立。
-                await repo_session.execute(
-                    text(
-                        "UPDATE outbox_event SET lease_until = clock_timestamp() + "
-                        "interval '2 seconds' WHERE id = :id"
-                    ),
-                    {"id": event_id},
-                )
-                await repo_session.commit()
-
-                # 外部事务持有 job 行锁：mark_sent 的 PUSH_RECEIVE_GRACE_SQL 必须在此阻塞。
-                await locker.execute(
-                    text("SELECT id FROM ingest_job WHERE id = :id FOR UPDATE"),
-                    {"id": job_id},
-                )
-                wait_start = time.monotonic()
-                mark_task = asyncio.create_task(repo.mark_sent(claim))
-
-                blocked_row = None
-                deadline = wait_start + LOCK_WAIT_DEADLINE_SECONDS
-                while time.monotonic() < deadline:
-                    if mark_task.done():
-                        break
-                    blocked_row = (
-                        await observer.execute(
-                            text(
-                                "SELECT wait_event_type, query, xact_start "
-                                "FROM pg_stat_activity WHERE pid = :pid"
-                            ),
-                            {"pid": repo_pid},
-                        )
-                    ).first()
-                    await observer.rollback()
-                    if (
-                        blocked_row is not None
-                        and blocked_row[0] == "Lock"
-                        and "ingest_job" in (blocked_row[1] or "")
-                    ):
-                        break
-                    blocked_row = None
-                    await asyncio.sleep(0.1)
-                if blocked_row is None:
-                    detail = await _release_lock_and_finish_task(locker, mark_task)
-                    pytest.fail(
-                        f"mark_sent 未在 {LOCK_WAIT_DEADLINE_SECONDS:.0f} 秒内阻塞在 "
-                        f"job 行锁上（{detail}）"
-                    )
-                assert not mark_task.done()
-                txn_start = blocked_row[2]
-                assert txn_start is not None
-
-                # 从被阻塞事务的 xact_start 起等满 4 秒：旧代码的 now() 正是该时刻，
-                # 等锁每多一秒就少一秒宽限；用事务时刻而非墙钟可避免误判。
-                progressed = False
-                progress_deadline = time.monotonic() + LOCK_WAIT_DEADLINE_SECONDS
-                while time.monotonic() < progress_deadline:
-                    if mark_task.done():
-                        break
-                    progressed = (
-                        await observer.execute(
-                            text(
-                                "SELECT clock_timestamp() >= :txn_start + "
-                                "         make_interval(secs => :wait) "
-                                "   AND (SELECT lease_until FROM outbox_event "
-                                "        WHERE id = :id) < clock_timestamp()"
-                            ),
-                            {
-                                "txn_start": txn_start,
-                                "wait": MARK_SENT_LOCK_WAIT_SECONDS,
-                                "id": event_id,
-                            },
-                        )
-                    ).scalar_one()
-                    await observer.rollback()
-                    if progressed:
-                        break
-                    await asyncio.sleep(0.1)
-                if not progressed:
-                    detail = await _release_lock_and_finish_task(locker, mark_task)
-                    pytest.fail(
-                        f"mark_sent 未在 {LOCK_WAIT_DEADLINE_SECONDS:.0f} 秒内等满租约"
-                        f"过期窗口（{detail}）"
-                    )
-                # 解锁前记录真实时刻；之后的断言都相对它，避免把检查延迟算进宽限。
-                unlock_time = (
-                    await observer.execute(text("SELECT clock_timestamp()"))
-                ).scalar_one()
-                await observer.rollback()
-
-                await locker.rollback()
-                assert await mark_task is True
-
-            async with factory() as check:
-                row = (
-                    await check.execute(
-                        text(
-                            "SELECT e.status, e.sent_at, e.lease_owner, e.lease_token, "
-                            "       e.lease_until, j.next_run_at "
-                            "FROM outbox_event AS e "
-                            "JOIN ingest_job AS j ON j.id = e.job_id "
-                            "WHERE e.id = :id"
-                        ),
-                        {"id": event_id},
-                    )
-                ).first()
-                await check.rollback()
-            assert row is not None
-            assert row[0] == "SENT"
-            assert row[2] is None and row[3] is None and row[4] is None
-            # 宽限相对 unlock_time：旧代码等锁 4 秒只剩约 56 秒，新代码仍为约 60 秒。
-            assert row[5] >= unlock_time + MARK_SENT_MIN_GRACE
-            # sent_at 必须落在发送事务开始到解锁之间，不得被推迟到等锁后的提交时刻。
-            assert row[1] is not None
-            assert txn_start <= row[1] <= unlock_time
-        finally:
-            await observer_engine.dispose()
-
-
 @pytest.mark.anyio
 async def test_compensation_reaches_cap_only_after_grace_cycles(
     role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
@@ -1249,3 +1102,463 @@ async def test_mark_sent_rejects_late_writeback_after_outbox_lock_outlives_lease
             assert row[2] == claim.lease_owner and row[3] == claim.lease_token
         finally:
             await observer_engine.dispose()
+
+
+# --- 处理中任务过期租约恢复（真实 PostgreSQL） ------------------------------------
+
+
+@dataclass(frozen=True)
+class RecoverableJob:
+    job_id: uuid.UUID
+    kb_id: uuid.UUID
+    document_id: uuid.UUID
+    version_id: uuid.UUID
+
+
+async def insert_recoverable_job(
+    session: AsyncSession,
+    *,
+    status: str = "PARSING",
+    attempt: int = 1,
+    expired: bool = True,
+    document_deleted: bool = False,
+    active_version: bool = False,
+    error_code: str | None = None,
+) -> RecoverableJob:
+    """按外键顺序写入 KB/document/version/job（可选已有 active 版本）。
+
+    使用 API 角色被授予的 DML 与默认全局 profile；租约默认已过期，供恢复扫描锁定。
+    """
+
+    kb_id = uuid.uuid4()
+    document_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    profile_id = await ensure_default_index_profile(session)
+    await session.execute(
+        text(
+            "INSERT INTO knowledge_base (id, organization_id, name) "
+            "VALUES (:id, :organization_id, :name)"
+        ),
+        {"id": kb_id, "organization_id": uuid.uuid4(), "name": "kb"},
+    )
+    await session.execute(
+        text(
+            "INSERT INTO document (id, kb_id, title, source_type, lifecycle_status, "
+            "deleted_at) VALUES (:id, :kb_id, :title, 'markdown', 'CREATED', "
+            "CASE WHEN :deleted THEN now() ELSE NULL END)"
+        ),
+        {
+            "id": document_id,
+            "kb_id": kb_id,
+            "title": "doc",
+            "deleted": document_deleted,
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO document_version "
+            "(id, document_id, version_no, file_ref, file_hash, mime, parser_version, status) "
+            "VALUES (:id, :document_id, 1, 'ref', 'hash', 'text/markdown', :parser_version, "
+            "'PENDING')"
+        ),
+        {
+            "id": version_id,
+            "document_id": document_id,
+            "parser_version": MARKDOWN_PARSER_VERSION,
+        },
+    )
+    if active_version:
+        active_version_id = uuid.uuid4()
+        await session.execute(
+            text(
+                "INSERT INTO document_version "
+                "(id, document_id, version_no, file_ref, file_hash, mime, parser_version, "
+                " status) "
+                "VALUES (:id, :document_id, 2, 'ref2', 'hash2', 'text/markdown', "
+                " :parser_version, 'READY')"
+            ),
+            {
+                "id": active_version_id,
+                "document_id": document_id,
+                "parser_version": MARKDOWN_PARSER_VERSION,
+            },
+        )
+        await session.execute(
+            text(
+                "UPDATE document SET active_version_id = :active_version_id, "
+                "lifecycle_status = 'READY' WHERE id = :id"
+            ),
+            {"active_version_id": active_version_id, "id": document_id},
+        )
+    lease_sql = (
+        "clock_timestamp() - interval '1 second'"
+        if expired
+        else "clock_timestamp() + interval '1 hour'"
+    )
+    await session.execute(
+        text(
+            "INSERT INTO ingest_job "
+            "(id, document_id, version_id, profile_id, status, attempt, "
+            " next_run_at, dedupe_key, error_code, lease_owner, lease_token, lease_until, "
+            " heartbeat_at) "
+            "VALUES (:id, :document_id, :version_id, :profile_id, :status, "
+            f" :attempt, now(), :dedupe_key, :error_code, 'pipeline:old', 'old-token', "
+            f" {lease_sql}, clock_timestamp() - interval '5 seconds')"
+        ),
+        {
+            "id": job_id,
+            "document_id": document_id,
+            "version_id": version_id,
+            "profile_id": profile_id,
+            "status": status,
+            "attempt": attempt,
+            "dedupe_key": uuid.uuid4().hex,
+            "error_code": error_code,
+        },
+    )
+    await session.commit()
+    return RecoverableJob(job_id, kb_id, document_id, version_id)
+
+
+async def read_job_row(session: AsyncSession, job_id: uuid.UUID) -> dict[str, Any]:
+    row = (
+        await session.execute(
+            text(
+                "SELECT status, error_code, attempt, next_run_at, lease_owner, lease_token, "
+                "lease_until, heartbeat_at, generation_id FROM ingest_job WHERE id = :id"
+            ),
+            {"id": job_id},
+        )
+    ).mappings().one()
+    return dict(row)
+
+
+def make_sync_factory(database_url: str) -> Any:
+    engine = create_engine(database_url, pool_pre_ping=True)
+    return create_sync_session_factory(engine), engine
+
+
+@pytest.mark.anyio
+async def test_recovery_requeues_all_active_statuses_with_backoff_event(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    statuses = ("PARSING", "CHUNKING", "EMBEDDING", "INDEXING")
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            jobs = [
+                await insert_recoverable_job(setup, status=status, attempt=1)
+                for status in statuses
+            ]
+
+        async with factory() as session:
+            result = await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+
+        assert set(result.requeued_job_ids) == {job.job_id for job in jobs}
+        assert result.exhausted_job_ids == ()
+
+        async with factory() as check:
+            for job in jobs:
+                row = await read_job_row(check, job.job_id)
+                assert row["status"] == "QUEUED"
+                assert row["attempt"] == 1  # attempt 由下一次 claim 递增
+                assert row["lease_owner"] is None and row["lease_token"] is None
+                assert row["lease_until"] is None and row["heartbeat_at"] is None
+                assert row["error_code"] is None
+                events = (
+                    await check.execute(
+                        text(
+                            "SELECT status, next_send_at = ("
+                            "  SELECT next_run_at FROM ingest_job WHERE id = :id"
+                            ") AS same_deadline FROM outbox_event WHERE job_id = :id"
+                        ),
+                        {"id": job.job_id},
+                    )
+                ).all()
+                assert len(events) == 1
+                assert events[0][0] == "PENDING" and events[0][1] is True
+            await check.rollback()
+
+
+@pytest.mark.anyio
+async def test_recovery_leaves_valid_lease_terminal_and_queued_unchanged(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            valid = await insert_recoverable_job(setup, status="PARSING", expired=False)
+            ready = await insert_recoverable_job(setup, status="READY", attempt=2)
+            queued = await insert_recoverable_job(setup, status="QUEUED", attempt=0)
+
+        async with factory() as session:
+            result = await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+
+        assert result.requeued_job_ids == ()
+        assert result.exhausted_job_ids == ()
+
+        async with factory() as check:
+            valid_row = await read_job_row(check, valid.job_id)
+            assert valid_row["status"] == "PARSING" and valid_row["lease_token"] == "old-token"
+            ready_row = await read_job_row(check, ready.job_id)
+            assert ready_row["status"] == "READY"
+            queued_row = await read_job_row(check, queued.job_id)
+            assert queued_row["status"] == "QUEUED"
+            events = (
+                await check.execute(text("SELECT count(*) FROM outbox_event"))
+            ).scalar_one()
+            assert events == 0
+            await check.rollback()
+
+
+@pytest.mark.anyio
+async def test_recovery_exhausts_at_cap_and_syncs_dependents(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            first = await insert_recoverable_job(
+                setup,
+                status="INDEXING",
+                attempt=protocol.MAX_PIPELINE_ATTEMPTS,
+            )
+            updated = await insert_recoverable_job(
+                setup,
+                status="PARSING",
+                attempt=protocol.MAX_PIPELINE_ATTEMPTS,
+                active_version=True,
+            )
+
+        async with factory() as session:
+            result = await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+
+        assert set(result.exhausted_job_ids) == {first.job_id, updated.job_id}
+        assert result.requeued_job_ids == ()
+
+        async with factory() as check:
+            for job in (first, updated):
+                row = await read_job_row(check, job.job_id)
+                assert row["status"] == "FAILED"
+                assert row["error_code"] == protocol.PIPELINE_RETRY_EXHAUSTED
+                assert row["lease_owner"] is None and row["lease_token"] is None
+                version_status = (
+                    await check.execute(
+                        text("SELECT status FROM document_version WHERE id = :id"),
+                        {"id": job.version_id},
+                    )
+                ).scalar_one()
+                assert version_status == "FAILED"
+                pending_events = (
+                    await check.execute(
+                        text(
+                            "SELECT count(*) FROM outbox_event WHERE job_id = :id "
+                            "AND status = 'PENDING'"
+                        ),
+                        {"id": job.job_id},
+                    )
+                ).scalar_one()
+                assert pending_events == 0
+            first_document = (
+                await check.execute(
+                    text(
+                        "SELECT lifecycle_status, active_version_id FROM document "
+                        "WHERE id = :id"
+                    ),
+                    {"id": first.document_id},
+                )
+            ).one()
+            assert first_document[0] == "FAILED" and first_document[1] is None
+            # 已有 active 版本的文档保持可用，不被耗尽失败下线。
+            updated_document = (
+                await check.execute(
+                    text(
+                        "SELECT lifecycle_status, active_version_id FROM document "
+                        "WHERE id = :id"
+                    ),
+                    {"id": updated.document_id},
+                )
+            ).one()
+            assert updated_document[0] == "READY" and updated_document[1] is not None
+            await check.rollback()
+
+
+@pytest.mark.anyio
+async def test_recovery_does_not_revive_deleted_document(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            job = await insert_recoverable_job(
+                setup, status="PARSING", attempt=1, document_deleted=True
+            )
+
+        async with factory() as session:
+            result = await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+
+        assert result.requeued_job_ids == ()
+        assert result.exhausted_job_ids == ()
+        async with factory() as check:
+            row = await read_job_row(check, job.job_id)
+            assert row["status"] == "PARSING" and row["lease_token"] == "old-token"
+            events = (
+                await check.execute(text("SELECT count(*) FROM outbox_event"))
+            ).scalar_one()
+            assert events == 0
+            await check.rollback()
+
+
+@pytest.mark.anyio
+async def test_recovery_is_idempotent_under_concurrent_scan(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            job = await insert_recoverable_job(setup, status="PARSING", attempt=1)
+
+        async with factory() as first_session, factory() as second_session:
+            first, second = await asyncio.gather(
+                recover_expired_pipeline_jobs(SqlOutboxRepository(first_session)),
+                recover_expired_pipeline_jobs(SqlOutboxRepository(second_session)),
+            )
+
+        requeued = set(first.requeued_job_ids) | set(second.requeued_job_ids)
+        assert requeued == {job.job_id}
+        async with factory() as check:
+            pending = (
+                await check.execute(
+                    text(
+                        "SELECT count(*) FROM outbox_event WHERE job_id = :id "
+                        "AND status = 'PENDING'"
+                    ),
+                    {"id": job.job_id},
+                )
+            ).scalar_one()
+            assert pending == 1
+            await check.rollback()
+
+
+@pytest.mark.anyio
+async def test_recovered_job_backoff_blocks_old_message_claim(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            job = await insert_recoverable_job(setup, status="PARSING", attempt=1)
+            old_event_id = await insert_event(setup, job.job_id, status="SENT")
+
+        async with factory() as session:
+            result = await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+        assert result.requeued_job_ids == (job.job_id,)
+
+        sync_factory, sync_engine = make_sync_factory(role_test_databases.worker_url)
+        try:
+            # 退避未到期：旧 Redis 重投的同一消息也不能领取。
+            blocked = iw.claim_ingest_job(
+                sync_factory,
+                job_id=job.job_id,
+                event_id=str(old_event_id),
+                expected_parser_versions={"markdown": MARKDOWN_PARSER_VERSION},
+            )
+            assert blocked.status == iw.PROCESS_STATUS_NOT_DUE
+            assert blocked.claimed is None
+
+            async with factory() as check:
+                row = await read_job_row(check, job.job_id)
+                assert row["status"] == "QUEUED" and row["lease_token"] is None
+                await check.execute(
+                    text(
+                        "UPDATE ingest_job SET next_run_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job.job_id},
+                )
+                await check.commit()
+
+            # 退避到期后可以正常领取，attempt 由本次 claim 递增。
+            claimed = iw.claim_ingest_job(
+                sync_factory,
+                job_id=job.job_id,
+                event_id=str(old_event_id),
+                expected_parser_versions={"markdown": MARKDOWN_PARSER_VERSION},
+            )
+            assert claimed.status == iw.PROCESS_STATUS_CLAIMED
+            assert claimed.claimed is not None
+
+            async with factory() as check:
+                row = await read_job_row(check, job.job_id)
+                assert row["status"] == "PARSING" and row["attempt"] == 2
+                await check.rollback()
+        finally:
+            sync_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_recovered_job_rejects_old_token_writes(
+    role_test_databases: RoleTestDatabases, dispatcher_schema: Engine
+) -> None:
+    async with api_sessions(role_test_databases.api_url) as factory:
+        async with factory() as setup:
+            job = await insert_recoverable_job(setup, status="PARSING", attempt=1)
+
+        async with factory() as session:
+            await recover_expired_pipeline_jobs(SqlOutboxRepository(session))
+
+        sync_factory, sync_engine = make_sync_factory(role_test_databases.worker_url)
+        try:
+            # 旧租约 token 的迟到写必须被拒绝。
+            assert (
+                iw.advance_ingest_stage(
+                    sync_factory,
+                    job_id=job.job_id,
+                    lease_token="old-token",
+                    from_status="PARSING",
+                    to_status="CHUNKING",
+                )
+                is False
+            )
+            assert (
+                iw.fail_ingest_job(
+                    sync_factory,
+                    job_id=job.job_id,
+                    lease_token="old-token",
+                    error_code="PIPELINE_DB_ERROR",
+                )
+                is False
+            )
+
+            # 退避到期后才允许下一次 claim 拿到新 token。
+            async with factory() as check:
+                await check.execute(
+                    text(
+                        "UPDATE ingest_job SET next_run_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job.job_id},
+                )
+                await check.commit()
+
+            claimed = iw.claim_ingest_job(
+                sync_factory,
+                job_id=job.job_id,
+                event_id=str(uuid.uuid4()),
+                expected_parser_versions={"markdown": MARKDOWN_PARSER_VERSION},
+            )
+            assert claimed.status == iw.PROCESS_STATUS_CLAIMED and claimed.claimed is not None
+            assert (
+                iw.advance_ingest_stage(
+                    sync_factory,
+                    job_id=job.job_id,
+                    lease_token="old-token",
+                    from_status="PARSING",
+                    to_status="CHUNKING",
+                )
+                is False
+            )
+            assert iw.advance_ingest_stage(
+                sync_factory,
+                job_id=job.job_id,
+                lease_token=claimed.claimed.lease_token,
+                from_status="PARSING",
+                to_status="CHUNKING",
+            )
+        finally:
+            sync_engine.dispose()

@@ -119,31 +119,6 @@ SET_JOB_ERROR_SQL = text(
     """
 )
 
-# 投递成功/补投后推后 job.next_run_at 至少到真实时钟+grace，作为 worker 写接收 marker
-# 的宽限期；同一事务内调用，避免 SENT 后立刻被补偿扫描当作未确认而重复新建事件。本语句会
-# 与 worker 的 job 行锁竞争：PostgreSQL 在等锁的扫描阶段就会求值 SET 表达式，只用
-# ``clock_timestamp()`` 仍会停在解锁前的时刻。因此先在同一语句的 CTE 里 ``FOR UPDATE``
-# 真正取得行锁，再执行 UPDATE，让时钟在解锁后求值；``MATERIALIZED`` 防止 CTE 被内联回
-# 到等锁的 UPDATE。
-PUSH_RECEIVE_GRACE_SQL = text(
-    """
-    WITH locked AS MATERIALIZED (
-        SELECT id
-        FROM ingest_job
-        WHERE id IN :job_ids
-          AND status = 'QUEUED'
-          AND error_code IS NULL
-        FOR UPDATE
-    )
-    UPDATE ingest_job
-    SET next_run_at = GREATEST(
-            next_run_at, clock_timestamp() + (:grace_seconds * interval '1 second')
-        ),
-        updated_at = clock_timestamp()
-    WHERE id IN (SELECT id FROM locked)
-    """
-).bindparams(bindparam("job_ids", expanding=True))
-
 # 对账：仅当该事件所属 job 的 `lease_owner` 精确指向本次 eventId 且存在 heartbeat 时才认定
 # 该事件已被接收。不能因为别的事件留下的 heartbeat 就把当前 outbox 当已收。
 CHECK_EVENT_RECEIVED_SQL = text(
@@ -157,7 +132,9 @@ CHECK_EVENT_RECEIVED_SQL = text(
     """
 )
 
-# 补偿候选：QUEUED、已到期、未被标记未确认、无 worker 接收标记、无 PENDING 事件的 job。
+# 补偿候选：QUEUED、已到期、未被标记未确认、无 worker 接收标记、无 PENDING 事件，且
+# 最近一个 SENT 事件已超出接收宽限的 job。接收宽限以 SENT 的 ``sent_at`` 判断，不再借用
+# ``next_run_at``；后者只用于处理中任务恢复后的退避与领取门槛。
 # 行锁 + SKIP LOCKED 保证同一 job 不会被两个 dispatcher 同时补偿。
 LOCK_COMPENSATION_CANDIDATES_SQL = text(
     """
@@ -182,6 +159,13 @@ LOCK_COMPENSATION_CANDIDATES_SQL = text(
       AND NOT EXISTS (
           SELECT 1 FROM outbox_event e
           WHERE e.job_id = j.id AND e.status = 'PENDING'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM outbox_event e
+          WHERE e.job_id = j.id
+            AND e.status = 'SENT'
+            AND e.sent_at IS NOT NULL
+            AND e.sent_at > now() - (:grace_seconds * interval '1 second')
       )
     ORDER BY j.next_run_at, j.id
     FOR UPDATE OF j SKIP LOCKED
@@ -216,6 +200,102 @@ FLAG_UNCONFIRMED_SQL = text(
     """
 ).bindparams(bindparam("job_ids", expanding=True))
 
+# 处理中任务的过期活动租约恢复候选：只锁定活动阶段、租约非空且已过期、无诊断的 job；
+# 已删除文档的 job 不参与。公平排序按最早过期的租约优先，批量上限由调用方限定。
+LOCK_EXPIRED_PIPELINE_JOBS_SQL = text(
+    """
+    SELECT j.id, j.attempt, j.version_id, j.document_id
+    FROM ingest_job AS j
+    JOIN document AS d ON d.id = j.document_id
+    WHERE j.status IN ('PARSING', 'CHUNKING', 'EMBEDDING', 'INDEXING')
+      AND j.lease_until IS NOT NULL
+      AND j.lease_until <= now()
+      AND j.lease_token IS NOT NULL
+      AND j.error_code IS NULL
+      AND d.deleted_at IS NULL
+    ORDER BY j.lease_until, j.id
+    FOR UPDATE OF j SKIP LOCKED
+    LIMIT :limit
+    """
+)
+
+# 重排一条已过期的活动任务：清掉旧租约（owner/token/until/heartbeat）并重入 QUEUED，
+# 把 backoff 写入 next_run_at；同一语句内原子新建 PENDING 事件，且事件的 next_send_at
+# 取同一 next_run_at，保证投递门和领取门都不早于退避。attempt 不回写，由下一次 claim 递增。
+REQUEUE_EXPIRED_PIPELINE_JOB_SQL = text(
+    """
+    WITH requeued AS (
+        UPDATE ingest_job
+        SET status = 'QUEUED',
+            lease_owner = NULL,
+            lease_token = NULL,
+            lease_until = NULL,
+            heartbeat_at = NULL,
+            error_code = NULL,
+            next_run_at = clock_timestamp() + (:delay_seconds * interval '1 second'),
+            updated_at = clock_timestamp()
+        WHERE id = :job_id
+          AND status IN ('PARSING', 'CHUNKING', 'EMBEDDING', 'INDEXING')
+          AND lease_until IS NOT NULL
+          AND lease_until <= clock_timestamp()
+          AND lease_token IS NOT NULL
+          AND error_code IS NULL
+        RETURNING id, next_run_at
+    )
+    INSERT INTO outbox_event (
+        id, job_id, event_type, status, dispatch_attempt, next_send_at,
+        lease_owner, lease_token, lease_until, sent_at, created_at, updated_at
+    )
+    SELECT gen_random_uuid(), r.id, :event_type, 'PENDING', 0, r.next_run_at,
+           NULL, NULL, NULL, NULL, clock_timestamp(), clock_timestamp()
+    FROM requeued AS r
+    RETURNING id
+    """
+)
+
+# 达到恢复上限：静态置 FAILED + PIPELINE_RETRY_EXHAUSTED 并清租约，不改 next_run_at、
+# 不建事件；同事务内由调用方再按守卫同步 version/document。
+EXHAUST_EXPIRED_PIPELINE_JOB_SQL = text(
+    """
+    UPDATE ingest_job
+    SET status = 'FAILED',
+        error_code = :error_code,
+        lease_owner = NULL,
+        lease_token = NULL,
+        lease_until = NULL,
+        heartbeat_at = NULL,
+        updated_at = clock_timestamp()
+    WHERE id = :job_id
+      AND status IN ('PARSING', 'CHUNKING', 'EMBEDDING', 'INDEXING')
+      AND lease_until IS NOT NULL
+      AND lease_until <= clock_timestamp()
+      AND lease_token IS NOT NULL
+      AND error_code IS NULL
+    RETURNING version_id, document_id
+    """
+)
+
+# 恢复耗尽后同步依赖状态：只把 PENDING version 置 FAILED；文档只在没有 active version 时
+# 才置 FAILED，使已有可检索文档继续服务。BUILDING generation 不做 GC（api 角色对其只有
+# SELECT），任务下一次成功暂存会绑定到新 generation。
+FAIL_EXHAUSTED_VERSION_SQL = text(
+    """
+    UPDATE document_version
+    SET status = 'FAILED', updated_at = clock_timestamp()
+    WHERE id = :version_id AND status = 'PENDING'
+    """
+)
+
+FAIL_EXHAUSTED_DOCUMENT_SQL = text(
+    """
+    UPDATE document
+    SET lifecycle_status = 'FAILED', updated_at = clock_timestamp()
+    WHERE id = :document_id
+      AND active_version_id IS NULL
+      AND lifecycle_status IN ('CREATED', 'INDEXING')
+    """
+)
+
 
 @dataclass(frozen=True)
 class ClaimedOutboxEvent:
@@ -249,6 +329,24 @@ class CompensationResult:
     unconfirmed_job_ids: tuple[uuid.UUID, ...]
 
 
+@dataclass(frozen=True)
+class ExpiredPipelineJob:
+    """一条处理中且租约已过期的 job 事实；供恢复服务做重排/耗尽决策。"""
+
+    job_id: uuid.UUID
+    attempt: int
+    version_id: uuid.UUID
+    document_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class PipelineRecoveryResult:
+    """一次恢复扫描的结果：重排的 job id 与耗尽失败的 job id。"""
+
+    requeued_job_ids: tuple[uuid.UUID, ...]
+    exhausted_job_ids: tuple[uuid.UUID, ...]
+
+
 class OutboxRepository(Protocol):
     """dispatcher 依赖的最小仓储接口；SQL 与内存实现共享同一语义。"""
 
@@ -263,7 +361,7 @@ class OutboxRepository(Protocol):
     async def fail_event(self, claim: ClaimedOutboxEvent) -> bool: ...
 
     async def lock_compensation_candidates(
-        self, *, limit: int
+        self, *, limit: int, grace_seconds: int
     ) -> tuple[CompensationCandidate, ...]: ...
 
     async def create_followup_events(
@@ -273,6 +371,16 @@ class OutboxRepository(Protocol):
     async def flag_delivery_unconfirmed(
         self, job_ids: Sequence[uuid.UUID]
     ) -> tuple[uuid.UUID, ...]: ...
+
+    async def lock_expired_pipeline_jobs(
+        self, *, limit: int
+    ) -> tuple[ExpiredPipelineJob, ...]: ...
+
+    async def requeue_expired_pipeline_job(
+        self, job_id: uuid.UUID, *, delay_seconds: int
+    ) -> uuid.UUID | None: ...
+
+    async def exhaust_expired_pipeline_job(self, job_id: uuid.UUID) -> bool: ...
 
     async def commit(self) -> None: ...
 
@@ -319,14 +427,6 @@ class SqlOutboxRepository:
         if row is None:
             await self._session.commit()
             return False
-        # 同一事务内推后 job.next_run_at 作为接收宽限期；回写失败则整体不提交。
-        await self._session.execute(
-            PUSH_RECEIVE_GRACE_SQL,
-            {
-                "job_ids": [claim.job_id],
-                "grace_seconds": protocol.RECEIVE_GRACE_SECONDS,
-            },
-        )
         await self._session.commit()
         return True
 
@@ -378,10 +478,11 @@ class SqlOutboxRepository:
         return True
 
     async def lock_compensation_candidates(
-        self, *, limit: int
+        self, *, limit: int, grace_seconds: int
     ) -> tuple[CompensationCandidate, ...]:
         result: Result[Any] = await self._session.execute(
-            LOCK_COMPENSATION_CANDIDATES_SQL, {"limit": limit}
+            LOCK_COMPENSATION_CANDIDATES_SQL,
+            {"limit": limit, "grace_seconds": grace_seconds},
         )
         return tuple(
             CompensationCandidate(
@@ -406,16 +507,8 @@ class SqlOutboxRepository:
                 "event_type": protocol.INGEST_REQUESTED_EVENT_TYPE,
             },
         )
-        created = tuple(row[0] for row in result)
-        # 同事务推后 next_run_at：补投后 60s 内不再把该 job 当作未确认而重复新建。
-        await self._session.execute(
-            PUSH_RECEIVE_GRACE_SQL,
-            {
-                "job_ids": list(job_ids),
-                "grace_seconds": protocol.RECEIVE_GRACE_SECONDS,
-            },
-        )
-        return created
+        # 补投后的接收宽限由补偿候选按 SENT.sent_at 判断，不再回写 next_run_at。
+        return tuple(row[0] for row in result)
 
     async def flag_delivery_unconfirmed(
         self, job_ids: Sequence[uuid.UUID]
@@ -427,6 +520,53 @@ class SqlOutboxRepository:
             {"job_ids": list(job_ids), "error_code": protocol.DELIVERY_UNCONFIRMED},
         )
         return tuple(row[0] for row in result)
+
+    async def lock_expired_pipeline_jobs(
+        self, *, limit: int
+    ) -> tuple[ExpiredPipelineJob, ...]:
+        result: Result[Any] = await self._session.execute(
+            LOCK_EXPIRED_PIPELINE_JOBS_SQL, {"limit": limit}
+        )
+        return tuple(
+            ExpiredPipelineJob(
+                job_id=row[0],
+                attempt=int(row[1]),
+                version_id=row[2],
+                document_id=row[3],
+            )
+            for row in result
+        )
+
+    async def requeue_expired_pipeline_job(
+        self, job_id: uuid.UUID, *, delay_seconds: int
+    ) -> uuid.UUID | None:
+        result: Result[Any] = await self._session.execute(
+            REQUEUE_EXPIRED_PIPELINE_JOB_SQL,
+            {
+                "job_id": job_id,
+                "delay_seconds": delay_seconds,
+                "event_type": protocol.INGEST_REQUESTED_EVENT_TYPE,
+            },
+        )
+        row = result.first()
+        return None if row is None else row[0]
+
+    async def exhaust_expired_pipeline_job(self, job_id: uuid.UUID) -> bool:
+        result: Result[Any] = await self._session.execute(
+            EXHAUST_EXPIRED_PIPELINE_JOB_SQL,
+            {"job_id": job_id, "error_code": protocol.PIPELINE_RETRY_EXHAUSTED},
+        )
+        row = result.first()
+        if row is None:
+            return False
+        version_id, document_id = row[0], row[1]
+        await self._session.execute(
+            FAIL_EXHAUSTED_VERSION_SQL, {"version_id": version_id}
+        )
+        await self._session.execute(
+            FAIL_EXHAUSTED_DOCUMENT_SQL, {"document_id": document_id}
+        )
+        return True
 
     async def commit(self) -> None:
         await self._session.commit()

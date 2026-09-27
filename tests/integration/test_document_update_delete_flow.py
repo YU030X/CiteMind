@@ -31,6 +31,7 @@ from rag_backend.auth.context import AuthContext
 from rag_backend.auth.tokens import CSRF_HEADER_NAME
 from rag_backend.config import Settings
 from rag_backend.database import create_sync_session_factory
+from rag_backend.dispatch import protocol
 from rag_backend.dispatch.repository import SqlOutboxRepository
 from rag_backend.ingestion import indexing_worker as iw
 from rag_backend.ingestion import service as ingestion_service
@@ -696,7 +697,9 @@ async def test_delete_tombstones_cancels_queued_job_and_yields_zero_candidates(
     # dispatcher 补偿不会把已取消 job 当作候选再次补投。
     async with api_session(role_test_databases.api_url) as session:
         repository = SqlOutboxRepository(session)
-        compensation = await repository.lock_compensation_candidates(limit=50)
+        compensation = await repository.lock_compensation_candidates(
+            limit=50, grace_seconds=protocol.RECEIVE_GRACE_SECONDS
+        )
         await repository.commit()
     assert all(candidate.job_id != job2 for candidate in compensation)
 

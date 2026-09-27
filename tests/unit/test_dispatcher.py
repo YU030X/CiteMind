@@ -12,6 +12,7 @@ import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,7 @@ from rag_backend.dispatch.repository import (
     ClaimedOutboxEvent,
     CompensationCandidate,
     CompensationResult,
+    ExpiredPipelineJob,
 )
 from rag_backend.dispatch.service import (
     FAILURE_WARN_ATTEMPTS,
@@ -31,6 +33,7 @@ from rag_backend.dispatch.service import (
     compensate_unconfirmed_jobs,
     dispatch_one,
     plan_compensation,
+    recover_expired_pipeline_jobs,
 )
 
 BASE_TIME = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
@@ -74,6 +77,11 @@ class FakeJob:
     error_code: str | None = None
     lease_owner: str | None = None
     heartbeat_at: datetime | None = None
+    attempt: int = 0
+    lease_token: str | None = None
+    lease_until: datetime | None = None
+    version_id: uuid.UUID = dataclass_field(default_factory=uuid.uuid4)
+    document_id: uuid.UUID = dataclass_field(default_factory=uuid.uuid4)
 
 
 class FakeOutboxRepository:
@@ -159,7 +167,6 @@ class FakeOutboxRepository:
         event.lease_owner = None
         event.lease_token = None
         event.lease_until = None
-        self._push_grace([event.job_id])
         return True
 
     async def event_already_received(self, event_id: uuid.UUID) -> bool:
@@ -171,12 +178,6 @@ class FakeOutboxRepository:
                     and job.heartbeat_at is not None
                 )
         return False
-
-    def _push_grace(self, job_ids: Sequence[uuid.UUID]) -> None:
-        floor = self._clock.now() + timedelta(seconds=protocol.RECEIVE_GRACE_SECONDS)
-        for job in self.jobs:
-            if job.id in job_ids and job.status == "QUEUED" and job.error_code is None:
-                job.next_run_at = max(job.next_run_at, floor)
 
     async def defer_event(self, claim: ClaimedOutboxEvent, *, delay_seconds: int) -> bool:
         event = self._find(claim.event_id)
@@ -202,9 +203,10 @@ class FakeOutboxRepository:
         return True
 
     async def lock_compensation_candidates(
-        self, *, limit: int
+        self, *, limit: int, grace_seconds: int
     ) -> tuple[CompensationCandidate, ...]:
         now = self._clock.now()
+        grace_floor = now - timedelta(seconds=grace_seconds)
         candidates: list[CompensationCandidate] = []
         for job in self.jobs:
             if job.status != "QUEUED" or job.error_code is not None:
@@ -216,6 +218,13 @@ class FakeOutboxRepository:
             if self._has_pending(job.id):
                 continue
             job_events = [event for event in self.events if event.job_id == job.id]
+            if any(
+                event.status == "SENT"
+                and event.sent_at is not None
+                and event.sent_at > grace_floor
+                for event in job_events
+            ):
+                continue
             candidates.append(
                 CompensationCandidate(
                     job_id=job.id,
@@ -236,7 +245,6 @@ class FakeOutboxRepository:
         for job_id in job_ids:
             event = self.add_event(job_id)
             created.append(event.id)
-        self._push_grace(job_ids)
         return tuple(created)
 
     async def flag_delivery_unconfirmed(
@@ -249,6 +257,77 @@ class FakeOutboxRepository:
                     job.error_code = protocol.DELIVERY_UNCONFIRMED
                     flagged.append(job.id)
         return tuple(flagged)
+
+    async def lock_expired_pipeline_jobs(
+        self, *, limit: int
+    ) -> tuple[ExpiredPipelineJob, ...]:
+        now = self._clock.now()
+        active = {"PARSING", "CHUNKING", "EMBEDDING", "INDEXING"}
+        candidates = [
+            job
+            for job in self.jobs
+            if job.status in active
+            and job.lease_until is not None
+            and job.lease_until <= now
+            and job.lease_token is not None
+            and job.error_code is None
+        ]
+        candidates.sort(key=lambda job: (job.lease_until, str(job.id)))
+        return tuple(
+            ExpiredPipelineJob(
+                job_id=job.id,
+                attempt=job.attempt,
+                version_id=job.version_id,
+                document_id=job.document_id,
+            )
+            for job in candidates[:limit]
+        )
+
+    async def requeue_expired_pipeline_job(
+        self, job_id: uuid.UUID, *, delay_seconds: int
+    ) -> uuid.UUID | None:
+        now = self._clock.now()
+        for job in self.jobs:
+            if (
+                job.id == job_id
+                and job.status in {"PARSING", "CHUNKING", "EMBEDDING", "INDEXING"}
+                and job.lease_until is not None
+                and job.lease_until <= now
+                and job.lease_token is not None
+                and job.error_code is None
+            ):
+                job.status = "QUEUED"
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_until = None
+                job.heartbeat_at = None
+                job.error_code = None
+                job.next_run_at = now + timedelta(seconds=delay_seconds)
+                event = self.add_event(
+                    job.id,
+                    next_send_at=job.next_run_at,
+                )
+                return event.id
+        return None
+
+    async def exhaust_expired_pipeline_job(self, job_id: uuid.UUID) -> bool:
+        now = self._clock.now()
+        for job in self.jobs:
+            if (
+                job.id == job_id
+                and job.status in {"PARSING", "CHUNKING", "EMBEDDING", "INDEXING"}
+                and job.lease_until is not None
+                and job.lease_until <= now
+                and job.lease_token is not None
+            ):
+                job.status = "FAILED"
+                job.error_code = protocol.PIPELINE_RETRY_EXHAUSTED
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_until = None
+                job.heartbeat_at = None
+                return True
+        return False
 
     async def commit(self) -> None:
         self.commits += 1
@@ -590,7 +669,7 @@ async def test_compensation_skips_job_with_receive_marker() -> None:
 
 
 @pytest.mark.anyio
-async def test_sent_event_pushes_receive_grace_before_compensation() -> None:
+async def test_recent_sent_blocks_compensation_until_grace_elapses() -> None:
     clock = FakeClock()
     repo = FakeOutboxRepository(clock=clock)
     job = repo.add_job()
@@ -598,7 +677,8 @@ async def test_sent_event_pushes_receive_grace_before_compensation() -> None:
     publisher = FakePublisher()
 
     assert await dispatch_one(repo, publisher, owner="dispatcher:a") is DispatchOutcome.SENT
-    assert job.next_run_at >= clock.now() + timedelta(seconds=protocol.RECEIVE_GRACE_SECONDS)
+    # 接收宽限不再回写 next_run_at；由补偿候选按最新 SENT.sent_at 判断。
+    assert job.next_run_at == clock.now()
 
     # 宽限期内 worker 尚未写 marker，补偿也不得新建事件。
     assert (await compensate_unconfirmed_jobs(repo)).created_event_ids == ()
@@ -613,7 +693,11 @@ async def test_compensation_respects_grace_then_stops_at_cap() -> None:
     clock = FakeClock()
     repo = FakeOutboxRepository(clock=clock)
     job = repo.add_job()
-    repo.add_event(job.id, status="SENT")
+    repo.add_event(
+        job.id,
+        status="SENT",
+        sent_at=clock.now() - timedelta(seconds=protocol.RECEIVE_GRACE_SECONDS),
+    )
 
     # 每个宽限周期只补投一次，累计到上限后标记未确认并停止。
     for _ in range(protocol.MAX_DELIVERY_ATTEMPTS - 1):
@@ -622,6 +706,7 @@ async def test_compensation_respects_grace_then_stops_at_cap() -> None:
         for event in repo.events:
             if event.id == created[0]:
                 event.status = "SENT"
+                event.sent_at = clock.now()
         clock.advance(protocol.RECEIVE_GRACE_SECONDS)
 
     result = await compensate_unconfirmed_jobs(repo)
@@ -858,3 +943,97 @@ async def test_run_keeps_sending_while_events_are_sent() -> None:
         await task
 
     assert dispatcher.calls == 4  # 3 次 SENT + 1 次 IDLE
+
+
+# --- 处理中任务过期租约恢复（纯逻辑） --------------------------------------------
+
+
+def _active_job(
+    repo: FakeOutboxRepository, clock: FakeClock, *, attempt: int, expired: bool = True
+) -> FakeJob:
+    """构造一条带过期（默认）租约的处理中 job。"""
+
+    return repo.add_job(
+        status="PARSING",
+        attempt=attempt,
+        lease_owner="pipeline:old",
+        lease_token="old-token",
+        lease_until=(
+            clock.now() - timedelta(seconds=1)
+            if expired
+            else clock.now() + timedelta(seconds=60)
+        ),
+        heartbeat_at=clock.now() - timedelta(seconds=5),
+    )
+
+
+@pytest.mark.anyio
+async def test_recover_requeues_expired_active_job_with_backoff_event() -> None:
+    clock = FakeClock()
+    repo = FakeOutboxRepository(clock=clock)
+    job = _active_job(repo, clock, attempt=1)
+
+    result = await recover_expired_pipeline_jobs(repo)
+
+    assert result.requeued_job_ids == (job.id,)
+    assert result.exhausted_job_ids == ()
+    assert job.status == "QUEUED"
+    assert job.lease_owner is None and job.lease_token is None
+    assert job.lease_until is None and job.heartbeat_at is None
+    assert job.attempt == 1  # attempt 由下一次 claim 递增，不由恢复回写
+    delay = protocol.pipeline_retry_delay_seconds(1)
+    assert job.next_run_at == clock.now() + timedelta(seconds=delay)
+    pending = [event for event in repo.events if event.status == "PENDING"]
+    assert len(pending) == 1
+    assert pending[0].job_id == job.id
+    assert pending[0].next_send_at == job.next_run_at
+
+
+@pytest.mark.anyio
+async def test_recover_exhausts_job_at_attempt_cap() -> None:
+    clock = FakeClock()
+    repo = FakeOutboxRepository(clock=clock)
+    job = _active_job(repo, clock, attempt=protocol.MAX_PIPELINE_ATTEMPTS)
+
+    result = await recover_expired_pipeline_jobs(repo)
+
+    assert result.requeued_job_ids == ()
+    assert result.exhausted_job_ids == (job.id,)
+    assert job.status == "FAILED"
+    assert job.error_code == protocol.PIPELINE_RETRY_EXHAUSTED
+    assert job.lease_owner is None and job.lease_token is None
+    assert repo.events == []  # 耗尽后不建事件
+
+
+@pytest.mark.anyio
+async def test_recover_skips_valid_lease_terminal_and_deleted_states() -> None:
+    clock = FakeClock()
+    repo = FakeOutboxRepository(clock=clock)
+    valid = _active_job(repo, clock, attempt=1, expired=False)
+    terminal = repo.add_job(status="READY", attempt=1)
+    queued = repo.add_job(status="QUEUED", attempt=1)
+    # 已删除文档的 job 在真实 SQL 中由 join 排除；内存实现不持有 document，这里只覆盖状态。
+
+    result = await recover_expired_pipeline_jobs(repo)
+
+    assert result.requeued_job_ids == ()
+    assert result.exhausted_job_ids == ()
+    assert valid.status == "PARSING" and terminal.status == "READY"
+    assert queued.status == "QUEUED"
+    assert repo.events == []
+
+
+@pytest.mark.anyio
+async def test_recover_is_idempotent_and_second_scan_is_empty() -> None:
+    clock = FakeClock()
+    repo = FakeOutboxRepository(clock=clock)
+    job = _active_job(repo, clock, attempt=1)
+
+    first = await recover_expired_pipeline_jobs(repo)
+    second = await recover_expired_pipeline_jobs(repo)
+
+    assert first.requeued_job_ids == (job.id,)
+    assert second.requeued_job_ids == ()
+    assert second.exhausted_job_ids == ()
+    # 恢复后 job 已 QUEUED（非活动），不会被第二次扫到，也不会重复建事件。
+    assert len([event for event in repo.events if event.status == "PENDING"]) == 1

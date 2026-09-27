@@ -50,6 +50,7 @@ API 以短事务读取候选 DTO，释放连接后等待 inference/LLM。一个�
 > `knowledge_base(active_index_profile_id, kb_revision)` 列级 UPDATE，不授予全表 UPDATE。该管线
 > 的代码、单元测试与真实 PG/模型整链已由独立 tester 验收（隔离 PostgreSQL 17 pipeline 15 passed
 > + 权限迁移 3 passed；Linux prefork concurrency 1 真离线模型整链 PG `0007` READY，详见
-> [开发约定](development.md)）；父 worker kill 后子进程回收与租约恢复、物理 Redis 停启、多 worker
-> 与 p95 未测；处理中崩溃无自动恢复（无常驻 reaper）。详见
+> [开发约定](development.md)）；父 worker kill 后子进程回收、物理 Redis 停启、多 worker
+> 与 p95 未测；处理中任务的过期活动租约由 dispatcher 后台周期做有界恢复（达上限静态
+> `PIPELINE_RETRY_EXHAUSTED`），不设独立常驻 reaper。详见
 > [文档入库](ingestion.md) 的“已实现：worker 真实入库管线”。

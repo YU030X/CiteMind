@@ -56,6 +56,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 dispatcher = OutboxDispatcher(
                     session_factory=session_factory,
                     publisher=dispatcher_publisher,
+                    # 双门控：dispatcher_enabled 已在外部判定，这里只在真实入库开启时
+                    # 才允许恢复处理中任务的过期租约，避免对安全接收壳任务误动。
+                    recovery_enabled=resolved_settings.ingest_processing_enabled,
                 )
                 dispatcher_task = asyncio.create_task(dispatcher.run())
             yield

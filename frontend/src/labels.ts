@@ -66,6 +66,7 @@ const JOB_ERROR_LABELS: Record<string, string> = {
   PIPELINE_PDF_INVALID: "PDF 文件损坏",
   PIPELINE_NEEDS_OCR: "没有可提取文本层，需要 OCR",
   PIPELINE_DB_ERROR: "入库数据库错误",
+  PIPELINE_RETRY_EXHAUSTED: "处理中断已耗尽重试",
 };
 
 /** 任务是否还在推进；终态不再触发轮询。 */

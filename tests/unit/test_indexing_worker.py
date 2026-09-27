@@ -30,6 +30,7 @@ def claim_facts(**overrides: Any) -> iw.ClaimFacts:
         "document_active_version_id": None,
         "ready_generation_present": False,
         "expected_active_version_id": None,
+        "next_run_due": True,
     }
     values.update(overrides)
     return iw.ClaimFacts(**values)
@@ -85,6 +86,7 @@ STALE_VERSION = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
             iw.ClaimAction.UNSUPPORTED_UPDATE,
         ),
         (claim_facts(ready_generation_present=True), iw.ClaimAction.UNSUPPORTED_UPDATE),
+        (claim_facts(next_run_due=False), iw.ClaimAction.NOT_DUE),
     ],
     ids=[
         "claimable",
@@ -104,6 +106,7 @@ STALE_VERSION = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
         "second-version-stale-expected",
         "already-active-version",
         "already-ready-generation",
+        "backoff-not-due",
     ],
 )
 def test_decide_claim_action_priority(facts: iw.ClaimFacts, expected: iw.ClaimAction) -> None:
@@ -324,9 +327,10 @@ def test_process_status_constants_are_distinct() -> None:
         iw.PROCESS_STATUS_EXISTING_DIAGNOSTIC,
         iw.PROCESS_STATUS_UNSUPPORTED_UPDATE,
         iw.PROCESS_STATUS_STALE_EXPECTED,
+        iw.PROCESS_STATUS_NOT_DUE,
         iw.PROCESS_STATUS_FAILED,
         iw.PROCESS_STATUS_LEASE_LOST,
         iw.PROCESS_STATUS_CLAIMED,
         iw.PROCESS_STATUS_PERSIST_UNCONFIRMED,
     }
-    assert len(statuses) == 13
+    assert len(statuses) == 14
