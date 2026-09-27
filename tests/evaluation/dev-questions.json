@@ -1,0 +1,999 @@
+{
+  "datasetKind": "dev",
+  "datasetVersion": "citemind-eval-dev-1",
+  "corpusManifest": "corpus/manifest.json",
+  "notes": "Phase 1 开发评估集：自制无敏感语料，用于开发期调参与离线结构校验。它不是留出集或测试集，不得用其结果声称最终质量；真实质量指标仍需在留出集上按固定分母、真实模型与真实权限环境测量。",
+  "questions": [
+    {
+      "id": "dev-single-001",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "员工手册规定的新员工试用期是多长时间？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["试用期为2个月，自入职日起算"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "试用期为2个月，自劳动合同约定的入职日起算。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "入职与试用期"],
+            "startLine": 9,
+            "endLine": 9
+          }
+        }
+      ],
+      "distractors": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 2,
+          "quote": "试用期为3个月，自劳动合同约定的入职日起算。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "入职与试用期"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ],
+      "tags": ["version_update"]
+    },
+    {
+      "id": "dev-single-002",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "那入职第一年的年假怎么计算？",
+      "standaloneQuestion": "入职第一年的年假如何折算？",
+      "history": [
+        { "role": "user", "text": "正式员工每年有多少天带薪年假？" },
+        { "role": "assistant", "text": "正式员工每个自然年享有12天带薪年假。入职第一年按当年剩余月份折算。" }
+      ],
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["入职第一年按当年剩余月份折算12天年假"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "正式员工每个自然年享有12天带薪年假，入职第一年按当年剩余月份折算。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 17,
+            "endLine": 17
+          }
+        }
+      ],
+      "distractors": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 2,
+          "quote": "正式员工每个自然年享有10天带薪年假，入职第一年按当年剩余月份折算。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 11,
+            "endLine": 11
+          }
+        }
+      ],
+      "tags": ["multi_turn", "version_update"]
+    },
+    {
+      "id": "dev-single-003",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司规定的核心协作时段是几点到几点？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["核心协作时段为10:00至16:00"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "标准工作时间为每周5天、每天8小时，核心协作时段为10:00至16:00。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 15,
+            "endLine": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-004",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "申请年假需要提前多少个工作日？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["提前3个工作日在内部系统提交申请"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "年假需提前3个工作日在内部系统提交申请，由直属主管审批。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 19,
+            "endLine": 19
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-005",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "工作日加班多久可以申请调休，调休有效期多长？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["加班满2小时可申请调休", "调休需在3个月内使用"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "工作日加班满2小时可申请调休，调休需在3个月内使用。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "加班与调休"],
+            "startLine": 23,
+            "endLine": 23
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-006",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "员工主动离职需要提前多久书面通知？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["提前30日书面通知"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "员工提出离职需提前30日书面通知，并完成账号与设备交接。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "离职与交接"],
+            "startLine": 27,
+            "endLine": 27
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-007",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "离职时未结清的差旅与报销应如何处理？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["未结清的差旅与报销事项应在离职前处理完毕"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "未结清的差旅与报销事项应在离职前处理完毕。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "离职与交接"],
+            "startLine": 29,
+            "endLine": 29
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-008",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "员工可以把内部资料上传到外部服务吗？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["不得上传至任何未经批准的外部服务"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "员工不得将内部资料上传至任何未经批准的外部服务。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "保密与安全"],
+            "startLine": 33,
+            "endLine": 33
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-009",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "系统账号密码长度至少多少位？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["密码长度不得少于14位"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "所有系统账号密码长度不得少于14位，并至少每180天更换一次。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "账号与密码"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-010",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "账号密码需要多久更换一次？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["至少每180天更换一次"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "所有系统账号密码长度不得少于14位，并至少每180天更换一次。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "账号与密码"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-011",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "办公终端是否要求启用双因素认证？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["办公终端必须启用双因素认证", "禁止多人共用账号"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "办公终端必须启用双因素认证，禁止多人共用账号。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "账号与密码"],
+            "startLine": 9,
+            "endLine": 9
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-012",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司配发的笔记本电脑需要开启什么保护？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["必须开启全盘加密", "离开工位时须锁屏"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "公司配发的笔记本电脑必须开启全盘加密，离开工位时须锁屏。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "设备与数据"],
+            "startLine": 13,
+            "endLine": 13
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-013",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "发现数据泄露后应在多长时间内上报？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["在1小时内通过安全值班邮箱上报"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "发现疑似钓鱼邮件或数据泄露时，应在1小时内通过安全值班邮箱上报。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "事件上报"],
+            "startLine": 21,
+            "endLine": 21
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-014",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "员工请病假应在何时提交申请？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["应在上班开始前通过内部系统提交病假申请"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "员工因病需要休息时，应在上班开始前通过内部系统提交病假申请。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-015",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "连续病假超过几天需要提交医院证明？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["连续病假超过3天需提交二级及以上医院证明"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "连续病假超过3天的，需在返岗后5个工作日内提交二级及以上医院证明。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 9,
+            "endLine": 9
+          }
+        }
+      ],
+      "distractors": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 1,
+          "quote": "连续病假超过1天的，需在返岗后5个工作日内提交医院证明。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ],
+      "tags": ["version_update"]
+    },
+    {
+      "id": "dev-single-016",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "全年事假累计不得超过多少天？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["全年事假累计不得超过15天"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "事假需提前1个工作日申请，全年事假累计不得超过15天。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "事假"],
+            "startLine": 13,
+            "endLine": 13
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-017",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "跨城出差优先选择什么交通工具？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["跨城出行优先选择高铁二等座"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "市内交通凭票据实报销；跨城出行优先选择高铁二等座。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "交通"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-018",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "一线城市出差住宿每晚上限是多少？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["一线城市住宿标准为每晚上限600元"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "一线城市住宿标准为每晚上限600元，其他城市为每晚上限400元。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "住宿"],
+            "startLine": 11,
+            "endLine": 11
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-019",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "出差期间每天的餐饮补贴上限是多少？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["每人每天餐饮补贴上限100元"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "出差期间每人每天餐饮补贴上限100元，凭发票报销。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "餐饮补贴"],
+            "startLine": 15,
+            "endLine": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-020",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "差旅结束后应在多少个工作日内提交报销单？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["差旅结束后10个工作日内提交报销单"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "差旅结束后10个工作日内提交报销单，逾期需部门负责人书面说明。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "报销时限"],
+            "startLine": 19,
+            "endLine": 19
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-single-021",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "食堂周末的开放时间是什么？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["周末开放时间为09:00至14:00"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1,
+          "quote": "Weekends 09:00-14:00",
+          "locator": {
+            "sourceType": "pdf",
+            "parserVersion": "pypdf-6.19.0-v1",
+            "headingPath": [],
+            "page": 1
+          }
+        }
+      ],
+      "tags": ["pdf_page"]
+    },
+    {
+      "id": "dev-single-022",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "在食堂订餐最晚需要提前到什么时候？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["前一天的17:00前订餐"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1,
+          "quote": "Place orders by 17:00 the day before",
+          "locator": {
+            "sourceType": "pdf",
+            "parserVersion": "pypdf-6.19.0-v1",
+            "headingPath": [],
+            "page": 2
+          }
+        }
+      ],
+      "tags": ["pdf_page"]
+    },
+    {
+      "id": "dev-single-023",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "访客餐券每张面额是多少？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["每张面额30元"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1,
+          "quote": "Each voucher is worth 30 CNY",
+          "locator": {
+            "sourceType": "pdf",
+            "parserVersion": "pypdf-6.19.0-v1",
+            "headingPath": [],
+            "page": 3
+          }
+        }
+      ],
+      "tags": ["pdf_page"]
+    },
+    {
+      "id": "dev-single-024",
+      "category": "single_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "新员工入职当天需要完成什么培训？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["岗位安全与信息安全基础培训"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "新员工入职当天需完成岗位安全与信息安全基础培训。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "入职与试用期"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-001",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "那试用期员工连续请病假需要提交什么材料？",
+      "standaloneQuestion": "试用期员工连续请病假需要提交什么证明？",
+      "history": [
+        { "role": "user", "text": "新员工试用期是多长时间？" },
+        { "role": "assistant", "text": "试用期为2个月，自劳动合同约定的入职日起算。" }
+      ],
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["试用期为2个月", "连续病假超过3天需提交二级及以上医院证明"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "试用期为2个月，自劳动合同约定的入职日起算。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "入职与试用期"],
+            "startLine": 9,
+            "endLine": 9
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "连续病假超过3天的，需在返岗后5个工作日内提交二级及以上医院证明。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 9,
+            "endLine": 9
+          }
+        }
+      ],
+      "tags": ["multi_turn"]
+    },
+    {
+      "id": "dev-cross-002",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "年假和病假分别需要提前多久申请？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["年假提前3个工作日申请", "病假应在上班开始前提交申请"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "年假需提前3个工作日在内部系统提交申请，由直属主管审批。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 19,
+            "endLine": 19
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "员工因病需要休息时，应在上班开始前通过内部系统提交病假申请。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-003",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "把内部资料上传到外部云盘是否合规，发现泄露后如何上报？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["不得上传至未经批准的外部服务", "发现泄露应在1小时内上报"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "员工不得将内部资料上传至任何未经批准的外部服务。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "保密与安全"],
+            "startLine": 33,
+            "endLine": 33
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "发现疑似钓鱼邮件或数据泄露时，应在1小时内通过安全值班邮箱上报。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "事件上报"],
+            "startLine": 21,
+            "endLine": 21
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-004",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "向外部单位发送含客户信息的文件前需要做什么审批，内部资料能否随意外发？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["含客户信息文件外发需信息安全负责人审批", "内部资料不得上传未批准的外部服务"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "向外部单位发送含客户信息的文件前，需经信息安全负责人审批。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "外发与共享"],
+            "startLine": 17,
+            "endLine": 17
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "员工不得将内部资料上传至任何未经批准的外部服务。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "保密与安全"],
+            "startLine": 33,
+            "endLine": 33
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-005",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "出差携带公司电脑时，交通选择和设备安全各有什么要求？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["跨城出行优先高铁二等座", "笔记本电脑必须开启全盘加密并锁屏"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "市内交通凭票据实报销；跨城出行优先选择高铁二等座。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "交通"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1,
+          "quote": "公司配发的笔记本电脑必须开启全盘加密，离开工位时须锁屏。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["信息安全规范", "设备与数据"],
+            "startLine": 13,
+            "endLine": 13
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-006",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "工作日的核心协作时段是什么，午餐应该如何订餐？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["核心协作时段为10:00至16:00", "提前一天17:00前订餐"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "标准工作时间为每周5天、每天8小时，核心协作时段为10:00至16:00。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "工作时间与休假"],
+            "startLine": 15,
+            "endLine": 15
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1,
+          "quote": "Place orders by 17:00 the day before",
+          "locator": {
+            "sourceType": "pdf",
+            "parserVersion": "pypdf-6.19.0-v1",
+            "headingPath": [],
+            "page": 2
+          }
+        }
+      ],
+      "tags": ["pdf_page"]
+    },
+    {
+      "id": "dev-cross-007",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "离职交接时未报销的差旅费怎么处理，报销单最晚什么时候提交？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["未结清的差旅与报销应在离职前处理完毕", "差旅结束后10个工作日内提交报销单"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "未结清的差旅与报销事项应在离职前处理完毕。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "离职与交接"],
+            "startLine": 29,
+            "endLine": 29
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1,
+          "quote": "差旅结束后10个工作日内提交报销单，逾期需部门负责人书面说明。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["差旅报销标准", "报销时限"],
+            "startLine": 19,
+            "endLine": 19
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-cross-008",
+      "category": "cross_document",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "加班之后的调休和请病假分别需要怎么申请？",
+      "expectedBehavior": "answer",
+      "goldAnswerPoints": ["加班满2小时可申请调休且3个月内使用", "病假应在上班开始前提交申请"],
+      "goldSourceSpans": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3,
+          "quote": "工作日加班满2小时可申请调休，调休需在3个月内使用。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["员工手册", "加班与调休"],
+            "startLine": 23,
+            "endLine": 23
+          }
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2,
+          "quote": "员工因病需要休息时，应在上班开始前通过内部系统提交病假申请。",
+          "locator": {
+            "sourceType": "markdown",
+            "parserVersion": "markdown-it-py-4.2.0-v1",
+            "headingPath": ["病假与事假管理办法", "病假申请"],
+            "startLine": 7,
+            "endLine": 7
+          }
+        }
+      ]
+    },
+    {
+      "id": "dev-unanswerable-001",
+      "category": "unanswerable",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司是否提供员工持股计划？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "tags": ["insufficient_evidence"]
+    },
+    {
+      "id": "dev-unanswerable-002",
+      "category": "unanswerable",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司在海外有哪些分支机构？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "tags": ["insufficient_evidence"]
+    },
+    {
+      "id": "dev-unanswerable-003",
+      "category": "unanswerable",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "旧版年终奖办法如何计算年终奖？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["legacy-bonus"],
+      "unavailableReason": "deleted",
+      "tags": ["deletion"]
+    },
+    {
+      "id": "dev-unanswerable-004",
+      "category": "unanswerable",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "2019年以前入职员工的年终奖按什么标准发放？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["legacy-bonus"],
+      "unavailableReason": "deleted",
+      "tags": ["deletion"]
+    },
+    {
+      "id": "dev-no-permission-001",
+      "category": "no_permission",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "P5职级的年度薪酬带宽是多少？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["salary-bands"],
+      "unavailableReason": "no_permission",
+      "tags": ["permission"]
+    },
+    {
+      "id": "dev-no-permission-002",
+      "category": "no_permission",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "职级P6的年度薪酬范围是多少？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["salary-bands"],
+      "unavailableReason": "no_permission",
+      "tags": ["permission"]
+    },
+    {
+      "id": "dev-no-permission-003",
+      "category": "no_permission",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司每年什么时候调薪？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["salary-bands"],
+      "unavailableReason": "no_permission",
+      "tags": ["permission"]
+    },
+    {
+      "id": "dev-no-permission-004",
+      "category": "no_permission",
+      "scope": { "role": "staff", "kbIds": ["kb-handbook"] },
+      "question": "公司薪酬带宽相关的规定对谁可见？",
+      "expectedBehavior": "refuse",
+      "goldAnswerPoints": [],
+      "goldSourceSpans": [],
+      "unavailableDocumentIds": ["salary-bands"],
+      "unavailableReason": "no_permission",
+      "tags": ["permission"]
+    }
+  ]
+}

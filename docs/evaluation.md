@@ -1,6 +1,6 @@
 # 评估与验收计划
 
-> 所有数字是待验证的目标，没有已完成的测试结果。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。
+> 所有数字是待验证的目标，没有已完成的测试结果。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的开发集、自制语料与离线校验已实现（见“已实现：Phase 1 开发评估集与离线校验”）；质量与性能数字仍是待验证目标，尚未测量。
 
 ## 固定题集
 
@@ -13,7 +13,52 @@
 | 无答案/证据不足 | 4 | 11 | 拒答 |
 | 当前角色无权限 | 4 | 11 | 不泄露存在性 |
 
-MVP 先有至少 30 道开发题；100 题与留出集用于完整评估。gold span 绑定固定原文版本、parser 版本、block/page ID 和规范化文本区间，不绑定 chunk ID。更换 parser 后重新映射并升级数据集版本。
+MVP 先有至少 30 道开发题；100 题与留出集用于完整评估。gold span 绑定固定原文版本、parser 版本与 headingPath + 1-based 行区间（Markdown）或 1-based page（PDF），不绑定 chunk ID。更换 parser 后重新映射并升级数据集版本。
+
+## 已实现：Phase 1 开发评估集与离线校验
+
+Phase 1 要交付的“至少 30 道开发题”已落地为**开发集**（`datasetKind=dev`，不是留出集或测试集）：`tests/evaluation/dev-questions.json` 含 40 道唯一题，分类计数与上表开发列一致（单文档 24、跨文档 8、无答案/证据不足 4、当前角色无权限 4），并覆盖版本更新、逻辑删除、多轮追问与 PDF 页定位四种场景标签。
+
+**语料与定位。** 语料为自制、无敏感内容：`tests/evaluation/corpus/` 下的 Markdown 样本与由 `tests/evaluation/tools/build_corpus.py`（只用 dev 组已有的 `pypdf`，输出字节确定）生成的文本层 `cafeteria.pdf`；语料清单 `tests/evaluation/corpus/manifest.json` 记录每个逻辑文档的版本、样本文件、来源类型、解析器版本与 active/superseded/deleted 状态，另登记各角色可访问的 KB 集合。gold 引用只绑定（KB、文档、版本）与原文定位，外加解析器版本，**不绑定 chunk UUID**：Markdown 用 `locator.headingPath`（标题路径数组）加 1-based 闭区间 `startLine`/`endLine`；PDF 用 1-based `page`，`headingPath` 必须为空且不带行号（PDF 没有可靠行号，绝不伪造）。校验器用与入库同一实现重放样本文件：Markdown 重新解析后必须存在 `headingPath` 与行区间都相等的块且 `quote` 落在该块文本内，PDF 必须能在声明页抽到含 `quote` 的文本；清单 `parserVersion` 与实现常量不一致时报解析器漂移。
+
+**每题字段。** 每题保存角色、请求 KB 集合（`scope.kbIds`）、问题（多轮题另存 `standaloneQuestion` 与 `history`）、预期行为、gold 答案要点与 `goldSourceSpans`。另有两类可选字段：
+
+- `distractors`：答案题里**同文档的 superseded 版本**引文，用于“版本更新”场景，表示检索/生成不得把它当当前事实；校验要求它绑定 `status=superseded`，且其 KB 在本题 `scope.kbIds` 内并可由该角色访问。
+- `unavailableDocumentIds` + `unavailableReason`：无权限或删除题里对当前角色不可用的文档；两者必须同时出现或同时为空。`no_permission` 要求该 KB 对当前角色不可访问、文档有有效版本；`deleted` 要求该 KB 对当前角色可访问、文档**没有有效版本**且至少有一个 `status=deleted` 的版本（校验的是最小删除状态事实，不证明真实权限或删除链路已生效）。
+
+所有 gold 与 distractor 的 KB 都必须在 `question.scope.kbIds` 内且该角色可访问，违反即静态校验失败；无答案和无权限题 gold 为空且预期拒答。题集自身的泄漏检查只覆盖题面、`standaloneQuestion`、历史与 gold 答案要点中**逐行完全包含**不可访问文档“实质行”（长度 ≥12 且非标题/引用行）的情况：**它是启发式检查，只拦明显复制，不证明不存在泄漏**，改写、跨行拼接、同义表述与部分片段都不会被捕获，也不能替代真实候选/日志/历史/下载链路的人工与代码级验证。
+
+离线入口（不联网、不读环境文件、不调用任何模型；在仓库根目录单行执行）：
+
+```text
+uv run python -m rag_backend.evaluation
+```
+
+该命令校验题集 schema、数量（开发集 ≥30）、分类、来源存在与 gold 匹配，打印分类与标签计数后退出 0；失败时输出静态原因并退出 1。语料文件缺失、读取失败、Markdown 非法 UTF-8、PDF 解析具名异常（加密/结构损坏/超页）都统一收敛为静态 `DatasetValidationError` 并让 CLI 退出 1，不打印 traceback，也不用宽泛的 `except Exception` 吞掉程序自身 bug。可选的 `--results` 读取**真实运行产生**的结果文件（字段为 `questionId`、`behavior`、`citations[].{kbId,documentId,version}`、`answerText`），计算五个确定性指标；结果必须恰好覆盖题集全部 id，重复、未知或缺失都拒绝。结果文件里的引用来源是**手工按固定版本配对**的运行事实，不由校验器推断。
+
+五个指标的分母与分子固定如下（`None` 表示该指标没有分母，例如没有应拒答题），其中 `citationSourceValidity` 按**引用条数**、`goldSourceCoverage` 按**整题回答数**，粒度不同：
+
+| 指标 | 分子 | 分母 |
+| --- | --- | --- |
+| `refusalAccuracy` | 正确拒答的应拒答题数 | 全部应拒答题数 |
+| `falseRefusalRate` | 被误拒的应作答题数 | 全部应作答题数 |
+| `citationSourceValidity` | 已作答题返回的、命中本题 gold 的引用条数（按引用） | 已作答题返回的全部引用条数 |
+| `goldSourceCoverage` | 引用覆盖了本题全部 gold (KB, 文档, 版本) 的应作答题数（按回答） | 全部应作答题数 |
+| `permissionLeakCount` | 回答正文逐行包含不可访问文档实质行的应拒答题数 | 无（计数，目标 0） |
+
+```text
+uv run python -m rag_backend.evaluation --results path/to/results.json
+```
+
+聚焦单测（同样离线）：
+
+```text
+uv run pytest tests/unit/test_evaluation_dataset.py -q
+```
+
+本切片只交付开发集、离线校验与确定性指标计算，**不建评估平台、不建新数据库、不引入 LLM 裁判**；计算器不联网、不读环境文件、不调用任何模型，测试里用合成结果只验证计算分支。本轮实测：`uv run python -m rag_backend.evaluation` 退出 0、`total=40`；`uv run pytest tests/unit/test_evaluation_dataset.py -q` 为 28 passed。
+
+以下验收仍未完成，需在真实模型与真实权限环境下另测，不能由本开发集或任何合成结果代替：**40 道开发题没有对任何真实检索/生成模型跑过**，因此没有真实检索/生成质量分数，也没有费用或延迟数字；留出集（上表留出列）尚不存在；真实检索/生成质量（Recall@10、nDCG@10、引用支持率、真实 provider 拒答与费用/延迟）尚未测量；无权限不泄漏尚未在真实候选、重排、日志、历史与下载链路上验收；三组消融与性能 p95 目标未测。开发集只用于开发期调参和结构自检，不得冒充留出集或作为最终质量结论。
 
 ## 消融与计分
 

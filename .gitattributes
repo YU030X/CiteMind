@@ -8,3 +8,6 @@ deploy/compose/frontend.Dockerfile.dockerignore text eol=lf
 deploy/compose/gateway/nginx.conf text eol=lf
 inference/Dockerfile text eol=lf
 inference/.dockerignore text eol=lf
+
+# PDF 语料/工件按二进制处理：xref 表尾随空格是格式固有内容，避免 git diff --check 误报文本空白错误。
+*.pdf binary

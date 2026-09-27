@@ -1,0 +1,120 @@
+{
+  "manifestVersion": "citemind-eval-corpus-1",
+  "note": "自制、无敏感内容的开发评估语料清单。每个版本条目绑定一个可复现的样本文件；gold 引用只按 (knowledgeBase, document, version) 加原文行区间或页码定位，不绑定 chunk UUID。",
+  "knowledgeBases": {
+    "kb-handbook": {
+      "documents": {
+        "handbook": {
+          "currentVersion": 3,
+          "versions": [
+            {
+              "version": 2,
+              "file": "handbook-v2.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "superseded"
+            },
+            {
+              "version": 3,
+              "file": "handbook-v3.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "leave-policy": {
+          "currentVersion": 2,
+          "versions": [
+            {
+              "version": 1,
+              "file": "leave-policy-v1.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "superseded"
+            },
+            {
+              "version": 2,
+              "file": "leave-policy-v2.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "it-security": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "it-security.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "travel": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "travel.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "cafeteria": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "cafeteria.pdf",
+              "sourceType": "pdf",
+              "parserVersion": "pypdf-6.19.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "legacy-bonus": {
+          "currentVersion": null,
+          "versions": [
+            {
+              "version": 1,
+              "file": "legacy-bonus-v1.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "deleted"
+            }
+          ]
+        }
+      }
+    },
+    "kb-restricted": {
+      "documents": {
+        "salary-bands": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "salary-bands.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "roles": {
+    "staff": {
+      "knowledgeBases": ["kb-handbook"]
+    },
+    "hr": {
+      "knowledgeBases": ["kb-handbook", "kb-restricted"]
+    }
+  }
+}
