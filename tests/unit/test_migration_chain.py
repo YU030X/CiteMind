@@ -21,6 +21,7 @@ WORKER_KB_PUBLISH_REVISION = "20260925_0007"
 INGEST_JOB_REQUEST_TITLE_REVISION = "20260926_0008"
 CONVERSATION_REVISION = "20260927_0009"
 CONVERSATION_METADATA_REVISION = "20260927_0010"
+QUERY_RUN_OPTIONS_REVISION = "20260927_0011"
 
 CORE_TABLES = (
     "index_profile",
@@ -84,6 +85,7 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_query_run_provider_prompt_tokens_non_negative",
     "ck_query_run_provider_completion_tokens_non_negative",
     "ck_query_run_question_non_empty",
+    "ck_query_run_generation_options_object",
     "ck_message_role",
     "ck_message_sequence_positive",
     "ck_citation_display_label_non_empty",
@@ -131,9 +133,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [CONVERSATION_METADATA_REVISION]
+    assert script_directory.get_heads() == [QUERY_RUN_OPTIONS_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    query_run_options = script_directory.get_revision(QUERY_RUN_OPTIONS_REVISION)
     conversation_metadata = script_directory.get_revision(CONVERSATION_METADATA_REVISION)
     conversation = script_directory.get_revision(CONVERSATION_REVISION)
     request_title = script_directory.get_revision(INGEST_JOB_REQUEST_TITLE_REVISION)
@@ -146,7 +149,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
     assert conversation_metadata.down_revision == CONVERSATION_REVISION
-    assert conversation_metadata.nextrev == set()
+    assert conversation_metadata.nextrev == {QUERY_RUN_OPTIONS_REVISION}
+    assert query_run_options.down_revision == CONVERSATION_METADATA_REVISION
+    assert query_run_options.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -507,6 +512,44 @@ def test_offline_downgrade_sql_removes_only_conversation_metadata(
     assert "DROP COLUMN deleted_at" in output
     assert "DROP COLUMN pinned_at" in output
     assert "DROP COLUMN title" in output
+    assert "DROP TABLE" not in output
+    assert "GRANT " not in output
+
+
+def test_offline_upgrade_sql_adds_only_query_run_generation_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{CONVERSATION_METADATA_REVISION}:{QUERY_RUN_OPTIONS_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE query_run ADD COLUMN generation_options JSONB" in output
+    assert "'{}'::jsonb" in output
+    assert "NOT NULL" in output
+    assert "generation_options_object" in output
+    # 只加列与约束：不回填、不建索引、不改授权、不动其它表。
+    assert "UPDATE query_run" not in output
+    assert "CREATE INDEX" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+    assert "DROP " not in output
+
+
+def test_offline_downgrade_sql_removes_only_query_run_generation_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{QUERY_RUN_OPTIONS_REVISION}:{CONVERSATION_METADATA_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP CONSTRAINT ck_query_run_generation_options_object" in output
+    assert "DROP COLUMN generation_options" in output
     assert "DROP TABLE" not in output
     assert "GRANT " not in output
 

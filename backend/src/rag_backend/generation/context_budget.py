@@ -36,11 +36,13 @@ from typing import Literal
 
 from rag_backend.config import Settings
 from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
     PROMPT_ENCODING_CONTRACT,
     TOKEN_COUNT_SOURCE,
     ChatMessage,
     PromptEncodingError,
     PromptTokenEstimator,
+    ThinkingChoice,
 )
 
 # 与 Settings 同名配置字段的默认值保持一致；配置是运行期权威值，这里的常量只服务直接调用与测试。
@@ -235,11 +237,13 @@ def plan_chat_context(
     evidence: Sequence[EvidenceCandidate] = (),
     history: Sequence[HistoryTurn] = (),
     budget: ContextBudget | None = None,
+    thinking: ThinkingChoice = NON_THINKING,
 ) -> ChatContextPlan:
     """选择证据与历史并装配最终提示；系统提示与当前问题超预算时抛预算错误。
 
     输入顺序即优先级顺序：``evidence`` 必须是检索（融合）顺序，``history`` 的顺序不影响结果
-    （轮次序号与相关性决定取舍，装配始终按时序）。
+    （轮次序号与相关性决定取舍，装配始终按时序）。``thinking`` 只影响本地估算使用的渲染变体：
+    思考模式多一段强度说明与 ``<think>`` 标记，必须计入输入预算。
     """
 
     resolved_budget = ContextBudget() if budget is None else budget
@@ -249,7 +253,7 @@ def plan_chat_context(
     _validate_evidence(evidence)
 
     mandatory = _assemble_messages(system_prompt, (), question, ())
-    mandatory_tokens = estimator.estimate_chat_tokens(mandatory)
+    mandatory_tokens = estimator.estimate_chat_tokens(mandatory, thinking=thinking)
     if mandatory_tokens > resolved_budget.input_token_budget:
         raise MandatoryContextExceedsBudgetError(
             mandatory_tokens, resolved_budget.input_token_budget
@@ -288,7 +292,10 @@ def plan_chat_context(
             (),
         )
         try:
-            fits = estimator.estimate_chat_tokens(candidate) <= resolved_budget.input_token_budget
+            fits = (
+                estimator.estimate_chat_tokens(candidate, thinking=thinking)
+                <= resolved_budget.input_token_budget
+            )
         except PromptEncodingError:
             excluded.append(
                 ExcludedItem(kind="history", key=str(turn.sequence), reason=REASON_UNSUPPORTED_TEXT)
@@ -318,7 +325,10 @@ def plan_chat_context(
             system_prompt, selected_turns, question, [*selected_evidence, item]
         )
         try:
-            fits = estimator.estimate_chat_tokens(candidate) <= resolved_budget.input_token_budget
+            fits = (
+                estimator.estimate_chat_tokens(candidate, thinking=thinking)
+                <= resolved_budget.input_token_budget
+            )
         except PromptEncodingError:
             # 低信任证据含本地结构 token：只跳过该候选，其余合法证据继续按顺序加入。
             excluded.append(
@@ -340,7 +350,7 @@ def plan_chat_context(
         evidence_ids=tuple(item.evidence_id for item in selected_evidence),
         history_sequences=tuple(turn.sequence for turn in turns),
         excluded=tuple(excluded),
-        input_tokens=estimator.estimate_chat_tokens(messages),
+        input_tokens=estimator.estimate_chat_tokens(messages, thinking=thinking),
         input_token_budget=resolved_budget.input_token_budget,
         output_token_budget=resolved_budget.output_token_budget,
         prompt_encoding_contract=PROMPT_ENCODING_CONTRACT,

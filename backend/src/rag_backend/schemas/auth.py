@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import Field
 
 from rag_backend.auth.accounts import MAX_USERNAME_LENGTH
+from rag_backend.generation.capabilities import SUPPORTED_MODELS, ReasoningEffort
 from rag_backend.knowledge.roles import KbRole
 from rag_backend.schemas.base import CamelModel
 
@@ -31,15 +32,53 @@ class UserSummary(CamelModel):
     organization_id: uuid.UUID
 
 
-class GenerationCapability(CamelModel):
-    """只读的生成能力事实：当前配置的模型与固定的 thinking 关闭，不可由客户端切换。
+class ThinkingCapability(CamelModel):
+    """单个模型的思考能力事实：是否支持开关与可用强度。"""
 
-    它只叙述服务端实际配置，不声称支持思考强度或模型路由。
+    supported: bool
+    efforts: list[ReasoningEffort]
+    default_effort: ReasoningEffort | None
+
+
+class ModelCapability(CamelModel):
+    """服务端白名单内的一个模型及其可切换能力。"""
+
+    id: str
+    thinking: ThinkingCapability
+
+
+class GenerationCapability(CamelModel):
+    """只读的生成能力事实：受支持模型与思考选项，以及服务端默认组合。
+
+    它只列举经证实与固定 tokenizer/渲染契约兼容的模型；不在列表里的模型（例如词表尚未验证的
+    ``deepseek-v4-pro``）不接受、也不展示。``default_thinking`` 描述省略请求字段时的行为。
     """
 
-    model: str
-    thinking: Literal["disabled"]
     enabled: bool
+    default_model: str
+    default_thinking: Literal["enabled", "disabled"]
+    models: list[ModelCapability]
+
+
+def generation_capability(enabled: bool, default_model: str) -> GenerationCapability:
+    """按服务端白名单构造只读能力事实；不含密钥、端点与任何客户端可提交的开关。"""
+
+    return GenerationCapability(
+        enabled=enabled,
+        default_model=default_model,
+        default_thinking="disabled",
+        models=[
+            ModelCapability(
+                id=model.model_id,
+                thinking=ThinkingCapability(
+                    supported=model.thinking_supported,
+                    efforts=list(model.efforts),
+                    default_effort=model.default_effort if model.thinking_supported else None,
+                ),
+            )
+            for model in SUPPORTED_MODELS
+        ],
+    )
 
 
 class MeResponse(CamelModel):

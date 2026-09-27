@@ -168,9 +168,9 @@ def resolve_probe_api_key(settings: Settings) -> str | None:
 def build_request_payload(model: str) -> dict[str, Any]:
     """固定探针请求；显式关闭 thinking，非流式，并限制输出长度。
 
-    未添加 ``reasoning_effort``：它与 ``thinking: {"type": "disabled"}`` 的兼容性
-    尚未由官方文档确认，需一次真实计费调用核实后再决定，避免凭猜测发送未知字段。
-    默认 thinking 必须显式关闭，不能依赖供应商默认值。
+    官方文档（2026-09-27 读取）同时提供 ``thinking.type`` 与 ``reasoning_effort``（``none`` 关闭）；
+    探针只需最小请求面验证连通与 usage，因此只发 ``thinking: {"type": "disabled"}``，不额外发
+    ``reasoning_effort``。默认 thinking 必须显式关闭，不能依赖供应商默认值（默认是 enabled）。
     """
 
     return {

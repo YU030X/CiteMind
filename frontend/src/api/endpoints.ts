@@ -3,6 +3,7 @@
 import { request } from "./client";
 import type {
   AnswerResponse,
+  AskGenerationOptions,
   Citation,
   ConversationListResponse,
   ConversationMessagesResponse,
@@ -97,10 +98,24 @@ export const api = {
   listMessages: (conversationId: string): Promise<ConversationMessagesResponse> =>
     request<ConversationMessagesResponse>(`/conversations/${conversationId}/messages`),
 
-  ask: (conversationId: string, question: string, requestId: string): Promise<AnswerResponse> =>
+  /** 追问：可携带服务端白名单内的模型与思考选项；省略字段等价于服务端默认（关闭思考）。 */
+  ask: (
+    conversationId: string,
+    question: string,
+    requestId: string,
+    options: AskGenerationOptions,
+  ): Promise<AnswerResponse> =>
     request<AnswerResponse>(`/conversations/${conversationId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ question, requestId }),
+      body: JSON.stringify({
+        question,
+        requestId,
+        model: options.model,
+        thinking: { type: options.thinking },
+        ...(options.thinking === "enabled" && options.reasoningEffort !== undefined
+          ? { reasoningEffort: options.reasoningEffort }
+          : {}),
+      }),
     }),
 
   getCitation: (citationId: string): Promise<Citation> =>

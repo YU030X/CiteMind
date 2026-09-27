@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 from rag_backend.api.conversations import (
+    get_answer_generator,
     get_conversation_repository,
     get_evidence_repository,
     get_prompt_estimator,
@@ -20,7 +21,9 @@ from rag_backend.api.errors import (
     CODE_CITATION_NOT_FOUND,
     CODE_CONVERSATION_NOT_FOUND,
     CODE_CSRF_INVALID,
+    CODE_GENERATION_OPTION_UNSUPPORTED,
     CODE_LLM_UNAVAILABLE,
+    CODE_VALIDATION_ERROR,
 )
 from rag_backend.api.retrieval import get_query_analyzer, get_query_embedder
 from rag_backend.app import create_app
@@ -85,7 +88,7 @@ class _FakeEmbedder:
 
 
 class _FakeEstimator:
-    def estimate_chat_tokens(self, messages: Any) -> int:
+    def estimate_chat_tokens(self, messages: Any, *, thinking: Any = None) -> int:
         return 1
 
 
@@ -282,3 +285,98 @@ async def test_citation_detail_returns_404_for_other_owner(
 
     assert response.status_code == 404
     assert response.json()["code"] == CODE_CITATION_NOT_FOUND
+
+
+# --- 生成选项白名单 ---------------------------------------------------------
+
+
+class _UnusedGenerator:
+    """非法选项或无效请求不得进入生成；被调用即断言失败。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(
+        self, messages: Any, *, model: str, max_output_tokens: int, thinking: Any = None
+    ) -> Any:
+        self.calls += 1
+        raise AssertionError("生成模型不应被调用")
+
+    def close(self) -> None:
+        return None
+
+
+def _generation_enabled_app() -> Any:
+    """开启生成并覆盖生成客户端；用于把请求选项校验走到 422 而不联网。"""
+
+    app = create_app(_settings(llm_enabled=True, llm_api_key="unit-key"))
+    app.dependency_overrides[get_auth_context] = _context
+    app.dependency_overrides[get_prompt_estimator] = _FakeEstimator
+    app.dependency_overrides[get_query_analyzer] = _FakeAnalyzer
+    app.dependency_overrides[get_query_embedder] = _FakeEmbedder
+    app.dependency_overrides[get_conversation_repository] = (
+        lambda: FakeConversationRepository(_conversation())
+    )
+    app.dependency_overrides[get_evidence_repository] = lambda: FakeEvidenceRepository([])
+    app.dependency_overrides[get_answer_generator] = _UnusedGenerator
+    return app
+
+
+@pytest.mark.anyio
+async def test_append_message_rejects_unverified_model() -> None:
+    app = _generation_enabled_app()
+    async with app.router.lifespan_context(app):
+        async with _client(app) as client:
+            response = await client.post(
+                f"/api/v1/conversations/{CONVERSATION_ID}/messages",
+                json={"question": "问题", "model": "deepseek-v4-pro"},
+                headers={CSRF_HEADER_NAME: CSRF_TOKEN, "Origin": ORIGIN},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == CODE_GENERATION_OPTION_UNSUPPORTED
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # 关闭/省略 thinking 时提交强度：组合无意义，必须拒绝。
+        {"question": "问题", "reasoningEffort": "high"},
+        {"question": "问题", "thinking": {"type": "disabled"}, "reasoningEffort": "max"},
+        # 未知参数（如自定义 endpoint）不得被静默忽略。
+        {"question": "问题", "baseUrl": "https://example.invalid"},
+        {"question": "问题", "thinking": {"type": "enabled", "extra": 1}},
+    ],
+)
+@pytest.mark.anyio
+async def test_append_message_rejects_invalid_option_combinations(
+    payload: dict[str, Any],
+) -> None:
+    app = _generation_enabled_app()
+    async with app.router.lifespan_context(app):
+        async with _client(app) as client:
+            response = await client.post(
+                f"/api/v1/conversations/{CONVERSATION_ID}/messages",
+                json=payload,
+                headers={CSRF_HEADER_NAME: CSRF_TOKEN, "Origin": ORIGIN},
+            )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == CODE_VALIDATION_ERROR
+
+
+def test_resolve_thinking_maps_request_to_render_choice() -> None:
+    """请求开关/强度到渲染选项的映射：省略或 disabled 归为非思考，省略强度用官方默认。"""
+
+    from rag_backend.api.conversations import _resolve_thinking
+    from rag_backend.generation.deepseek_prompt import NON_THINKING, ThinkingChoice
+    from rag_backend.schemas.conversation import ThinkingRequest
+
+    assert _resolve_thinking(None, None) == NON_THINKING
+    assert _resolve_thinking(ThinkingRequest(type="disabled"), None) == NON_THINKING
+    assert _resolve_thinking(ThinkingRequest(type="enabled"), None) == ThinkingChoice(
+        enabled=True
+    )
+    assert _resolve_thinking(ThinkingRequest(type="enabled"), "max") == ThinkingChoice(
+        enabled=True, effort="max"
+    )

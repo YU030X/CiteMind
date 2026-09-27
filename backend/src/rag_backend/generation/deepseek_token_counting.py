@@ -30,8 +30,10 @@ from typing import Final
 from tokenizers import Tokenizer
 
 from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
     PROMPT_ENCODING_CONTRACT,
     ChatMessage,
+    ThinkingChoice,
     render_chat_prompt,
 )
 
@@ -170,10 +172,12 @@ class LocalPromptTokenCounter:
 
         return len(self._tokenizer.encode(prompt, add_special_tokens=False).ids)
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
-        """渲染 chat 消息并返回其 token 估算值；渲染不合法时抛 :class:`PromptEncodingError`。"""
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
+        """按给定思考选项渲染 chat 消息并返回 token 估算值；渲染不合法时抛异常。"""
 
-        return self.count_prompt_tokens(render_chat_prompt(messages))
+        return self.count_prompt_tokens(render_chat_prompt(messages, thinking=thinking))
 
 
 __all__ = [

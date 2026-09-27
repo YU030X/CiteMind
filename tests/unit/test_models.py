@@ -164,6 +164,7 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "ck_query_run_provider_prompt_tokens_non_negative",
         "ck_query_run_provider_completion_tokens_non_negative",
         "ck_query_run_question_non_empty",
+        "ck_query_run_generation_options_object",
     },
     "message": {
         "pk_message",

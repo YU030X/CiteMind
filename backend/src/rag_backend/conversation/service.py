@@ -16,7 +16,11 @@
 成员关系重新鉴权。只有当存在**合法历史轮次**时才调用一次改写模型（``stage='qa_rewrite'``），
 把追问收敛为唯一 ``standalone_question``；首轮与历史全部撤权都不额外发请求，独立问题即原问题。
 独立问题只用于查询编码与关键词检索，**回答提示仍使用原始问题**；改写发生在重检索循环之外，
-版本变化触发的重检索复用同一个独立问题，不重复付费调用。改写返回它实际入参的历史轮次，
+版本变化触发的重检索复用同一个独立问题，不重复付费调用。改写**固定使用服务端默认模型且关闭思考**
+（成本受控），回答则使用请求选择的模型与思考选项；每轮实际选项随 ``query_run`` 持久化，不被
+后续选择改写。思考模式的 ``reasoning_content`` 不进入回答也不展示给用户，provider 的
+``completion_tokens`` 已包含 reasoning token，不重复计算；思考与回答争夺同一个 ``max_tokens``，
+被推理耗尽时如实落为 ``TRUNCATED`` 失败，不自动抬高预算。改写返回它实际入参的历史轮次，
 调用方在**每次检索前**与**交付前**都重新鉴权这些来源：任一失效立即以
 ``ConversationSourcesChanged`` 整轮失败，绝不退化继续用派生问题（已发生的 ``qa_rewrite``
 账本保留，但不落派生问题、不发编码/FTS/回答）。
@@ -73,9 +77,11 @@ from rag_backend.generation.deepseek_client import (
     GenerationOutcome,
 )
 from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
     ChatMessage,
     PromptEncodingError,
     PromptTokenEstimator,
+    ThinkingChoice,
 )
 from rag_backend.generation.query_rewrite import (
     REWRITE_STAGE,
@@ -377,9 +383,15 @@ async def answer_question(
     estimator: PromptTokenEstimator,
     generator: AnswerGenerator,
     budget: ContextBudget,
-    model: str,
+    answer_model: str,
+    rewrite_model: str,
+    thinking: ThinkingChoice = NON_THINKING,
 ) -> TurnResult:
-    """执行一次追问；失败时抛 :mod:`rag_backend.conversation.errors` 内的领域错误。"""
+    """执行一次追问；失败时抛 :mod:`rag_backend.conversation.errors` 内的领域错误。
+
+    ``answer_model`` 是本轮回答请求的模型（服务端白名单内）；``rewrite_model`` 是追问改写固定
+    使用的模型；``thinking`` 是本轮回答的思考选项，只作用于回答，改写始终非思考。
+    """
 
     conversation = await repository.load_conversation(
         conversation_id=conversation_id, owner_id=user_id, organization_id=organization_id
@@ -407,7 +419,7 @@ async def answer_question(
             question=question,
             estimator=estimator,
             budget=budget,
-            model=model,
+            model=rewrite_model,
         )
 
     # 历史权限不复用固定快照：每一轮模型调用前都重新解析（见循环内 ``_load_authorized_history``）。
@@ -456,6 +468,7 @@ async def answer_question(
             history=history,
             estimator=estimator,
             budget=budget,
+            thinking=thinking,
         )
         degraded_stages = _degraded_stages(plan, retried=retried)
 
@@ -482,15 +495,16 @@ async def answer_question(
                 answer_text=REFUSAL_ANSWER,
                 drafts=(),
                 degraded_stages=degraded_stages,
+                generation_options=_generation_options(answer_model, thinking),
             )
 
         evidence_by_id = {
             f"E{index}": row for index, row in enumerate(evidence_rows, start=1)
         }
-        outcome = await _generate(generator, plan, budget)
+        outcome = await _generate(generator, plan, budget, model=answer_model, thinking=thinking)
         usage_id = uuid.uuid4()
         await repository.insert_llm_usage(
-            _usage_record(outcome, usage_id, model, stage=ANSWER_STAGE)
+            _usage_record(outcome, usage_id, answer_model, stage=ANSWER_STAGE)
         )
         await repository.commit()
 
@@ -541,6 +555,7 @@ async def answer_question(
                 answer_text=REFUSAL_ANSWER,
                 drafts=(),
                 degraded_stages=degraded_stages,
+                generation_options=_generation_options(answer_model, thinking),
             )
 
         drafts = _citation_drafts(parsed, evidence_by_id)
@@ -562,6 +577,7 @@ async def answer_question(
             drafts=drafts,
             follow_up=parsed.follow_up,
             degraded_stages=degraded_stages,
+            generation_options=_generation_options(answer_model, thinking),
         )
 
 
@@ -796,6 +812,7 @@ def _plan_context(
     history: Sequence[HistoryTurn],
     estimator: PromptTokenEstimator,
     budget: ContextBudget,
+    thinking: ThinkingChoice,
 ) -> ChatContextPlan:
     """本地装配提示；系统提示/当前问题超预算时映射为静态领域错误。"""
 
@@ -813,6 +830,7 @@ def _plan_context(
             evidence=evidence,
             history=history,
             budget=budget,
+            thinking=thinking,
         )
     except MandatoryContextExceedsBudgetError as error:
         raise ConversationQuestionTooLong("问题与系统提示超出输入预算") from error
@@ -842,7 +860,11 @@ async def _rewrite_standalone_question(
     )
     messages: Sequence[ChatMessage] = plan.messages
     outcome = await run_in_threadpool(
-        generator.generate, messages, max_output_tokens=plan.output_token_budget
+        generator.generate,
+        messages,
+        model=model,
+        max_output_tokens=plan.output_token_budget,
+        thinking=NON_THINKING,
     )
     usage_id = uuid.uuid4()
     await repository.insert_llm_usage(
@@ -881,14 +903,33 @@ def _plan_rewrite(
 
 
 async def _generate(
-    generator: AnswerGenerator, plan: ChatContextPlan, budget: ContextBudget
+    generator: AnswerGenerator,
+    plan: ChatContextPlan,
+    budget: ContextBudget,
+    *,
+    model: str,
+    thinking: ThinkingChoice,
 ) -> GenerationOutcome:
     """在线程池内执行同步生成客户端；期间不持有数据库连接。"""
 
     messages: Sequence[ChatMessage] = plan.messages
     return await run_in_threadpool(
-        generator.generate, messages, max_output_tokens=budget.output_token_budget
+        generator.generate,
+        messages,
+        model=model,
+        max_output_tokens=budget.output_token_budget,
+        thinking=thinking,
     )
+
+
+def _generation_options(model: str, thinking: ThinkingChoice) -> dict[str, Any]:
+    """本轮实际生成选项快照；强度只在开启思考时记录，关闭时为 null。"""
+
+    return {
+        "model": model,
+        "thinking": "enabled" if thinking.enabled else "disabled",
+        "reasoningEffort": thinking.effective_effort,
+    }
 
 
 def _usage_record(
@@ -967,6 +1008,7 @@ async def _persist_turn(
     drafts: Sequence[_CitationDraft],
     degraded_stages: Sequence[str] = (),
     follow_up: str | None = None,
+    generation_options: dict[str, Any],
 ) -> TurnResult:
     """在单个短事务内写入运行事实、两条消息与引用快照。
 
@@ -1013,6 +1055,7 @@ async def _persist_turn(
             llm_usage_id=usage_id,
             provider_prompt_tokens=provider_prompt,
             provider_completion_tokens=provider_completion,
+            generation_options=generation_options,
         )
     )
     user_message_id = uuid.uuid4()

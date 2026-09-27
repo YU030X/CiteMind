@@ -38,17 +38,16 @@ from rag_backend.schemas.auth import (
     MeOverviewResponse,
     MeResponse,
     UserSummary,
+    generation_capability,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["auth"])
 
 
 def _generation_capability(settings: Settings) -> GenerationCapability:
-    """只读地叙述生成侧事实：配置的模型名与显式关闭的 thinking；不含密钥或端点。"""
+    """只读地叙述生成侧事实：白名单模型与思考选项，以及服务端默认组合；不含密钥或端点。"""
 
-    return GenerationCapability(
-        model=settings.llm_model, thinking="disabled", enabled=settings.llm_enabled
-    )
+    return generation_capability(settings.llm_enabled, settings.llm_model)
 
 
 def _user_summary(user: UserAccount) -> UserSummary:

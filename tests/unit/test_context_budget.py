@@ -37,10 +37,12 @@ from rag_backend.generation.context_budget import (
     render_evidence_block,
 )
 from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
     PROMPT_ENCODING_CONTRACT,
     TOKEN_COUNT_SOURCE,
     ChatMessage,
     PromptEncodingError,
+    ThinkingChoice,
 )
 
 SYSTEM_PROMPT = "你是知识库助手。"
@@ -54,16 +56,22 @@ class _FakeEstimator:
 
     def __init__(self) -> None:
         self.seen: list[tuple[ChatMessage, ...]] = []
+        self.seen_thinking: list[ThinkingChoice] = []
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
         self.seen.append(tuple(messages))
+        self.seen_thinking.append(thinking)
         return sum(1 + len(message.content) for message in messages)
 
 
 class _RejectingEstimator:
     """模拟本地渲染器：正文含结构 token 时抛具名 ``PromptEncodingError``，否则口径同假估算器。"""
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
         for message in messages:
             if UNSUPPORTED_MARKER in message.content:
                 raise PromptEncodingError("本地渲染拒绝")
@@ -637,6 +645,26 @@ def test_budget_from_settings_uses_configured_budgets() -> None:
     assert budget.max_history_turns == DEFAULT_MAX_HISTORY_TURNS
     assert budget.max_evidence == DEFAULT_MAX_EVIDENCE
     assert budget.max_evidence_per_document == DEFAULT_MAX_EVIDENCE_PER_DOCUMENT
+
+
+def test_thinking_choice_is_threaded_to_every_estimate() -> None:
+    """思考选项必须传入每次估算：思考模式多出强度说明与 ``<think>``，不能按非思考口径估算。"""
+
+    estimator = _FakeEstimator()
+    history = [HistoryTurn(sequence=1, question="旧问", answer="旧答", authorized=True)]
+    plan_chat_context(
+        system_prompt=SYSTEM_PROMPT,
+        question=QUESTION,
+        estimator=estimator,
+        evidence=(_evidence("E1"),),
+        history=history,
+        thinking=ThinkingChoice(enabled=True, effort="max"),
+    )
+
+    assert estimator.seen_thinking
+    assert all(
+        choice.enabled and choice.effort == "max" for choice in estimator.seen_thinking
+    )
 
 
 def test_budget_from_settings_rejects_non_positive_configuration() -> None:

@@ -75,6 +75,9 @@ class QueryRun(CreatedAtMixin, Base):
             name="provider_completion_tokens_non_negative",
         ),
         CheckConstraint("btrim(question) <> ''", name="question_non_empty"),
+        CheckConstraint(
+            "jsonb_typeof(generation_options) = 'object'", name="generation_options_object"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -101,6 +104,8 @@ class QueryRun(CreatedAtMixin, Base):
     )
     provider_prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     provider_completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 本轮实际使用的生成选项快照（模型/思考开关/强度）；只写一次，后续选择不改写历史。
+    generation_options: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
 
 class Message(CreatedAtMixin, Base):

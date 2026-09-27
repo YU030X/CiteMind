@@ -25,9 +25,12 @@ from rag_backend.generation.deepseek_prompt import (
     SCAFFOLD_SENTINEL_TOKENS,
     SYSTEM_SP_TOKEN,
     THINKING_END_TOKEN,
+    THINKING_START_TOKEN,
     USER_SP_TOKEN,
     ChatMessage,
     PromptEncodingError,
+    ThinkingChoice,
+    reasoning_effort_preamble,
     render_chat_prompt,
 )
 from rag_backend.generation.deepseek_token_counting import (
@@ -64,11 +67,12 @@ def _fixture_tokenizer() -> Tokenizer:
         "alpha": 6,
         "beta": 7,
         SYSTEM_SP_TOKEN: 8,
+        THINKING_START_TOKEN: 9,
     }
     tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
     pattern = "|".join(
         re.escape(token)
-        for token in (*SCAFFOLD_SENTINEL_TOKENS, THINKING_END_TOKEN)
+        for token in (*SCAFFOLD_SENTINEL_TOKENS, THINKING_END_TOKEN, THINKING_START_TOKEN)
     )
     tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
         [
@@ -160,6 +164,58 @@ def test_assistant_turn_owns_its_prefix_and_terminator() -> None:
     )
 
 
+def test_render_chat_prompt_thinking_variant_matches_frozen_literal() -> None:
+    """思考模式逐字对照 recipe：强度说明前缀、空思考块与 ``<think>`` 生成前缀。"""
+
+    messages = (
+        ChatMessage(role="system", content="你是知识库助手。"),
+        ChatMessage(role="user", content="第一问"),
+        ChatMessage(role="assistant", content="第一答"),
+        ChatMessage(role="user", content="第二问"),
+    )
+    preamble = (
+        "Reasoning Effort: 75 "
+        "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    )
+    expected = (
+        f"{BOS_TOKEN}{SYSTEM_SP_TOKEN}{preamble}你是知识库助手。"
+        f"{USER_SP_TOKEN}第一问"
+        f"{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}{THINKING_END_TOKEN}第一答{EOS_TOKEN}"
+        f"{USER_SP_TOKEN}第二问{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+    )
+
+    assert render_chat_prompt(messages, thinking=ThinkingChoice(enabled=True)) == expected
+    assert render_chat_prompt(
+        messages, thinking=ThinkingChoice(enabled=True, effort="high")
+    ) == expected
+    # 关闭思考与非思考渲染逐字一致，与 v2 保持兼容。
+    assert render_chat_prompt(
+        messages, thinking=ThinkingChoice(enabled=False)
+    ) == render_chat_prompt(messages)
+
+
+def test_thinking_effort_scores_follow_recipe_variant() -> None:
+    assert reasoning_effort_preamble(ThinkingChoice(enabled=True, effort="low")).startswith(
+        "Reasoning Effort: 50 "
+    )
+    assert reasoning_effort_preamble(ThinkingChoice(enabled=True, effort="max")).startswith(
+        "Reasoning Effort: 100 "
+    )
+    # 未指定强度沿用官方默认 high（recipe 对 None 也按 75 计）。
+    assert reasoning_effort_preamble(ThinkingChoice(enabled=True)).startswith(
+        "Reasoning Effort: 75 "
+    )
+    with pytest.raises(ValueError):
+        reasoning_effort_preamble(ThinkingChoice(enabled=False))
+
+
+def test_thinking_choice_rejects_disabled_effort_and_unknown_values() -> None:
+    with pytest.raises(ValueError):
+        ThinkingChoice(enabled=False, effort="high")
+    with pytest.raises(ValueError):
+        ThinkingChoice(enabled=True, effort="ultra")  # type: ignore[arg-type]
+
+
 def test_render_chat_prompt_without_system_message() -> None:
     messages = (ChatMessage(role="user", content="只有问题"),)
 
@@ -227,7 +283,7 @@ def test_render_allows_thinking_end_token_in_content() -> None:
 
 
 def test_prompt_encoding_contract_declares_recipe_reference_revision() -> None:
-    assert deepseek_prompt.PROMPT_ENCODING_CONTRACT == "deepseek-v41-chat-v2"
+    assert deepseek_prompt.PROMPT_ENCODING_CONTRACT == "deepseek-v41-chat-v3"
     assert deepseek_prompt.PROMPT_ENCODING_REFERENCE_REPOSITORY == "deepseek-ai/deepseek-recipe"
     assert (
         deepseek_prompt.PROMPT_ENCODING_REFERENCE_REVISION
@@ -411,8 +467,16 @@ def test_counter_counts_rendered_prompt_components(
     # BOS + <｜System｜> + system + <｜User｜> + user + <｜Assistant｜> + </think>
     assert counter.count_prompt_tokens(render_chat_prompt(messages)) == 7
     assert counter.estimate_chat_tokens(messages) == 7
+    # 思考模式多出强度说明与 <think>；计数必须按实际渲染变体，不复用非思考口径。
+    thinking_prompt = render_chat_prompt(
+        messages, thinking=deepseek_prompt.ThinkingChoice(enabled=True)
+    )
+    assert counter.estimate_chat_tokens(
+        messages, thinking=deepseek_prompt.ThinkingChoice(enabled=True)
+    ) == counter.count_prompt_tokens(thinking_prompt)
+    assert counter.count_prompt_tokens(thinking_prompt) > 7
     assert counter.count_prompt_tokens("") == 0
-    assert counter.prompt_encoding_contract == "deepseek-v41-chat-v2"
+    assert counter.prompt_encoding_contract == "deepseek-v41-chat-v3"
 
 
 def test_counter_disables_special_token_insertion(
@@ -494,6 +558,8 @@ def test_real_asset_matches_pinned_digest_and_tokenizes_scaffold_tokens() -> Non
     verify_tokenizer_directory(directory)
     counter = LocalPromptTokenCounter(directory)
 
+    # 真实产物只对已在 v2 契约验证过的标记断言单 token；``<think>``（v3 新增）是否单 token
+    # 未经本仓库对真实产物的实测，不在这里做未验证断言。
     for token in (*SCAFFOLD_SENTINEL_TOKENS, THINKING_END_TOKEN):
         assert counter.count_prompt_tokens(token) == 1, token
     assert counter.estimate_chat_tokens((ChatMessage(role="user", content="你好"),)) >= 5

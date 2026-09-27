@@ -12,6 +12,8 @@ from pydantic_settings.sources import EnvSettingsSource
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
+from rag_backend.generation.capabilities import SUPPORTED_MODEL_IDS
+
 # 与 deploy/compose/compose.yml 默认暴露的本机端口一致；用户名是运行时 api 角色，
 # 密码是开发占位值，生产环境会被下面的校验拒绝。
 DEFAULT_DATABASE_URL = "postgresql+psycopg://citemind_api:citemind@127.0.0.1:55432/citemind"
@@ -300,6 +302,9 @@ class Settings(BaseSettings):
             self.llm_api_key = None
         if not self.llm_model.strip():
             raise ValueError("llm_model 不能为空字符串")
+        if self.llm_model not in SUPPORTED_MODEL_IDS:
+            # 未经验证 tokenizer/渲染契约的模型不得作为服务端默认：启动期即可独立判断。
+            raise ValueError("llm_model 必须属于服务端已验证的模型白名单")
         if self.llm_input_token_budget <= 0:
             raise ValueError("llm_input_token_budget 必须为正数")
         if self.llm_output_token_budget <= 0:

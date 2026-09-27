@@ -182,13 +182,14 @@ _INSERT_QUERY_RUN_SQL = text(
         id, conversation_id, question, standalone_question, request_id,
         scope_snapshot, input_token_budget, output_token_budget,
         estimated_input_tokens, evidence_count, status, insufficient_evidence,
-        degraded_stages, llm_usage_id, provider_prompt_tokens, provider_completion_tokens
+        degraded_stages, llm_usage_id, provider_prompt_tokens, provider_completion_tokens,
+        generation_options
     ) VALUES (
         :id, :conversation_id, :question, :standalone_question, :request_id,
         CAST(:scope_snapshot AS jsonb), :input_token_budget, :output_token_budget,
         :estimated_input_tokens, :evidence_count, :status, :insufficient_evidence,
         CAST(:degraded_stages AS jsonb), :llm_usage_id, :provider_prompt_tokens,
-        :provider_completion_tokens
+        :provider_completion_tokens, CAST(:generation_options AS jsonb)
     )
     """
 )
@@ -323,6 +324,8 @@ class QueryRunRecord:
     llm_usage_id: uuid.UUID | None
     provider_prompt_tokens: int | None
     provider_completion_tokens: int | None
+    # 本轮实际使用的生成选项（模型/思考开关/强度）；每轮独立快照，不被后续选择改写。
+    generation_options: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -665,6 +668,7 @@ class SqlConversationRepository:
                 "llm_usage_id": record.llm_usage_id,
                 "provider_prompt_tokens": record.provider_prompt_tokens,
                 "provider_completion_tokens": record.provider_completion_tokens,
+                "generation_options": json.dumps(record.generation_options),
             },
         )
 

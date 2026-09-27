@@ -79,7 +79,7 @@
 
 ## 已知未接通项
 
-- **模型与思考控件是只读合同**：`GET /me`/登录响应的 `generation` 只读返回服务端配置的模型名与固定 `thinking=disabled`（`enabled` 反映真实生成开关）；`POST /conversations/{id}/messages` 的请求体只有 `question` 与 `requestId`，输入区两个选择器始终禁用并展示服务端实际值，不向服务端传值，也不提供模型路由或思考强度切换。
+- **模型与思考控件受服务端白名单约束**：`GET /me`/登录响应的 `generation` 只读列出服务端已验证的模型与各自思考选项（当前仅 `deepseek-flash`，强度 `low`/`high`/`max`），并给出默认组合（默认模型 + 关闭思考）。`POST /conversations/{id}/messages` 请求体在 `question`/`requestId` 之外可选携带 `model`/`thinking`/`reasoningEffort`，前端选择器只能提交白名单内枚举，不提供任意模型名、endpoint 或强度别名；未验证模型返回 422 `GENERATION_OPTION_UNSUPPORTED`，关闭思考时提交强度返回 422。每轮选项记录在 `query_run.generation_options`，不随后续选择改写；思考模式的 CoT 不展示。
 - **引用没有内联标记**：服务端保存的助手消息正文是纯文本，引用只作为 `citations` 列表返回（`displayLabel` 形如 `E1`）。前端以下方引用按钮为唯一入口；`markdown-it`（`html: false`）的 `[n]` 标记映射仍保留，但当前没有生产者会生成它。
 - **拒答与降级未在界面上单独标注**：`AnswerResponse` 里有 `insufficientEvidence` 与 `degradedStages`，但 `GET /conversations/{id}/messages` 的消息对象没有这两个字段，历史刷新后无法还原，因此界面只展示服务端写入的正文。
 - **文档列表缺少部分列**：后端不返回文件大小与上传者，表格因此没有这两列。

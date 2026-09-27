@@ -20,6 +20,7 @@ from rag_backend.api.errors import (
     CODE_CONVERSATION_SOURCES_CHANGED,
     CODE_GENERATION_FAILED,
     CODE_GENERATION_INVALID_RESPONSE,
+    CODE_GENERATION_OPTION_UNSUPPORTED,
     CODE_KNOWLEDGE_BASE_NOT_FOUND,
     CODE_LLM_UNAVAILABLE,
     ApiError,
@@ -62,13 +63,18 @@ from rag_backend.conversation.service import (
     update_conversation,
 )
 from rag_backend.database import get_database_session
+from rag_backend.generation.capabilities import ReasoningEffort, is_supported_model
 from rag_backend.generation.context_budget import ContextBudget
 from rag_backend.generation.deepseek_client import (
     AnswerGenerator,
     DeepSeekAnswerGenerator,
     GenerationConfigError,
 )
-from rag_backend.generation.deepseek_prompt import PromptTokenEstimator
+from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
+    PromptTokenEstimator,
+    ThinkingChoice,
+)
 from rag_backend.generation.deepseek_token_counting import (
     DeepSeekTokenizerError,
     LocalPromptTokenCounter,
@@ -96,6 +102,7 @@ from rag_backend.schemas.conversation import (
     ConversationSummary,
     CreateConversationRequest,
     CreateConversationResponse,
+    ThinkingRequest,
     UpdateConversationRequest,
 )
 
@@ -104,6 +111,7 @@ router = APIRouter(prefix="/api/v1", tags=["conversations"])
 LLM_UNAVAILABLE_MESSAGE = "问答生成服务暂时不可用"
 GENERATION_FAILED_MESSAGE = "生成服务暂时不可用"
 GENERATION_INVALID_MESSAGE = "生成结果不合法"
+GENERATION_OPTION_UNSUPPORTED_MESSAGE = "不支持的模型或思考选项"
 SOURCES_CHANGED_MESSAGE = "资料更新中，请重试"
 CONVERSATION_NOT_FOUND_MESSAGE = "会话不存在"
 CITATION_NOT_FOUND_MESSAGE = "引用不存在"
@@ -345,6 +353,20 @@ async def list_conversation_messages(
     )
 
 
+def _resolve_thinking(
+    thinking: ThinkingRequest | None, reasoning_effort: ReasoningEffort | None
+) -> ThinkingChoice:
+    """把请求开关与强度映射为渲染/客户端选项；非法组合已在 schema 层拒绝。
+
+    省略 ``thinking`` 或显式 ``disabled`` 都归一为非思考；开启时未指定强度则沿用官方默认
+    ``high``（由 :class:`ThinkingChoice` 表达），不在这里另造默认值。
+    """
+
+    if thinking is None or thinking.type == "disabled":
+        return NON_THINKING
+    return ThinkingChoice(enabled=True, effort=reasoning_effort)
+
+
 @router.post(
     "/conversations/{conversation_id}/messages", response_model=AnswerResponse
 )
@@ -366,6 +388,13 @@ async def ask_question(
     settings: Settings = request.app.state.settings
     enforce_allowed_origin(request, settings)
     budget = ContextBudget.from_settings(settings)
+    # 模型只接受服务端已验证白名单：未验证的模型（如 deepseek-v4-pro）在此静态拒绝。
+    answer_model = settings.llm_model if payload.model is None else payload.model
+    if not is_supported_model(answer_model):
+        raise ApiError(
+            422, CODE_GENERATION_OPTION_UNSUPPORTED, GENERATION_OPTION_UNSUPPORTED_MESSAGE
+        )
+    thinking = _resolve_thinking(payload.thinking, payload.reasoning_effort)
 
     async def retrieve(
         *, kb_ids: Sequence[uuid.UUID], query: str
@@ -395,7 +424,9 @@ async def ask_question(
             estimator=estimator,
             generator=generator,
             budget=budget,
-            model=settings.llm_model,
+            answer_model=answer_model,
+            rewrite_model=settings.llm_model,
+            thinking=thinking,
         )
     except ConversationNotFound as error:
         raise ApiError(404, CODE_CONVERSATION_NOT_FOUND, CONVERSATION_NOT_FOUND_MESSAGE) from error

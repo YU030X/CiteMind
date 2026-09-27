@@ -27,6 +27,7 @@ import ConversationList from "@/components/ConversationList.vue";
 import KnowledgeBaseSelect from "@/components/KnowledgeBaseSelect.vue";
 import { kbRoleLabel, formatTime } from "@/labels";
 import { renderMarkdown } from "@/lib/markdown";
+import type { ReasoningEffort } from "@/api/types";
 import {
   activeKnowledgeBase,
   ask,
@@ -34,6 +35,9 @@ import {
   conversationsForActiveKb,
   openCitation,
   openConversation,
+  selectGenerationEffort,
+  selectGenerationModel,
+  selectGenerationThinking,
   startConversation,
   state,
 } from "@/state/store";
@@ -44,19 +48,48 @@ const citationOpen = ref(false);
 const scroller = ref<InstanceType<typeof ScrollArea> | null>(null);
 
 /**
- * 生成侧能力：模型与 thinking 都固定在服务端（受限客户端显式 `thinking: {"type": "disabled"}`），
- * `GET /me`/登录响应只读返回实际模型与 thinking 关闭；`POST /conversations/{id}/messages` 的请求体
- * 只有 `question` 与 `requestId`，不接受模型或思考参数。两个控件只展示服务端实际值并始终禁用，
- * 不向服务端传值，也不假装可切换。
+ * 生成侧能力：模型与思考选项都来自服务端白名单（`GET /me`/登录响应的 `generation`），
+ * 前端只展示并提交白名单内的枚举，不造任意模型名、端点或强度别名。默认组合沿用服务端事实：
+ * 服务端默认模型 + 关闭思考，与旧请求体兼容。
  */
-const FIXED_THINKING_LABEL = "关闭";
-const generationModel = computed(() => state.generation?.model ?? "—");
+const THINKING_LABELS: Record<"enabled" | "disabled", string> = {
+  disabled: "关闭",
+  enabled: "开启",
+};
+const EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  low: "低",
+  high: "中",
+  max: "高",
+};
+const generationModels = computed(() => state.generation?.models ?? []);
+const activeModel = computed(
+  () => generationModels.value.find((item) => item.id === state.generationModel) ?? null,
+);
+const thinkingSupported = computed(() => activeModel.value?.thinking.supported === true);
+const effortOptions = computed(() => activeModel.value?.thinking.efforts ?? []);
+const generationControlsDisabled = computed(
+  () => state.generation === null || !state.generation.enabled || state.asking,
+);
 const capabilityHint = computed(() => {
   const generation = state.generation;
-  if (generation === null) return "生成能力尚未从服务端读到，控件只读展示。";
+  if (generation === null) return "生成能力尚未从服务端读到，选择器暂不可用。";
   const disabled = generation.enabled ? "" : "；当前服务端未开启生成，提问会返回 503";
-  return `回答由服务端生成：模型 ${generation.model}、thinking 固定关闭，前端只读展示、不可切换${disabled}。`;
+  return `模型与思考选项由服务端白名单决定；思考与回答共用同一个输出上限，被推理耗尽时服务端会如实返回截断失败${disabled}。`;
 });
+
+function onModelChange(value: unknown): void {
+  if (typeof value === "string") selectGenerationModel(value);
+}
+
+function onThinkingChange(value: unknown): void {
+  if (value === "enabled" || value === "disabled") selectGenerationThinking(value);
+}
+
+function onEffortChange(value: unknown): void {
+  if (value === "low" || value === "high" || value === "max") {
+    selectGenerationEffort(value);
+  }
+}
 
 const conversations = computed(() => conversationsForActiveKb());
 const activeConversation = computed(
@@ -331,31 +364,67 @@ function cite(citationId: string): void {
               </p>
 
               <div class="ml-auto flex shrink-0 items-center gap-1.5">
-                <Select :model-value="generationModel" disabled>
+                <Select
+                  :model-value="state.generationModel"
+                  :disabled="generationControlsDisabled || generationModels.length === 0"
+                  @update:model-value="onModelChange"
+                >
                   <SelectTrigger
                     size="sm"
                     class="w-36"
-                    aria-label="模型（服务端固定，不可切换）"
+                    aria-label="模型"
                     :title="capabilityHint"
                   >
-                    <SelectValue />
+                    <SelectValue placeholder="模型" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem :value="generationModel">{{ generationModel }}</SelectItem>
+                    <SelectItem
+                      v-for="model in generationModels"
+                      :key="model.id"
+                      :value="model.id"
+                    >
+                      {{ model.id }}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
 
-                <Select :model-value="FIXED_THINKING_LABEL" disabled>
+                <Select
+                  :model-value="state.generationThinking"
+                  :disabled="generationControlsDisabled || !thinkingSupported"
+                  @update:model-value="onThinkingChange"
+                >
                   <SelectTrigger
                     size="sm"
                     class="w-20"
-                    aria-label="思考（服务端固定关闭，不可切换）"
+                    aria-label="思考"
                     :title="capabilityHint"
                   >
-                    <SelectValue />
+                    <SelectValue placeholder="思考" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem :value="FIXED_THINKING_LABEL">{{ FIXED_THINKING_LABEL }}</SelectItem>
+                    <SelectItem value="disabled">{{ THINKING_LABELS.disabled }}</SelectItem>
+                    <SelectItem value="enabled">{{ THINKING_LABELS.enabled }}</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                <Select
+                  v-if="state.generationThinking === 'enabled'"
+                  :model-value="state.generationEffort"
+                  :disabled="generationControlsDisabled"
+                  @update:model-value="onEffortChange"
+                >
+                  <SelectTrigger
+                    size="sm"
+                    class="w-20"
+                    aria-label="思考强度"
+                    :title="capabilityHint"
+                  >
+                    <SelectValue placeholder="强度" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="effort in effortOptions" :key="effort" :value="effort">
+                      {{ EFFORT_LABELS[effort] }}
+                    </SelectItem>
                   </SelectContent>
                 </Select>
 

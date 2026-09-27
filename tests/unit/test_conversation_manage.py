@@ -82,7 +82,9 @@ class _FakeEmbedder:
 
 
 class _FakeEstimator:
-    def estimate_chat_tokens(self, messages: Any) -> int:
+    def estimate_chat_tokens(
+        self, messages: Any, *, thinking: Any = None
+    ) -> int:
         return 1
 
 
@@ -90,7 +92,14 @@ class _UnusedGenerator:
     def __init__(self) -> None:
         self.calls = 0
 
-    def generate(self, messages: Any, *, max_output_tokens: int) -> Any:
+    def generate(
+        self,
+        messages: Any,
+        *,
+        model: str,
+        max_output_tokens: int,
+        thinking: Any = None,
+    ) -> Any:
         self.calls += 1
         raise AssertionError("已删除会话不应调用生成模型")
 

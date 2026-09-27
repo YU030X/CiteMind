@@ -16,7 +16,7 @@ from rag_backend.generation.context_budget import (
     HistoryTurn,
     MandatoryContextExceedsBudgetError,
 )
-from rag_backend.generation.deepseek_prompt import ChatMessage
+from rag_backend.generation.deepseek_prompt import NON_THINKING, ChatMessage, ThinkingChoice
 from rag_backend.generation.query_rewrite import (
     MAX_STANDALONE_QUESTION_CHARS,
     REWRITE_HISTORY_HEADER,
@@ -37,7 +37,9 @@ class RecordingEstimator:
     def __init__(self) -> None:
         self.contents: list[str] = []
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
         self.contents.extend(message.content for message in messages)
         return sum(1 + len(message.content) for message in messages)
 

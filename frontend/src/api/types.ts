@@ -31,11 +31,25 @@ export interface MeResponse {
   generation: GenerationCapability;
 }
 
-/** 只读生成能力事实：服务端固定模型与显式关闭的 thinking；不提供切换入口。 */
+/** 只读生成能力事实：服务端白名单内的模型与各自的思考选项，以及默认组合。 */
+export type ReasoningEffort = "low" | "high" | "max";
+
+export interface ThinkingCapability {
+  supported: boolean;
+  efforts: ReasoningEffort[];
+  defaultEffort: ReasoningEffort | null;
+}
+
+export interface ModelCapability {
+  id: string;
+  thinking: ThinkingCapability;
+}
+
 export interface GenerationCapability {
-  model: string;
-  thinking: "disabled";
   enabled: boolean;
+  defaultModel: string;
+  defaultThinking: "enabled" | "disabled";
+  models: ModelCapability[];
 }
 
 export interface MeOverviewResponse extends MeResponse {
@@ -137,6 +151,13 @@ export interface ConversationMessage {
 export interface ConversationMessagesResponse {
   conversationId: string;
   messages: ConversationMessage[];
+}
+
+/** 追问请求可选的模型与思考选项；服务端只接受白名单枚举，未知组合返回 422。 */
+export interface AskGenerationOptions {
+  model: string;
+  thinking: "enabled" | "disabled";
+  reasoningEffort?: ReasoningEffort;
 }
 
 export interface AnswerUsage {

@@ -1,8 +1,9 @@
 """问答会话接口的请求/响应 schema（外部字段 camelCase）。
 
-请求只提交问题与请求关联 ID 以及创建会话时的 ``kbIds``；组织、所有者、会话范围与引用
-映射都由服务端确定。响应中的引用只含服务端从已保存 chunk 映射出的 locator 与短引文，
-不含任何模型自造的 URL、页码或数据库 ID。
+请求只提交问题与请求关联 ID 以及可选的模型/思考选项；组织、所有者、会话范围与引用映射都由
+服务端确定。请求字段使用严格枚举并禁止未知字段，客户端不能提交任意模型名、端点或强度别名。
+响应中的引用只含服务端从已保存 chunk 映射出的 locator 与短引文，不含任何模型自造的 URL、
+页码或数据库 ID，也不包含思考模式返回的 chain of thought。
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from rag_backend.schemas.base import CamelModel
+from rag_backend.generation.capabilities import ReasoningEffort
+from rag_backend.schemas.base import CamelModel, StrictCamelModel
 
 # 问题本身的字符上限；输入预算由本地 tokenizer 在装配阶段单独强制。
 MAX_QUESTION_CHARS = 8000
@@ -109,14 +111,26 @@ class ConversationMessagesResponse(CamelModel):
     messages: list[ConversationMessageResponse]
 
 
-class AskQuestionRequest(CamelModel):
+class ThinkingRequest(StrictCamelModel):
+    """``thinking`` 开关；取值与官方文档一致，不接受强度别名、额外字段或未知取值。"""
+
+    type: Literal["enabled", "disabled"]
+
+
+class AskQuestionRequest(StrictCamelModel):
     """``POST /conversations/{id}/messages`` 的输入。
 
     ``requestId`` 只作为调用方关联标识记录在 ``query_run``；本切片不实现按它去重。
+    ``model``/``thinking``/``reasoningEffort`` 都可省略：省略时沿用服务端默认模型并关闭思考，
+    与旧请求体逐字兼容。``model`` 必须是服务端白名单内的已验证模型，``reasoningEffort`` 只在
+    ``thinking.type=enabled`` 时才有意义。
     """
 
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
     request_id: str | None = Field(default=None, max_length=MAX_REQUEST_ID_CHARS)
+    model: str | None = None
+    thinking: ThinkingRequest | None = None
+    reasoning_effort: ReasoningEffort | None = None
 
     @field_validator("question")
     @classmethod
@@ -124,6 +138,14 @@ class AskQuestionRequest(CamelModel):
         if not value.strip():
             raise ValueError("问题不能为空或纯空白")
         return value
+
+    @model_validator(mode="after")
+    def _require_thinking_for_effort(self) -> AskQuestionRequest:
+        if self.reasoning_effort is not None and (
+            self.thinking is None or self.thinking.type != "enabled"
+        ):
+            raise ValueError("reasoningEffort 需要 thinking.type=enabled")
+        return self
 
 
 class AnswerUsageResponse(CamelModel):
@@ -164,5 +186,6 @@ __all__ = [
     "ConversationSummary",
     "CreateConversationRequest",
     "CreateConversationResponse",
+    "ThinkingRequest",
     "UpdateConversationRequest",
 ]

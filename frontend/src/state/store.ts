@@ -12,12 +12,15 @@ import { reactive } from "vue";
 import { ApiError, describeError, setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import { api } from "../api/endpoints";
 import type {
+  AskGenerationOptions,
   Citation,
   ConversationMessage,
   ConversationSummary,
   DocumentSummary,
   GenerationCapability,
   KnowledgeBaseSummary,
+  ModelCapability,
+  ReasoningEffort,
   UserSummary,
 } from "../api/types";
 import { isTerminalJobStatus } from "../labels";
@@ -35,8 +38,12 @@ export const state = reactive({
   sessionExpiredNotice: "",
 
   session: null as Session | null,
-  // 只读的生成能力事实（固定模型与关闭的 thinking），来自登录/`GET /me`。
+  // 只读的生成能力事实（白名单模型与思考选项），来自登录/`GET /me`。
   generation: null as GenerationCapability | null,
+  // 当前选择的模型与思考选项；只在内存里，登录后按服务端默认初始化。
+  generationModel: "",
+  generationThinking: "disabled" as "enabled" | "disabled",
+  generationEffort: "high" as ReasoningEffort,
   loggingIn: false,
   loginError: "",
   loggingOut: false,
@@ -126,6 +133,9 @@ function resetSession(): void {
   resetConversationSelection();
   state.session = null;
   state.generation = null;
+  state.generationModel = "";
+  state.generationThinking = "disabled";
+  state.generationEffort = "high";
   setCsrfToken(null);
   state.knowledgeBases = [];
   state.knowledgeBasesLoading = false;
@@ -157,6 +167,49 @@ function applySession(
   state.session = { user, csrfToken };
   setCsrfToken(csrfToken);
   state.generation = generation;
+  applyGenerationDefaults(generation);
+}
+
+/** 用服务端默认组合初始化选择器；模型或默认强度缺失时退回已知安全值。 */
+function applyGenerationDefaults(generation: GenerationCapability): void {
+  state.generationModel = generation.defaultModel;
+  state.generationThinking = generation.defaultThinking;
+  const model = generation.models.find((item) => item.id === generation.defaultModel);
+  state.generationEffort = model?.thinking.defaultEffort ?? "high";
+}
+
+/** 当前选择对应的能力事实；模型不在白名单内时为 null，UI 据此只读展示。 */
+export function activeModelCapability(): ModelCapability | null {
+  const capability = state.generation;
+  if (capability === null) return null;
+  return capability.models.find((item) => item.id === state.generationModel) ?? null;
+}
+
+/** 切换模型：不接受白名单外模型；不支持思考的模型强制关闭思考。 */
+export function selectGenerationModel(modelId: string): void {
+  const capability = state.generation;
+  if (capability === null) return;
+  const model = capability.models.find((item) => item.id === modelId);
+  if (model === undefined) return;
+  state.generationModel = model.id;
+  if (!model.thinking.supported) {
+    state.generationThinking = "disabled";
+    return;
+  }
+  state.generationEffort = model.thinking.defaultEffort ?? state.generationEffort;
+}
+
+/** 切换思考开关；不支持思考的模型不接受开启。 */
+export function selectGenerationThinking(mode: "enabled" | "disabled"): void {
+  if (mode === "enabled" && activeModelCapability()?.thinking.supported !== true) return;
+  state.generationThinking = mode;
+}
+
+/** 切换思考强度；只接受当前模型声明的枚举。 */
+export function selectGenerationEffort(effort: ReasoningEffort): void {
+  const capability = activeModelCapability();
+  if (capability === null || !capability.thinking.efforts.includes(effort)) return;
+  state.generationEffort = effort;
 }
 
 async function loadInitialWorkspace(): Promise<void> {
@@ -441,11 +494,23 @@ export async function refreshMessages(): Promise<void> {
 export async function ask(question: string): Promise<boolean> {
   const conversationId = state.activeConversationId;
   if (conversationId === "" || state.asking || state.session === null) return false;
+  if (state.generation === null || state.generationModel === "") {
+    state.askError = "生成能力尚未从服务端读到，无法提交本次提问";
+    return false;
+  }
   state.asking = true;
   state.askError = "";
   try {
+    // 思考强度只在开启时随请求提交；关闭时服务端默认组合就是非思考。
+    const options: AskGenerationOptions = {
+      model: state.generationModel,
+      thinking: state.generationThinking,
+      ...(state.generationThinking === "enabled"
+        ? { reasoningEffort: state.generationEffort }
+        : {}),
+    };
     // requestId 只用于服务端关联本次调用；前端不按它去重，也不自动重试付费消息。
-    const answer = await api.ask(conversationId, question, crypto.randomUUID());
+    const answer = await api.ask(conversationId, question, crypto.randomUUID(), options);
     state.lastFollowUp = answer.followUp ?? "";
     const refreshed = await loadMessages(conversationId, true);
     if (!refreshed) {

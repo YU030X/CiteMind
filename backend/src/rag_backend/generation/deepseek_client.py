@@ -1,15 +1,19 @@
-"""业务问答的受限 DeepSeek 客户端：固定端点、非流式、thinking 关闭、零自动重试。
+"""业务问答的受限 DeepSeek 客户端：固定端点、非流式、显式思考开关、零自动重试。
 
 出站约束与一次性探针一致并更严格：
 
 - 只连固定 ``https://api.deepseek.com`` 的 ``/chat/completions``，不接受任意 base_url；
-- 显式 ``thinking: {"type": "disabled"}``、``stream: false`` 与 ``max_tokens``，不依赖供应商默认；
+- 模型只由调用方从服务端白名单传入，本模块不做路由也不接受客户端提交的模型名；
+- 显式 ``thinking`` 开关与 ``stream: false`` 与 ``max_tokens``，不依赖供应商默认（默认是思考模式）；
+  开启思考时同时发送官方 ``reasoning_effort``（``low``/``high``/``max``）；
 - ``trust_env=False``，不继承宿主 ``HTTP(S)_PROXY``/自定义 CA；``retries=0``，客户端零自动重试；
 - 成功体流式读取且有界（超过上限判 ``INVALID_RESPONSE``），非 2xx 不读正文；
 - 成功体非 UTF-8、或被 ``httpx`` 判定为解压/内容解码失败时也判 ``INVALID_RESPONSE`` 失败事实，
   绝不让底层解码异常冒泡中断 ``llm_usage`` 记账；
 - provider 未报告 usage 或 usage 非法时不报成功，token 一律留空；
-- ``finish_reason == "length"`` 明确判为 ``TRUNCATED`` 失败，绝不把截断内容当完整回答。
+- ``finish_reason == "length"`` 明确判为 ``TRUNCATED`` 失败，绝不把截断内容当完整回答；
+- 只读取 ``choices[0].message.content``：思考模式的 ``reasoning_content`` 一律丢弃，既不进回答也不
+  回显给用户；provider 的 ``completion_tokens`` 已经包含 reasoning token，原样落账，绝不二次相加。
 
 本模块不做任何权限判断、不读写数据库、不记录提示正文或密钥。真实用量必须由调用方按本模块
 返回的事实追加到 ``llm_usage``；本地 token 估算永远不能写成 provider 事实。
@@ -26,7 +30,7 @@ from typing import Any, Protocol
 import httpx
 
 from rag_backend.config import Settings
-from rag_backend.generation.deepseek_prompt import ChatMessage
+from rag_backend.generation.deepseek_prompt import NON_THINKING, ChatMessage, ThinkingChoice
 
 PROVIDER = "deepseek"
 # 供应商权威文档指定的生产 endpoint；不暴露为配置项，避免以任意 base_url 伪装真实验收。
@@ -70,29 +74,51 @@ class GenerationOutcome:
 
 
 class AnswerGenerator(Protocol):
-    """同步生成接口；``DeepSeekAnswerGenerator`` 在结构上满足它，测试可注入假实现。"""
+    """同步生成接口；``DeepSeekAnswerGenerator`` 在结构上满足它，测试可注入假实现。
+
+    模型与思考选项每次调用显式传入，以便同一客户端分别服务改写（固定非思考）与回答（按用户选择）。
+    """
 
     def generate(
-        self, messages: Sequence[ChatMessage], *, max_output_tokens: int
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        max_output_tokens: int,
+        thinking: ThinkingChoice = NON_THINKING,
     ) -> GenerationOutcome: ...
 
     def close(self) -> None: ...
 
 
 def build_chat_payload(
-    model: str, messages: Sequence[ChatMessage], *, max_output_tokens: int
+    model: str,
+    messages: Sequence[ChatMessage],
+    *,
+    max_output_tokens: int,
+    thinking: ThinkingChoice = NON_THINKING,
 ) -> dict[str, Any]:
-    """固定业务请求体：非流式、显式关闭 thinking，并限制输出长度。"""
+    """固定业务请求体：非流式、显式思考开关与强度，并限制输出长度。
 
-    return {
+    ``max_tokens`` 对输入输出总量不是一个池子，而是纯粹的生成上限；思考模式下 reasoning token
+    与最终回答共同占用它，因此 800 的配置在思考时可能被推理耗尽并返回 ``finish_reason=length``，
+    那种情况必须如实落为 ``TRUNCATED``，不自动抬高预算。
+    """
+
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": message.role, "content": message.content} for message in messages
         ],
         "stream": False,
-        "thinking": {"type": "disabled"},
         "max_tokens": max_output_tokens,
     }
+    if thinking.enabled:
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = thinking.effective_effort
+    else:
+        payload["thinking"] = {"type": "disabled"}
+    return payload
 
 
 def _elapsed_ms(started: float) -> int:
@@ -175,14 +201,12 @@ class DeepSeekAnswerGenerator:
         self,
         *,
         api_key: str,
-        model: str,
         timeout_seconds: float,
         max_response_bytes: int,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not api_key.strip():
             raise GenerationConfigError("缺少可用的 LLM 密钥")
-        self._model = model
         self._max_response_bytes = max_response_bytes
         self._client = httpx.Client(
             base_url=DEEPSEEK_BASE_URL,
@@ -196,7 +220,7 @@ class DeepSeekAnswerGenerator:
     def from_settings(
         cls, settings: Settings, *, transport: httpx.BaseTransport | None = None
     ) -> DeepSeekAnswerGenerator:
-        """用进程配置显式构造；未开启或缺少密钥时静态失败且不联网。"""
+        """用进程配置显式构造；未开启或缺少密钥时静态失败且不联网。模型在 ``generate`` 传入。"""
 
         if not settings.llm_enabled:
             raise GenerationConfigError("业务问答生成未启用")
@@ -204,7 +228,6 @@ class DeepSeekAnswerGenerator:
             raise GenerationConfigError("业务问答生成未配置 LLM_API_KEY")
         return cls(
             api_key=settings.llm_api_key.get_secret_value(),
-            model=settings.llm_model,
             timeout_seconds=settings.llm_timeout_seconds,
             max_response_bytes=settings.llm_max_response_bytes,
             transport=transport,
@@ -214,11 +237,18 @@ class DeepSeekAnswerGenerator:
         self._client.close()
 
     def generate(
-        self, messages: Sequence[ChatMessage], *, max_output_tokens: int
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        max_output_tokens: int,
+        thinking: ThinkingChoice = NON_THINKING,
     ) -> GenerationOutcome:
         """发起唯一一次请求并把失败/超时/截断映射为事实，而不是异常。"""
 
-        payload = build_chat_payload(self._model, messages, max_output_tokens=max_output_tokens)
+        payload = build_chat_payload(
+            model, messages, max_output_tokens=max_output_tokens, thinking=thinking
+        )
         started = time.monotonic()
         try:
             response = self._post(payload)
@@ -300,6 +330,7 @@ class DeepSeekAnswerGenerator:
             return _failure(usage.error_code, latency_ms)
         message = choice.get("message")
         content = message.get("content") if isinstance(message, dict) else None
+        # 思考模式另带 ``reasoning_content``：刻意不读、不返回，CoT 既不入库也不展示给用户。
         if not isinstance(content, str) or not content:
             return _failure("INVALID_RESPONSE", latency_ms)
         return GenerationOutcome(

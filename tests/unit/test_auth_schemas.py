@@ -7,12 +7,14 @@ from pydantic import ValidationError
 from rag_backend.auth.accounts import MAX_USERNAME_LENGTH
 from rag_backend.knowledge.roles import KbRole
 from rag_backend.schemas.auth import (
-    GenerationCapability,
     KbRoleSummary,
     LoginRequest,
     MeOverviewResponse,
     MeResponse,
+    ModelCapability,
+    ThinkingCapability,
     UserSummary,
+    generation_capability,
 )
 from rag_backend.schemas.errors import ErrorResponse
 
@@ -48,9 +50,7 @@ def test_me_response_serialises_camel_case_fields() -> None:
             organization_id=ORGANIZATION_ID,
         ),
         csrf_token="csrf-token",
-        generation=GenerationCapability(
-            model="deepseek-flash", thinking="disabled", enabled=False
-        ),
+        generation=generation_capability(False, "deepseek-flash"),
     )
 
     payload = response.model_dump(by_alias=True)
@@ -58,17 +58,52 @@ def test_me_response_serialises_camel_case_fields() -> None:
     assert set(payload) == {"user", "csrfToken", "generation"}
     assert payload["csrfToken"] == "csrf-token"
     assert payload["generation"] == {
-        "model": "deepseek-flash",
-        "thinking": "disabled",
         "enabled": False,
+        "defaultModel": "deepseek-flash",
+        "defaultThinking": "disabled",
+        "models": [
+            {
+                "id": "deepseek-flash",
+                "thinking": {
+                    "supported": True,
+                    "efforts": ["low", "high", "max"],
+                    "defaultEffort": "high",
+                },
+            }
+        ],
     }
     assert set(payload["user"]) == {"id", "username", "isAdmin", "organizationId"}
     assert payload["user"]["isAdmin"] is True
 
 
-def test_generation_capability_rejects_unknown_thinking_mode() -> None:
+def test_generation_capability_only_exposes_verified_models() -> None:
+    """官方存在但未经本仓库 tokenizer/渲染契约验证的模型不得出现在能力列表里。"""
+
+    capability = generation_capability(True, "deepseek-flash")
+
+    assert [model.id for model in capability.models] == ["deepseek-flash"]
+    assert all(model.id != "deepseek-v4-pro" for model in capability.models)
+    assert capability.default_model == "deepseek-flash"
+    assert capability.default_thinking == "disabled"
+
+
+def test_model_capability_rejects_unknown_thinking_effort() -> None:
     with pytest.raises(ValidationError):
-        GenerationCapability(model="deepseek-flash", thinking="enabled", enabled=True)  # type: ignore[arg-type]
+        ModelCapability.model_validate(
+            {
+                "id": "deepseek-flash",
+                "thinking": {
+                    "supported": True,
+                    "efforts": ["ultra"],
+                    "defaultEffort": "high",
+                },
+            }
+        )
+
+
+def test_thinking_capability_requires_efforts() -> None:
+    with pytest.raises(ValidationError):
+        ThinkingCapability.model_validate({"supported": True})
 
 
 def test_me_overview_includes_knowledge_base_roles() -> None:
@@ -81,9 +116,7 @@ def test_me_overview_includes_knowledge_base_roles() -> None:
             organization_id=ORGANIZATION_ID,
         ),
         csrf_token="csrf-token",
-        generation=GenerationCapability(
-            model="deepseek-flash", thinking="disabled", enabled=True
-        ),
+        generation=generation_capability(True, "deepseek-flash"),
         knowledge_bases=[KbRoleSummary(id=kb_id, name="kb", role=KbRole.OWNER)],
     ).model_dump(mode="json", by_alias=True)
 

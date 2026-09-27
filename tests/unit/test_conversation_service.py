@@ -47,9 +47,11 @@ from rag_backend.generation.deepseek_client import (
     GenerationOutcome,
 )
 from rag_backend.generation.deepseek_prompt import (
+    NON_THINKING,
     USER_SP_TOKEN,
     ChatMessage,
     PromptEncodingError,
+    ThinkingChoice,
 )
 from rag_backend.generation.query_rewrite import REWRITE_STAGE, REWRITE_SYSTEM_PROMPT
 from rag_backend.retrieval.fusion import FusedCandidate
@@ -393,17 +395,24 @@ class FakeRetrieval:
 class RecordingEstimator:
     def __init__(self) -> None:
         self.contents: list[str] = []
+        self.thinkings: list[ThinkingChoice] = []
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
         self.contents.extend(message.content for message in messages)
+        self.thinkings.append(thinking)
         return sum(1 + len(message.content) for message in messages)
 
 
 class ScaffoldRejectingEstimator(RecordingEstimator):
     """模拟本地渲染器：正文含结构 token 时抛具名 ``PromptEncodingError``。"""
 
-    def estimate_chat_tokens(self, messages: Sequence[ChatMessage]) -> int:
+    def estimate_chat_tokens(
+        self, messages: Sequence[ChatMessage], *, thinking: ThinkingChoice = NON_THINKING
+    ) -> int:
         self.contents.extend(message.content for message in messages)
+        self.thinkings.append(thinking)
         for message in messages:
             if USER_SP_TOKEN in message.content:
                 raise PromptEncodingError("消息正文包含提示结构 token")
@@ -431,9 +440,19 @@ class FakeGenerator:
         self.messages: list[tuple[ChatMessage, ...]] = []
         self.answer_messages: list[tuple[ChatMessage, ...]] = []
         self.rewrite_messages: list[tuple[ChatMessage, ...]] = []
+        # 每次真实调用实际传入的模型与思考选项，用于断言用户选择真到了客户端。
+        self.answer_models: list[str] = []
+        self.answer_thinkings: list[ThinkingChoice] = []
+        self.rewrite_models: list[str] = []
+        self.rewrite_thinkings: list[ThinkingChoice] = []
 
     def generate(
-        self, messages: Sequence[ChatMessage], *, max_output_tokens: int
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str,
+        max_output_tokens: int,
+        thinking: ThinkingChoice = NON_THINKING,
     ) -> GenerationOutcome:
         # 捕获每次真实调用进入提示的消息，用于断言历史/证据/改写实际入参。
         captured = tuple(messages)
@@ -442,11 +461,15 @@ class FakeGenerator:
         if captured[0].content == REWRITE_SYSTEM_PROMPT:
             self.rewrite_calls += 1
             self.rewrite_messages.append(captured)
+            self.rewrite_models.append(model)
+            self.rewrite_thinkings.append(thinking)
             pool = self.rewrite_outcomes
             index = min(self.rewrite_calls - 1, len(pool) - 1)
         else:
             self.answer_calls += 1
             self.answer_messages.append(captured)
+            self.answer_models.append(model)
+            self.answer_thinkings.append(thinking)
             pool = self.outcomes
             index = min(self.answer_calls - 1, len(pool) - 1)
         return pool[index]
@@ -518,6 +541,9 @@ async def _run(
     generator: FakeGenerator | None = None,
     question: str = "制度怎么规定？",
     budget: ContextBudget = BUDGET,
+    answer_model: str = "deepseek-flash",
+    rewrite_model: str = "deepseek-flash",
+    thinking: ThinkingChoice = NON_THINKING,
 ) -> tuple[Any, FakeConversationRepository, FakeEvidenceRepository, FakeGenerator]:
     resolved_repository = repository or FakeConversationRepository(_conversation())
     resolved_evidence = evidence or FakeEvidenceRepository([_evidence_row()])
@@ -535,7 +561,9 @@ async def _run(
         estimator=estimator or RecordingEstimator(),
         generator=resolved_generator,
         budget=budget,
-        model="deepseek-flash",
+        answer_model=answer_model,
+        rewrite_model=rewrite_model,
+        thinking=thinking,
     )
     return result, resolved_repository, resolved_evidence, resolved_generator
 
@@ -582,6 +610,13 @@ async def test_happy_path_maps_server_side_citation_and_records_usage() -> None:
     assert run.provider_prompt_tokens == 11
     assert run.scope_snapshot == (KB_ID,)
     assert run.evidence_count == 1
+    # 默认请求：服务端默认模型 + 关闭思考，选项随本轮持久化（不被后续选择改写）。
+    assert run.generation_options == {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "reasoningEffort": None,
+    }
+    assert generator.answer_thinkings == [NON_THINKING]
     # 正常问答没有异常降级；预算/top-k 裁剪不算故障。
     assert run.degraded_stages == ()
     # 证据文本确实进入了发送给模型的消息。
@@ -1370,3 +1405,90 @@ async def test_version_retry_reuses_single_rewrite() -> None:
     ]
     assert repository.query_runs[0].degraded_stages == ("source_retry",)
     assert repository.query_runs[0].standalone_question == REWRITE_STANDALONE
+
+
+# --- 模型与思考选项 ----------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_answer_thinking_choice_reaches_generator_and_is_persisted() -> None:
+    """用户选择的思考开关与强度必须真到达客户端，并随本轮 query_run 落库。"""
+
+    repository = FakeConversationRepository(_conversation())
+    generator = FakeGenerator([_outcome(content=_answer_json())])
+    choice = ThinkingChoice(enabled=True, effort="max")
+
+    _result, repository, _evidence, generator = await _run(
+        repository=repository, generator=generator, thinking=choice
+    )
+
+    assert generator.answer_thinkings == [choice]
+    assert generator.answer_models == ["deepseek-flash"]
+    assert repository.usage[0].model == "deepseek-flash"
+    assert repository.query_runs[0].generation_options == {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "reasoningEffort": "max",
+    }
+
+
+@pytest.mark.anyio
+async def test_thinking_mode_is_used_for_local_estimation() -> None:
+    """思考模式的提示多出强度说明与 ``<think>``，本地估算必须按同一变体进行。"""
+
+    estimator = RecordingEstimator()
+    choice = ThinkingChoice(enabled=True, effort="low")
+
+    _result, repository, _evidence, _generator = await _run(
+        estimator=estimator,
+        repository=FakeConversationRepository(_conversation()),
+        thinking=choice,
+    )
+
+    assert estimator.thinkings
+    assert all(item == choice for item in estimator.thinkings)
+    assert repository.query_runs[0].generation_options["reasoningEffort"] == "low"
+
+
+@pytest.mark.anyio
+async def test_rewrite_is_fixed_non_thinking_while_answer_follows_choice() -> None:
+    """追问改写固定模型 + 非思考（成本受控）；只有回答跟随本轮选择。"""
+
+    repository = _history_repository()
+    generator = FakeGenerator([_outcome(content=_answer_json())])
+    choice = ThinkingChoice(enabled=True, effort="high")
+
+    _result, repository, _evidence, generator = await _run(
+        repository=repository,
+        evidence=_authorized_history_evidence(),
+        generator=generator,
+        question="它的适用范围呢？",
+        answer_model="deepseek-flash",
+        rewrite_model="deepseek-flash",
+        thinking=choice,
+    )
+
+    assert generator.rewrite_models == ["deepseek-flash"]
+    assert generator.rewrite_thinkings == [NON_THINKING]
+    assert generator.answer_thinkings == [choice]
+    assert [row.stage for row in repository.usage] == [REWRITE_STAGE, "qa_answer"]
+    # 每轮选项独立落库；改写不把思考强度写进回答轮。
+    assert repository.query_runs[0].generation_options == {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "reasoningEffort": "high",
+    }
+
+
+@pytest.mark.anyio
+async def test_usage_model_records_the_requested_answer_model() -> None:
+    """``llm_usage.model`` 记录实际请求的模型，而不是硬编码的服务端常量。"""
+
+    repository = FakeConversationRepository(_conversation())
+
+    _result, repository, _evidence, _generator = await _run(
+        repository=repository, answer_model="deepseek-flash"
+    )
+
+    assert [row.model for row in repository.usage] == ["deepseek-flash"]
+    assert repository.query_runs[0].generation_options["model"] == "deepseek-flash"
