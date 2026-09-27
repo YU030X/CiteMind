@@ -3,3 +3,5 @@ packages:
 
 allowBuilds:
   esbuild: true
+  # @floating-ui/vue（reka-ui 的定位依赖）的 postinstall 会按当前 Vue 大版本切换 shim。
+  vue-demi: true

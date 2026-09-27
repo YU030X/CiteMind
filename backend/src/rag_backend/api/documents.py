@@ -1,10 +1,13 @@
-"""文档上传路由：``POST /api/v1/knowledge-bases/{kb_id}/documents``（multipart）。
+"""文档路由：列表/详情读取，以及上传、新版本与逻辑删除。
 
-关键顺序约束：本端点**不声明** ``UploadFile``/``Form`` 参数。FastAPI 在含表单/文件参数的
-端点上会先 ``await request.form()`` 再求解依赖（``fastapi/routing.py``），那样未授权请求
-也会先把正文落盘。这里只注入 ``Request``、路径参数、``Header`` 与鉴权/CSRF/体积依赖，
-等 KB ``EDITOR`` 角色、Origin、CSRF 与体积上限都通过后，才在处理器内调用
-``await request.form()``。
+读取端点（``GET /api/v1/knowledge-bases/{id}/documents``、``GET /api/v1/documents/{id}``）
+只读取未删除文档的元数据，授权复用 ``require_kb_role``/``require_document_role``。
+
+上传端点 ``POST /api/v1/knowledge-bases/{kb_id}/documents`` 的关键顺序约束：本端点**不声明**
+``UploadFile``/``Form`` 参数。FastAPI 在含表单/文件参数的端点上会先 ``await request.form()``
+再求解依赖（``fastapi/routing.py``），那样未授权请求也会先把正文落盘。这里只注入 ``Request``、
+路径参数、``Header`` 与鉴权/CSRF/体积依赖，等 KB ``EDITOR`` 角色、Origin、CSRF 与体积上限都
+通过后，才在处理器内调用 ``await request.form()``。
 """
 
 from __future__ import annotations
@@ -67,17 +70,32 @@ from rag_backend.ingestion.validation import (
     SOURCE_TYPE_PDF,
     resolve_upload_format,
 )
+from rag_backend.knowledge.document_read import (
+    DocumentReadRepository,
+    DocumentView,
+    SqlDocumentReadRepository,
+    list_knowledge_base_documents,
+    load_document_detail,
+)
 from rag_backend.knowledge.roles import KbRole, kb_role_rank
 from rag_backend.knowledge.service import (
     DocumentAccess,
     KbAccess,
     resolve_document_access,
 )
-from rag_backend.schemas.documents import DocumentUploadResponse
+from rag_backend.schemas.documents import (
+    DocumentJobSummary,
+    DocumentListResponse,
+    DocumentSummary,
+    DocumentUploadResponse,
+    DocumentVersionSummary,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
+require_reader = require_kb_role(KbRole.READER)
 require_editor = require_kb_role(KbRole.EDITOR)
+require_document_reader = require_document_role(KbRole.READER)
 require_document_editor = require_document_role(KbRole.EDITOR)
 
 # 删除事务先锁 ``document`` 再锁 ``ingest_job``，而 worker 的失败/发布事务先锁
@@ -202,6 +220,89 @@ async def enforce_upload_body_limit(request: Request) -> None:
         return message
 
     request._receive = limited_receive  # 在正文解析前安装流式上限
+
+
+def _document_summary(view: DocumentView) -> DocumentSummary:
+    """把只读视图映射为外部 schema；视图已不含 fileRef/fileHash/租约或正文。"""
+
+    return DocumentSummary(
+        id=view.id,
+        title=view.title,
+        source_type=view.source_type,
+        lifecycle_status=view.lifecycle_status,
+        active_version=(
+            None
+            if view.active_version is None
+            else DocumentVersionSummary(
+                id=view.active_version.id,
+                version_no=view.active_version.version_no,
+                status=view.active_version.status,
+            )
+        ),
+        latest_version=(
+            None
+            if view.latest_version is None
+            else DocumentVersionSummary(
+                id=view.latest_version.id,
+                version_no=view.latest_version.version_no,
+                status=view.latest_version.status,
+            )
+        ),
+        latest_job=(
+            None
+            if view.latest_job is None
+            else DocumentJobSummary(
+                id=view.latest_job.id,
+                status=view.latest_job.status,
+                error_code=view.latest_job.error_code,
+            )
+        ),
+        created_at=view.created_at,
+        updated_at=view.updated_at,
+    )
+
+
+def get_document_read_repository(
+    session: AsyncSession = Depends(get_database_session),
+) -> DocumentReadRepository:
+    """按请求构造只读仓储；不缓存、不跨请求复用事务。"""
+
+    return SqlDocumentReadRepository(session)
+
+
+@router.get(
+    "/knowledge-bases/{kb_id}/documents", response_model=DocumentListResponse
+)
+async def list_knowledge_base_documents_route(
+    access: KbAccess = Depends(require_reader),
+    repository: DocumentReadRepository = Depends(get_document_read_repository),
+) -> DocumentListResponse:
+    """列出 KB 内未删除文档；已删除文档不出现，本片不分页。"""
+
+    views = await list_knowledge_base_documents(
+        repository,
+        kb_id=access.kb_id,
+        organization_id=access.organization_id,
+    )
+    return DocumentListResponse(documents=[_document_summary(view) for view in views])
+
+
+@router.get("/documents/{document_id}", response_model=DocumentSummary)
+async def get_document(
+    document_id: uuid.UUID,
+    access: DocumentAccess = Depends(require_document_reader),
+    repository: DocumentReadRepository = Depends(get_document_read_repository),
+) -> DocumentSummary:
+    """读取单个未删除文档；已删除或越权统一返回不暴露存在性的 404。"""
+
+    view = await load_document_detail(
+        repository,
+        document_id=document_id,
+        organization_id=access.organization_id,
+    )
+    if view is None:
+        raise ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
+    return _document_summary(view)
 
 
 @router.post(
@@ -464,4 +565,7 @@ async def delete_document(
     return Response(status_code=204)
 
 
-__all__ = ["router"]
+__all__ = [
+    "get_document_read_repository",
+    "router",
+]

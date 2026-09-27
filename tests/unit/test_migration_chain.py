@@ -20,6 +20,7 @@ INGEST_JOB_PROFILE_REVISION = "20260925_0006"
 WORKER_KB_PUBLISH_REVISION = "20260925_0007"
 INGEST_JOB_REQUEST_TITLE_REVISION = "20260926_0008"
 CONVERSATION_REVISION = "20260927_0009"
+CONVERSATION_METADATA_REVISION = "20260927_0010"
 
 CORE_TABLES = (
     "index_profile",
@@ -111,6 +112,10 @@ CONVERSATION_GRANTS = tuple(
     f"GRANT SELECT, INSERT ON TABLE {table} TO citemind_api;"
     for table in CONVERSATION_TABLES
 )
+CONVERSATION_METADATA_GRANTS = (
+    "GRANT UPDATE (title, pinned_at, deleted_at, updated_at) "
+    "ON TABLE conversation TO citemind_api;",
+)
 
 
 def alembic_config() -> Config:
@@ -126,9 +131,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [CONVERSATION_REVISION]
+    assert script_directory.get_heads() == [CONVERSATION_METADATA_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    conversation_metadata = script_directory.get_revision(CONVERSATION_METADATA_REVISION)
     conversation = script_directory.get_revision(CONVERSATION_REVISION)
     request_title = script_directory.get_revision(INGEST_JOB_REQUEST_TITLE_REVISION)
     worker_kb_publish = script_directory.get_revision(WORKER_KB_PUBLISH_REVISION)
@@ -139,8 +145,10 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert conversation_metadata.down_revision == CONVERSATION_REVISION
+    assert conversation_metadata.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
-    assert conversation.nextrev == set()
+    assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
     assert request_title.nextrev == {CONVERSATION_REVISION}
     assert worker_kb_publish.down_revision == INGEST_JOB_PROFILE_REVISION
@@ -325,6 +333,7 @@ def test_offline_upgrade_sql_grants_the_business_tables_exactly(
         + len(IDENTITY_GRANTS)
         + len(WORKER_KB_PUBLISH_GRANTS)
         + len(CONVERSATION_GRANTS)
+        + len(CONVERSATION_METADATA_GRANTS)
     )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
@@ -453,6 +462,53 @@ def test_offline_downgrade_sql_removes_conversation_tables(
         assert f"DROP TABLE {table};" in output
     assert "GRANT " not in output
     assert "REVOKE " not in output
+
+
+def test_offline_upgrade_sql_adds_only_conversation_metadata_columns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{CONVERSATION_REVISION}:{CONVERSATION_METADATA_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE conversation ADD COLUMN title TEXT;" in output
+    assert (
+        "ALTER TABLE conversation ADD COLUMN pinned_at TIMESTAMP WITH TIME ZONE;" in output
+    )
+    assert (
+        "ALTER TABLE conversation ADD COLUMN deleted_at TIMESTAMP WITH TIME ZONE;" in output
+    )
+    # 只追加列级 UPDATE，不给全表 UPDATE，也不改结构之外的授权或其它对象。
+    assert CONVERSATION_METADATA_GRANTS[0] in output
+    assert "GRANT UPDATE ON TABLE conversation" not in output
+    assert "CREATE INDEX" not in output
+    assert "CREATE TABLE" not in output
+    assert "REVOKE " not in output
+    assert "DROP " not in output
+
+
+def test_offline_downgrade_sql_removes_only_conversation_metadata(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{CONVERSATION_METADATA_REVISION}:{CONVERSATION_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert (
+        "REVOKE UPDATE (title, pinned_at, deleted_at, updated_at) "
+        "ON TABLE conversation FROM citemind_api;" in output
+    )
+    assert "DROP COLUMN deleted_at" in output
+    assert "DROP COLUMN pinned_at" in output
+    assert "DROP COLUMN title" in output
+    assert "DROP TABLE" not in output
+    assert "GRANT " not in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(

@@ -89,12 +89,30 @@ profile 一致，发布事务必须用带谓词的条件 UPDATE 拒绝非 NULL �
 
 | 表 | 主要字段 | 关键约束与 ACL |
 | --- | --- | --- |
-| `conversation` | id, organization_id, owner_id, kb_scope JSONB, created_at, updated_at | `owner_id` 外键 RESTRICT；`kb_scope` 固化创建时可访问 KB 集合（改写成不了扩大范围的手段）；api SELECT+INSERT，worker 无权限 |
+| `conversation` | id, organization_id, owner_id, kb_scope JSONB, title, pinned_at, deleted_at, created_at, updated_at | `owner_id` 外键 RESTRICT；`kb_scope` 固化创建时可访问 KB 集合（改写成不了扩大范围的手段）；`title` 可空（首轮提问派生）、`pinned_at` 可空（非空即置顶）、`deleted_at` 可空（非空即软删）；api SELECT+INSERT，另加列级 UPDATE（`title, pinned_at, deleted_at, updated_at`），worker 无权限 |
 | `query_run` | id, conversation_id, question, standalone_question, request_id, scope_snapshot JSONB, input_token_budget, output_token_budget, estimated_input_tokens, evidence_count, status, insufficient_evidence, degraded_stages JSONB, llm_usage_id, provider_prompt_tokens, provider_completion_tokens, created_at | `status IN (SUCCEEDED, REFUSED, FAILED)`；两个预算列 `> 0`；本地估算与 provider token 均为 `>= 0` 且分开存储；`question` 非空；api SELECT+INSERT |
 | `message` | id, conversation_id, sequence, role, content, query_run_id, created_at | `role IN (user, assistant)`；`sequence > 0` 且 `(conversation_id, sequence)` 唯一；api SELECT+INSERT |
 | `citation` | id, message_id, query_run_id, chunk_id, version_id, display_label, locator_snapshot JSONB, quote, quote_hash, created_at | `(message_id, display_label)` 唯一；`display_label` 非空；四个外键 RESTRICT；api SELECT+INSERT |
 
 `citation` 的 `locator_snapshot` 与 `quote` 全部由服务端从已保存 `chunk.source_locator`/`chunk.text` 映射，`quote_hash` 是完整正文 SHA-256；模型只能返回临时 `E` 编号，不能提交 URL、页码或数据库 ID。`query_run.llm_usage_id` 指向对应 provider attempt 的 append-only 账本行（不在本表复制 provider 事实），`estimated_input_tokens` 是本地 tokenizer 估算，不冒充 provider 用量。`query_run.scope_snapshot` 存的是本次检索**实际解析出的可检索 KB 子集**（`knowledge_base.active_index_profile_id` 为 NULL 的 KB 被排除，无可检索 KB 时为空数组），不是会话名义 `kb_scope`，也不做二次范围查询；`query_run.degraded_stages` 只记录真实异常造成的静态阶段标识（当前为 `unsupported_text` 与 `source_retry`），正常的 top-k/同文档限量/预算裁剪不计入。问答四表的真实迁移与授权验收由 `tests/integration/test_conversation_migration.py` 承担（隔离 PG17 上 10 passed）；完整 HTTP/所有者与撤权/引用/预算/版本竞态/用量/失败，以及删除成员行/跨组织来源、实际 scope 快照、第二轮历史实际入参、旧版本历史展示与部分引用撤权验收由 `tests/integration/test_conversation_flow.py` 承担（15 passed）。
+
+## 已实现：会话管理切片（迁移 20260927_0010）
+
+迁移 `20260927_0010_conversation_title_pin_delete` 紧接 `20260927_0009`，只给 `conversation` 增加三个可空列：`title`（首轮提问派生的展示标题，来源是用户真实问题，不编造内容）、`pinned_at`（非空表示置顶，无布尔列与默认值）与 `deleted_at`（逻辑删除时间）。迁移不新增索引、不改表结构之外的其它对象、不 seed、不回填。
+
+删除复用软删，因此 api 角色只追加 `conversation` 的列级 UPDATE，不给全表 UPDATE，也不授予 DELETE/TRUNCATE/REFERENCES/TRIGGER：
+
+```sql
+GRANT UPDATE (title, pinned_at, deleted_at, updated_at) ON TABLE conversation TO citemind_api;
+```
+
+三个列与应用行为对应：
+
+- `title` 由首轮追问在写入消息的同一事务内按 `title IS NULL` 条件写入一次（`derive_conversation_title` 取首个非空行、折叠空白并截断到 200 字符），不覆盖用户后来的改名；为空仅表示尚无标题。
+- `pinned_at` 由 `PATCH /conversations/{id}` 的 `pinned=true` 写 `now()`（重复置顶不刷新原时间）、`pinned=false` 清为 NULL；列表排序为置顶优先，其后按最近消息时间稳定倒序。
+- `deleted_at` 由 `DELETE /conversations/{id}` 写入：列表、单会话读取、历史、引用与追加追问的 SQL 全部过滤 `deleted_at IS NULL`（引用通过 `message → conversation` 回表过滤），追加追问在写入事务内取会话级 advisory 锁后重查会话，因此删除与“查删除 + 插入”互相串行，模型调用期间被删不会把回答复活成新消息。删除只写本表，不删共享 `chunk`/`citation`/`llm_usage` 历史事实，也不做物理回收与级联清理。
+
+会话管理切片的真实迁移与列级授权验收仍需在真实 PostgreSQL 上执行 `tests/integration/test_conversation_migration.py` 一类的迁移检查（本片未运行）；离线 SQL 与权限形态由 `tests/unit/test_migration_chain.py` 静态核对，所有者/组织隔离、软删后所有读取路径拒绝与追加追问提交前重查由 `tests/unit/test_conversation_manage.py` 与 `tests/unit/test_conversation_service.py` 的聚焦单测覆盖（不连真实数据库）。
 
 ## index profile 契约与 KB active 可见性
 

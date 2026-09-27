@@ -14,7 +14,7 @@
 | 中文关键词 | 固定 `jieba==0.42.1` 搜索模式（私有 `Tokenizer` + `cut_for_search`）+ 版本化领域词典 + tsvector/GIN | 显式保留错误码、简称和代码标识；文档与查询共用同一分析器并参数绑定 `to_tsvector('simple', …)`；分析器标识同时钉死 jieba 基础 `dict.txt` 与领域词典摘要，分词缓存只写构造期私有临时目录（不回退共享 `jieba.cache`，运行时需可写 tmpfs）；词典 v1 为空且按原始字节 SHA-256 冻结，扩词典必须新建 index profile 并重索引，freq=0 词条改动需单独安全评估；需求超过本方案时再评估独立搜索引擎 |
 | 文件和解析 | 鉴权本地卷；按格式保留源位置的轻量解析器 | 小文档集无需自建对象存储集群；OCR 或复杂版面有样本与质量问题后再评估增强解析器 |
 | 推理服务 | 独立单进程 transformers + PyTorch CPU（不使用 sentence-transformers） | 避免 API 与 worker 复制模型内存；模型烘入镜像且运行期离线；同一内部服务按需增加 rerank，先测峰值再扩并发 |
-| 前端 | Vue 3、Vite、TypeScript、Element Plus | 登录后 SPA，无 SSR 需求；PDF.js 与图表只在对应页面需要时引入 |
+| 前端 | Vue 3、Vite、TypeScript、Tailwind CSS v4、shadcn-vue（reka-ui + lucide 图标） | 登录后 SPA，无 SSR 需求；控件源码来自已审核的 `ui-demos/` 视觉稿，Tailwind v4 与 shadcn-vue 生成组件按其视觉合同接入，不预装 Element Plus；PDF.js 与图表只在对应页面需要时引入 |
 | 部署 | Docker Compose v2 单机 profile | 六类服务已满足当前范围；Kubernetes 不作为问答正确性的前提 |
 
 文档中的外部技术事实应优先按所锁定版本的官方文档核对：[FastAPI 后台任务](https://fastapi.tiangolo.com/tutorial/background-tasks/)、[SQLAlchemy Session](https://docs.sqlalchemy.org/en/20/orm/session_basics.html)、[Celery task](https://docs.celeryq.dev/en/latest/userguide/tasks.html)、[pgvector 过滤](https://github.com/pgvector/pgvector#filtering)、[PostgreSQL 全文检索](https://www.postgresql.org/docs/current/textsearch.html)、[BGE embedding 模型卡](https://huggingface.co/BAAI/bge-small-zh-v1.5)、[BGE reranker 模型卡](https://huggingface.co/BAAI/bge-reranker-base)。这些链接是复核入口，不表示当前仓库已完成兼容性或性能验证。

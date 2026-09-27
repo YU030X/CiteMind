@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from rag_backend.conversation.errors import (
+    CitationNotFound,
     ConversationNotFound,
     ConversationQuestionTooLong,
     ConversationSourcesChanged,
@@ -25,6 +26,7 @@ from rag_backend.conversation.errors import (
 from rag_backend.conversation.repository import (
     CitationRecord,
     ConversationRow,
+    ConversationSummaryRow,
     LlmUsageRecord,
     MessageRecord,
     QueryRunRecord,
@@ -34,6 +36,9 @@ from rag_backend.conversation.repository import (
 from rag_backend.conversation.service import (
     REFUSAL_ANSWER,
     answer_question,
+    derive_conversation_title,
+    load_citation_detail,
+    load_conversation_history,
 )
 from rag_backend.generation.context_budget import ContextBudget
 from rag_backend.generation.deepseek_client import (
@@ -140,9 +145,92 @@ class FakeConversationRepository:
             conversation.id != conversation_id
             or conversation.owner_id != owner_id
             or conversation.organization_id != organization_id
+            # 服务端读取路径一律过滤软删；删除后的会话对所有者也是 404。
+            or conversation.deleted_at is not None
         ):
             return None
         return conversation
+
+    async def load_conversation_summary(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> ConversationSummaryRow | None:
+        conversation = await self.load_conversation(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            organization_id=organization_id,
+        )
+        if conversation is None:
+            return None
+        return ConversationSummaryRow(
+            id=conversation.id,
+            kb_scope=conversation.kb_scope,
+            created_at=conversation.created_at,
+            last_message_at=max(
+                (message.created_at for message in self.messages), default=None
+            ),
+            title=conversation.title,
+            pinned_at=conversation.pinned_at,
+        )
+
+    async def update_conversation_metadata(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        title: str | None,
+        pinned: bool | None,
+    ) -> bool:
+        conversation = await self.load_conversation(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            organization_id=organization_id,
+        )
+        if conversation is None:
+            return False
+        changes: dict[str, Any] = {}
+        if title is not None:
+            changes["title"] = title
+        if pinned is not None:
+            changes["pinned_at"] = datetime.now(UTC) if pinned else None
+        self.conversation = replace(conversation, **changes)
+        return True
+
+    async def soft_delete_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> bool:
+        conversation = self.conversation
+        if (
+            conversation is None
+            or conversation.id != conversation_id
+            or conversation.owner_id != owner_id
+            or conversation.organization_id != organization_id
+        ):
+            return False
+        # 重复删除也返回 True（幂等 204）；已删除后读取路径自然过滤为 404。
+        if conversation.deleted_at is None:
+            self.conversation = replace(conversation, deleted_at=datetime.now(UTC))
+        return True
+
+    async def set_conversation_title_if_empty(
+        self, *, conversation_id: uuid.UUID, title: str
+    ) -> None:
+        conversation = self.conversation
+        if (
+            conversation is not None
+            and conversation.id == conversation_id
+            and conversation.deleted_at is None
+            and conversation.title is None
+        ):
+            self.conversation = replace(conversation, title=title)
 
     async def insert_conversation(
         self,
@@ -164,6 +252,9 @@ class FakeConversationRepository:
     async def load_citation_for_owner(
         self, *, citation_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
     ) -> StoredCitation | None:
+        # 会话软删后其引用同样不可读（真实 SQL 通过 conversation.deleted_at 过滤）。
+        if self.conversation is None or self.conversation.deleted_at is not None:
+            return None
         for citation in self.citations:
             if citation.id == citation_id:
                 return citation
@@ -897,6 +988,101 @@ async def test_history_revoked_before_retry_fails_without_second_retrieval() -> 
     # 持续变化不落查询运行、消息或引用，也不持久化派生问题。
     assert repository.query_runs == []
     assert all(message.content != REWRITE_STANDALONE for message in repository.messages)
+
+
+# --- 标题、删除与提交前重查 ---------------------------------------------------
+
+
+def test_derive_conversation_title_collapses_and_truncates() -> None:
+    assert derive_conversation_title("  第一行  标题 \n第二行") == "第一行 标题"
+    assert derive_conversation_title("\n\n  只有第二行  ") == "只有第二行"
+    # 长问题按 200 字符截断，来源仍是真实问题。
+    assert len(derive_conversation_title("字" * 500)) == 200
+
+
+@pytest.mark.anyio
+async def test_first_turn_persists_title_derived_from_question() -> None:
+    repository = FakeConversationRepository(_conversation())
+
+    result, repository, _evidence, _generator = await _run(
+        repository=repository, question="制度怎么规定？\n第二行不应进入标题"
+    )
+
+    assert result.insufficient_evidence is False
+    assert repository.conversation is not None
+    assert repository.conversation.title == "制度怎么规定？"
+
+
+@pytest.mark.anyio
+async def test_existing_title_is_not_overwritten_by_later_turns() -> None:
+    repository = FakeConversationRepository(replace(_conversation(), title="用户已改名"))
+
+    _result, repository, _evidence, _generator = await _run(repository=repository)
+
+    assert repository.conversation is not None
+    assert repository.conversation.title == "用户已改名"
+
+
+class _DeletedAfterFirstLoadRepository(FakeConversationRepository):
+    """首次读取会话成功后模拟“模型调用期间被删除”，重查必须拒绝提交。"""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.loads = 0
+
+    async def load_conversation(
+        self, *, conversation_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> ConversationRow | None:
+        self.loads += 1
+        if self.loads > 1:
+            return None
+        return await super().load_conversation(
+            conversation_id=conversation_id,
+            owner_id=owner_id,
+            organization_id=organization_id,
+        )
+
+
+@pytest.mark.anyio
+async def test_deleted_conversation_is_rechecked_before_persisting_turn() -> None:
+    repository = _DeletedAfterFirstLoadRepository(_conversation())
+
+    with pytest.raises(ConversationNotFound):
+        await _run(repository=repository)
+
+    # provider 尝试已发生并落账，但绝不把回答复活成删除后的新消息/引用。
+    assert len(repository.usage) == 1
+    assert repository.query_runs == []
+    assert repository.messages == []
+    assert repository.citations == []
+
+
+@pytest.mark.anyio
+async def test_deleted_conversation_rejects_history_and_citation_reads() -> None:
+    user, assistant, citation = _prior_turn("旧回答")
+    repository = FakeConversationRepository(
+        _conversation(), messages=[user, assistant], citations=[citation]
+    )
+    conversation = repository.conversation
+    assert conversation is not None
+    repository.conversation = replace(conversation, deleted_at=datetime.now(UTC))
+
+    with pytest.raises(ConversationNotFound):
+        await load_conversation_history(
+            repository,
+            FakeEvidenceRepository([]),
+            conversation_id=CONVERSATION_ID,
+            user_id=USER_ID,
+            organization_id=ORG_ID,
+        )
+    with pytest.raises(CitationNotFound):
+        await load_citation_detail(
+            repository,
+            FakeEvidenceRepository([]),
+            citation_id=citation.id,
+            user_id=USER_ID,
+            organization_id=ORG_ID,
+        )
 
 
 # --- 追问改写 ---------------------------------------------------------------

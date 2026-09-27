@@ -32,6 +32,7 @@ from rag_backend.database import get_database_session
 from rag_backend.knowledge.service import list_accessible_knowledge_bases
 from rag_backend.models.identity import UserAccount
 from rag_backend.schemas.auth import (
+    GenerationCapability,
     KbRoleSummary,
     LoginRequest,
     MeOverviewResponse,
@@ -40,6 +41,14 @@ from rag_backend.schemas.auth import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["auth"])
+
+
+def _generation_capability(settings: Settings) -> GenerationCapability:
+    """只读地叙述生成侧事实：配置的模型名与显式关闭的 thinking；不含密钥或端点。"""
+
+    return GenerationCapability(
+        model=settings.llm_model, thinking="disabled", enabled=settings.llm_enabled
+    )
 
 
 def _user_summary(user: UserAccount) -> UserSummary:
@@ -86,7 +95,11 @@ async def login(
             secure=settings.session_cookie_secure, max_age=settings.session_ttl_seconds
         ),
     )
-    return MeResponse(user=_user_summary(user), csrf_token=csrf_token)
+    return MeResponse(
+        user=_user_summary(user),
+        csrf_token=csrf_token,
+        generation=_generation_capability(settings),
+    )
 
 
 @router.post("/auth/logout", status_code=204)
@@ -121,6 +134,7 @@ async def logout(
 
 @router.get("/me", response_model=MeOverviewResponse)
 async def me(
+    request: Request,
     context: AuthContext = Depends(current_auth_context),
     session: AsyncSession = Depends(get_database_session),
 ) -> MeOverviewResponse:
@@ -139,6 +153,7 @@ async def me(
             organization_id=context.organization_id,
         ),
         csrf_token=context.csrf_token,
+        generation=_generation_capability(request.app.state.settings),
         knowledge_bases=[
             KbRoleSummary(id=access.kb_id, name=access.name, role=access.role)
             for access in accesses

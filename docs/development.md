@@ -108,7 +108,7 @@
 
 - 后端使用 Python 3.12、`uv`、`pyproject.toml` 和 `uv.lock`。当前已锁定 FastAPI、Pydantic v2、pydantic-settings、Uvicorn、SQLAlchemy 2.x、psycopg 3、Alembic、pgvector-python、Celery 5.x、直接依赖的 Redis 客户端（登录限流与 `celery[redis]` 共用）、`argon2-cffi` 与 `markdown-it-py==4.2.0`（含 `mdurl`）；HTTPX 已是运行时依赖，用于一次性云 LLM 探针与 ASGI 接口测试。psycopg 只安装 `[binary]` extra，连接池使用 SQLAlchemy 自带实现，`psycopg_pool` 未被使用；pgvector-python 与业务的 `Vector(512)` 已在 `chunk_embedding` 落地；当前迁移创建 `vector` 扩展、第一片六张事实表、第二片三张索引表、第三片 `llm_usage` 用量账本与第四片身份三表。worker 计划使用独立同步 Session；推理进程已单独安装 PyTorch CPU 与 transformers（不用 sentence-transformers）。
 - Windows 上 psycopg 异步模式不能使用默认的 `ProactorEventLoop`：应用启动用 `--loop rag_backend.event_loop:create_event_loop` 提供自定义事件循环工厂（Windows 返回 `SelectorEventLoop`，其他平台返回 `asyncio.new_event_loop`），不修改全局事件循环 policy；Alembic 在线迁移在 Windows 内部同样切换到 `SelectorEventLoop`。
-- 前端已使用 Vue 3、Vite 和 TypeScript，并由根目录 pnpm workspace 管理。Element Plus 在出现实际组件需求后再加入，不为骨架预装。
+- 前端已使用 Vue 3、Vite、TypeScript、Tailwind CSS v4 与 shadcn-vue（reka-ui）组件，并由根目录 pnpm workspace 管理；视觉与组件来自已审核的 `ui-demos/` 视觉稿，未使用 Element Plus。
 - 开发期 Jev 判断使用 Node 脚本、Vercel AI SDK 和 `typesafe-ai/jev`，只从服务端 `AI_GATEWAY_API_KEY` 读取凭据，不进入前端产物或产品运行时。
 - 文档处理已锁定 `markdown-it-py==4.2.0`（含 `mdurl`）用于纯 Markdown 解析与切分（实现版本 `markdown-it-py-4.2.0-v1`）；文本 PDF 已锁定 `pypdf==6.19.0`（仅 `dev` 与 `worker` 依赖组，api 镜像不安装）并实现 `rag_backend.ingestion.pdf_parsing`（`pypdf-6.19.0-v1`）；中文关键词检索已锁定 `jieba==0.42.1` 并实现纯函数 `KeywordAnalyzer`（已由默认关闭的真实入库管线接线）；完整范围再加 pdfplumber、python-docx、BeautifulSoup4/lxml 和受限网页抓取。
 - 业务 LLM 的输入预算估算已锁定 `tokenizers==0.23.2`（主依赖，api 与 worker 阶段都安装）：api 侧只用于把本地渲染的 V4.1 chat 提示折算为 token 估算值，查询 embedding 客户端本身不导入它。**渲染参考与 tokenizer 是两个独立钉死的事实**：渲染规则逐字取自 recipe **源码** `deepseek-ai/deepseek-recipe` commit `8cadfede7063c896b944e7bae05daa3549ae97ea`（`deepseek-recipe-encoding/src/v4/mod.rs` 与 `dsv41.rs`），契约名 `deepseek-v41-chat-v2`（`<｜System｜>` 前置、assistant 轮次自带 `<｜Assistant｜></think>`、末尾追加生成前缀）；tokenizer 产物身份钉死在 HF 模型仓库 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` revision `6821d6ad3681a4b137b066b76094fa82ebd0a380`（size `6367257`、SHA-256 `c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b`，MIT），离线加载且不使用 `trust_remote_code`，绝不复用 worker 的 BGE 计数。api 镜像在构建期由 `backend/scripts/prepare_generation_tokenizer.py` 按该 revision 下载 `tokenizer.json`，用 Hub commit 与包内钉死的字节大小/SHA-256（非 LFS 文件另核 Git blob SHA-1）双重校验后烘入 `/models/deepseek-v41/tokenizer.json`，许可与来源说明放在模型目录之外的 `/models/deepseek-v41-LICENSE.txt`；运行期不联网、不读凭据、不挂宿主模型卷。宿主可在不构建镜像的情况下用 `TEST_DEEPSEEK_TOKENIZER_DIRECTORY` 指向仓库外真实产物目录运行真实计数用例（显式指定后目录不合规必失败，不再退化为跳过）。
@@ -121,7 +121,7 @@
 backend/src/rag_backend/   # 已建立：API、配置、数据库会话入口、auth/（会话/CSRF/限流/开户 CLI）与 knowledge/（KB 成员授权用例）
 backend/scripts/           # 已建立：api 镜像构建期脚本（prepare_generation_tokenizer.py：下载并双重校验 DeepSeek tokenizer 产物，支持 --verify）
 backend/third_party/       # 已建立：随 api 镜像分发的第三方产物许可与来源说明
-frontend/                  # 已建立：Vue 控制台骨架
+frontend/                  # 已建立：Vue 3 + Tailwind v4 + shadcn-vue 控制台（组件源码自 ui-demos 视觉审核稿迁入）
 scripts/                   # 已建立：开发辅助和质量门禁实现
 tests/tooling/             # 已建立：开发工具的 Node 测试
 tests/unit/                # 已建立：后端纯逻辑、API 骨架与部署文件静态测试

@@ -11,13 +11,15 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from rag_backend.schemas.base import CamelModel
 
 # 问题本身的字符上限；输入预算由本地 tokenizer 在装配阶段单独强制。
 MAX_QUESTION_CHARS = 8000
 MAX_REQUEST_ID_CHARS = 128
+# 会话标题上限；与 ``conversation.service.derive_conversation_title`` 的截断长度一致。
+MAX_TITLE_CHARS = 200
 
 
 class CreateConversationRequest(CamelModel):
@@ -32,6 +34,50 @@ class CreateConversationResponse(CamelModel):
     conversation_id: uuid.UUID
     kb_ids: list[uuid.UUID]
     created_at: datetime
+
+
+class ConversationSummary(CamelModel):
+    """会话列表的一行；只暴露标题、置顶状态与范围/时间，不含任何消息正文。"""
+
+    id: uuid.UUID
+    title: str | None
+    pinned: bool
+    kb_ids: list[uuid.UUID]
+    created_at: datetime
+    last_message_at: datetime | None
+
+
+class UpdateConversationRequest(CamelModel):
+    """``PATCH /conversations/{id}`` 的输入：title 与 pinned 至少提供一个。
+
+    ``title`` 为提供时的最终展示标题（去首尾空白、非空），``pinned`` 为显式布尔；
+    两者都省略的请求是无效请求，不做空操作。
+    """
+
+    title: str | None = Field(default=None, min_length=1, max_length=MAX_TITLE_CHARS)
+    pinned: bool | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _normalise_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("标题不能为空或纯空白")
+        return stripped
+
+    @model_validator(mode="after")
+    def _require_at_least_one_field(self) -> UpdateConversationRequest:
+        if self.title is None and self.pinned is None:
+            raise ValueError("title 与 pinned 至少提供一个")
+        return self
+
+
+class ConversationListResponse(CamelModel):
+    """当前用户的会话列表；本片不分页。"""
+
+    conversations: list[ConversationSummary]
 
 
 class CitationResponse(CamelModel):
@@ -107,12 +153,16 @@ class AnswerResponse(CamelModel):
 __all__ = [
     "MAX_QUESTION_CHARS",
     "MAX_REQUEST_ID_CHARS",
+    "MAX_TITLE_CHARS",
     "AnswerResponse",
     "AnswerUsageResponse",
     "AskQuestionRequest",
     "CitationResponse",
+    "ConversationListResponse",
     "ConversationMessageResponse",
     "ConversationMessagesResponse",
+    "ConversationSummary",
     "CreateConversationRequest",
     "CreateConversationResponse",
+    "UpdateConversationRequest",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
 from pydantic import Field
 
@@ -30,11 +31,23 @@ class UserSummary(CamelModel):
     organization_id: uuid.UUID
 
 
+class GenerationCapability(CamelModel):
+    """只读的生成能力事实：当前配置的模型与固定的 thinking 关闭，不可由客户端切换。
+
+    它只叙述服务端实际配置，不声称支持思考强度或模型路由。
+    """
+
+    model: str
+    thinking: Literal["disabled"]
+    enabled: bool
+
+
 class MeResponse(CamelModel):
     """GET /me 与登录成功共用的响应；CSRF 令牌供后续状态变更请求使用。"""
 
     user: UserSummary
     csrf_token: str
+    generation: GenerationCapability
 
 
 class KbRoleSummary(CamelModel):

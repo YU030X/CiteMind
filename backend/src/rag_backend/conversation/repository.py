@@ -12,18 +12,108 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_LIST_CONVERSATIONS_SQL = text(
+    """
+    SELECT c.id,
+           c.kb_scope,
+           c.title,
+           c.pinned_at,
+           c.created_at,
+           (SELECT max(m.created_at) FROM message AS m
+            WHERE m.conversation_id = c.id) AS last_message_at
+    FROM conversation AS c
+    WHERE c.owner_id = :owner_id
+      AND c.organization_id = :organization_id
+      AND c.deleted_at IS NULL
+    """
+)
 
 _LOAD_CONVERSATION_SQL = text(
     """
-    SELECT id, organization_id, owner_id, kb_scope, created_at, updated_at
+    SELECT id, organization_id, owner_id, kb_scope, title, pinned_at, created_at,
+           updated_at, deleted_at
     FROM conversation
     WHERE id = :conversation_id
       AND owner_id = :owner_id
       AND organization_id = :organization_id
+      AND deleted_at IS NULL
+    """
+)
+
+# 单会话摘要读取：PATCH 写完后按同一所有者隔离返回最新标题/置顶与最近消息时间。
+_LOAD_CONVERSATION_SUMMARY_SQL = text(
+    """
+    SELECT c.id,
+           c.kb_scope,
+           c.title,
+           c.pinned_at,
+           c.created_at,
+           (SELECT max(m.created_at) FROM message AS m
+            WHERE m.conversation_id = c.id) AS last_message_at
+    FROM conversation AS c
+    WHERE c.id = :conversation_id
+      AND c.owner_id = :owner_id
+      AND c.organization_id = :organization_id
+      AND c.deleted_at IS NULL
+    """
+)
+
+# 标题与置顶都按列级 UPDATE 授权；未提交的 None 表示不改动该字段。
+_UPDATE_CONVERSATION_SQL = text(
+    """
+    UPDATE conversation
+    SET title = COALESCE(CAST(:title AS text), title),
+        pinned_at = CASE
+            WHEN CAST(:pinned AS boolean) IS NULL THEN pinned_at
+            WHEN CAST(:pinned AS boolean) THEN COALESCE(pinned_at, now())
+            ELSE NULL
+        END,
+        updated_at = now()
+    WHERE id = :conversation_id
+      AND owner_id = :owner_id
+      AND organization_id = :organization_id
+      AND deleted_at IS NULL
+    """
+)
+
+# 软删：只写 deleted_at/updated_at；二次删除（rowcount = 0）由调用方再判是否存在。
+_SOFT_DELETE_CONVERSATION_SQL = text(
+    """
+    UPDATE conversation
+    SET deleted_at = now(),
+        updated_at = now()
+    WHERE id = :conversation_id
+      AND owner_id = :owner_id
+      AND organization_id = :organization_id
+      AND deleted_at IS NULL
+    """
+)
+
+# 所有者隔离的存在性检查：不过滤 deleted_at，用于让重复删除保持幂等 204。
+_CONVERSATION_EXISTS_SQL = text(
+    """
+    SELECT 1 FROM conversation
+    WHERE id = :conversation_id
+      AND owner_id = :owner_id
+      AND organization_id = :organization_id
+    """
+)
+
+# 首轮提问派生标题：只在尚未有标题时写入，不覆盖用户后来的改名。
+_SET_TITLE_IF_EMPTY_SQL = text(
+    """
+    UPDATE conversation
+    SET title = CAST(:title AS text),
+        updated_at = now()
+    WHERE id = :conversation_id
+      AND title IS NULL
+      AND deleted_at IS NULL
     """
 )
 
@@ -72,6 +162,7 @@ _LOAD_CITATION_FOR_OWNER_SQL = text(
     WHERE ci.id = :citation_id
       AND cv.owner_id = :owner_id
       AND cv.organization_id = :organization_id
+      AND cv.deleted_at IS NULL
     """
 )
 
@@ -147,6 +238,21 @@ class ConversationRow:
     kb_scope: tuple[uuid.UUID, ...]
     created_at: datetime
     updated_at: datetime
+    title: str | None = None
+    pinned_at: datetime | None = None
+    deleted_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConversationSummaryRow:
+    """会话列表的一行；``last_message_at`` 为空表示尚无消息，不含正文。"""
+
+    id: uuid.UUID
+    kb_scope: tuple[uuid.UUID, ...]
+    created_at: datetime
+    last_message_at: datetime | None
+    title: str | None = None
+    pinned_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -266,6 +372,36 @@ class ConversationRepository(Protocol):
         kb_scope: Sequence[uuid.UUID],
     ) -> datetime: ...
 
+    async def load_conversation_summary(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> ConversationSummaryRow | None: ...
+
+    async def update_conversation_metadata(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        title: str | None,
+        pinned: bool | None,
+    ) -> bool: ...
+
+    async def soft_delete_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> bool: ...
+
+    async def set_conversation_title_if_empty(
+        self, *, conversation_id: uuid.UUID, title: str
+    ) -> None: ...
+
     async def list_messages(self, *, conversation_id: uuid.UUID) -> list[StoredMessage]: ...
 
     async def list_citations(
@@ -327,6 +463,107 @@ class SqlConversationRepository:
             kb_scope=tuple(uuid.UUID(str(item)) for item in row["kb_scope"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            title=row["title"],
+            pinned_at=row["pinned_at"],
+            deleted_at=row["deleted_at"],
+        )
+
+    async def list_conversations(
+        self, *, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[ConversationSummaryRow]:
+        raw_rows = (
+            await self._session.execute(
+                _LIST_CONVERSATIONS_SQL,
+                {"owner_id": owner_id, "organization_id": organization_id},
+            )
+        ).mappings().all()
+        return [self._to_summary(row) for row in raw_rows]
+
+    async def load_conversation_summary(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> ConversationSummaryRow | None:
+        row = (
+            await self._session.execute(
+                _LOAD_CONVERSATION_SUMMARY_SQL,
+                {
+                    "conversation_id": conversation_id,
+                    "owner_id": owner_id,
+                    "organization_id": organization_id,
+                },
+            )
+        ).mappings().first()
+        return None if row is None else self._to_summary(row)
+
+    async def update_conversation_metadata(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        title: str | None,
+        pinned: bool | None,
+    ) -> bool:
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                _UPDATE_CONVERSATION_SQL,
+                {
+                    "conversation_id": conversation_id,
+                    "owner_id": owner_id,
+                    "organization_id": organization_id,
+                    "title": title,
+                    "pinned": pinned,
+                },
+            ),
+        )
+        return result.rowcount == 1
+
+    async def soft_delete_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> bool:
+        # 与追加追问的序号分配共用同一会话级 advisory 锁：删除与「查删除 + 插入」互相串行，
+        # 让提交前的重查能确定看到已提交的删除，避免回答在删除后复活。
+        await self._session.execute(
+            _LOCK_CONVERSATION_SQL, {"conversation_id": conversation_id}
+        )
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                _SOFT_DELETE_CONVERSATION_SQL,
+                {
+                    "conversation_id": conversation_id,
+                    "owner_id": owner_id,
+                    "organization_id": organization_id,
+                },
+            ),
+        )
+        if result.rowcount == 1:
+            return True
+        # 已删除（重复删除）仍返回 True 让路由保持幂等 204；越权/不存在返回 False。
+        exists = await self._session.scalar(
+            _CONVERSATION_EXISTS_SQL,
+            {
+                "conversation_id": conversation_id,
+                "owner_id": owner_id,
+                "organization_id": organization_id,
+            },
+        )
+        return exists is not None
+
+    async def set_conversation_title_if_empty(
+        self, *, conversation_id: uuid.UUID, title: str
+    ) -> None:
+        await self._session.execute(
+            _SET_TITLE_IF_EMPTY_SQL,
+            {"conversation_id": conversation_id, "title": title},
         )
 
     async def insert_conversation(
@@ -487,6 +724,17 @@ class SqlConversationRepository:
         await self._session.rollback()
 
     @staticmethod
+    def _to_summary(row: Any) -> ConversationSummaryRow:
+        return ConversationSummaryRow(
+            id=row["id"],
+            kb_scope=tuple(uuid.UUID(str(item)) for item in row["kb_scope"]),
+            created_at=row["created_at"],
+            last_message_at=row["last_message_at"],
+            title=row["title"],
+            pinned_at=row["pinned_at"],
+        )
+
+    @staticmethod
     def _to_citation(row: Any) -> StoredCitation:
         return StoredCitation(
             id=row["citation_id"],
@@ -507,6 +755,7 @@ __all__ = [
     "CitationRecord",
     "ConversationRepository",
     "ConversationRow",
+    "ConversationSummaryRow",
     "LlmUsageRecord",
     "MessageRecord",
     "QueryRunRecord",

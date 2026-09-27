@@ -6,11 +6,13 @@
 """
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Integer,
     Text,
@@ -24,7 +26,11 @@ from rag_backend.models.base import Base, CreatedAtMixin, UpdatedAtMixin
 
 
 class Conversation(CreatedAtMixin, UpdatedAtMixin, Base):
-    """一次问答会话；只由所有者访问，``kb_scope`` 固化可访问 KB 集合。"""
+    """一次问答会话；只由所有者访问，``kb_scope`` 固化可访问 KB 集合。
+
+    ``title`` 在首轮提问时由该问题派生（真实来源，非编造），``pinned_at`` 非空表示置顶，
+    ``deleted_at`` 非空表示逻辑删除；删除后所有读取与追加路径都必须拒绝。
+    """
 
     __tablename__ = "conversation"
 
@@ -37,6 +43,16 @@ class Conversation(CreatedAtMixin, UpdatedAtMixin, Base):
     )
     # 创建时固化的 KB 集合（UUID 字符串列表）；改写成不了扩大范围的手段。
     kb_scope: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    # 首轮提问派生的展示标题；为空表示尚无标题（如空会话或尚未追问）。
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 非空表示已置顶；未置顶为 NULL，不引入布尔列与默认值。
+    pinned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 逻辑删除时间；非空后列表、历史、引用与追加追问全部拒绝。
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class QueryRun(CreatedAtMixin, Base):

@@ -50,11 +50,16 @@ from rag_backend.conversation.repository import (
 )
 from rag_backend.conversation.service import (
     CitationView,
+    ConversationListRepository,
+    ConversationSummaryView,
     TurnResult,
     answer_question,
     create_conversation,
+    delete_conversation,
+    list_owned_conversations,
     load_citation_detail,
     load_conversation_history,
+    update_conversation,
 )
 from rag_backend.database import get_database_session
 from rag_backend.generation.context_budget import ContextBudget
@@ -85,10 +90,13 @@ from rag_backend.schemas.conversation import (
     AnswerUsageResponse,
     AskQuestionRequest,
     CitationResponse,
+    ConversationListResponse,
     ConversationMessageResponse,
     ConversationMessagesResponse,
+    ConversationSummary,
     CreateConversationRequest,
     CreateConversationResponse,
+    UpdateConversationRequest,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["conversations"])
@@ -116,6 +124,14 @@ def get_evidence_repository(
     """证据读取与检索共用同一 ``AsyncSession`` 与权威授权链。"""
 
     return SqlRetrievalRepository(session)
+
+
+def get_conversation_list_repository(
+    session: AsyncSession = Depends(get_database_session),
+) -> ConversationListRepository:
+    """会话列表只依赖单条聚合读取；与完整会话仓储分开注入，保持接口最小。"""
+
+    return SqlConversationRepository(session)
 
 
 def get_prompt_estimator(request: Request) -> PromptTokenEstimator:
@@ -146,6 +162,17 @@ def get_answer_generator(request: Request) -> Iterator[AnswerGenerator]:
         yield generator
     finally:
         generator.close()
+
+
+def _summary_response(view: ConversationSummaryView) -> ConversationSummary:
+    return ConversationSummary(
+        id=view.conversation_id,
+        title=view.title,
+        pinned=view.pinned,
+        kb_ids=list(view.kb_ids),
+        created_at=view.created_at,
+        last_message_at=view.last_message_at,
+    )
 
 
 def _citation_response(view: CitationView) -> CitationResponse:
@@ -215,6 +242,69 @@ async def create_conversation_endpoint(
         kb_ids=list(view.kb_ids),
         created_at=view.created_at,
     )
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+async def list_conversations(
+    context: AuthContext = Depends(get_auth_context),
+    repository: ConversationListRepository = Depends(get_conversation_list_repository),
+) -> ConversationListResponse:
+    """列出当前用户的会话摘要；只按所有者隔离，不读取任何消息正文。"""
+
+    views = await list_owned_conversations(
+        repository,
+        owner_id=context.user_id,
+        organization_id=context.organization_id,
+    )
+    return ConversationListResponse(conversations=[_summary_response(view) for view in views])
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationSummary)
+async def update_conversation_endpoint(
+    request: Request,
+    conversation_id: uuid.UUID,
+    payload: UpdateConversationRequest,
+    context: AuthContext = Depends(require_csrf),
+    repository: ConversationRepository = Depends(get_conversation_repository),
+) -> ConversationSummary:
+    """改名/置顶当前用户的会话；不存在、已删除或不属于本人统一返回 404。"""
+
+    settings: Settings = request.app.state.settings
+    enforce_allowed_origin(request, settings)
+    try:
+        view = await update_conversation(
+            repository,
+            conversation_id=conversation_id,
+            owner_id=context.user_id,
+            organization_id=context.organization_id,
+            title=payload.title,
+            pinned=payload.pinned,
+        )
+    except ConversationNotFound as error:
+        raise ApiError(404, CODE_CONVERSATION_NOT_FOUND, CONVERSATION_NOT_FOUND_MESSAGE) from error
+    return _summary_response(view)
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation_endpoint(
+    request: Request,
+    conversation_id: uuid.UUID,
+    context: AuthContext = Depends(require_csrf),
+    repository: ConversationRepository = Depends(get_conversation_repository),
+) -> None:
+    """逻辑删除当前用户的会话；重复删除幂等 204，不存在或不属于本人返回 404。"""
+
+    settings: Settings = request.app.state.settings
+    enforce_allowed_origin(request, settings)
+    try:
+        await delete_conversation(
+            repository,
+            conversation_id=conversation_id,
+            owner_id=context.user_id,
+            organization_id=context.organization_id,
+        )
+    except ConversationNotFound as error:
+        raise ApiError(404, CODE_CONVERSATION_NOT_FOUND, CONVERSATION_NOT_FOUND_MESSAGE) from error
 
 
 @router.get(
@@ -352,6 +442,7 @@ async def get_citation(
 
 __all__ = [
     "get_answer_generator",
+    "get_conversation_list_repository",
     "get_conversation_repository",
     "get_evidence_repository",
     "get_prompt_estimator",

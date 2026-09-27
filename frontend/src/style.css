@@ -1,84 +1,100 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * CiteMind 界面视觉合同（自 ui-demos 视觉审核稿沿用，数值未改）：
+ * 页面 #FAFAFA / 卡片 #FFFFFF / 次级面 #F7F7F6 / 主文 #18181B / 次文 #71717A
+ * 细边框 #E4E4E7 / 唯一强调 #2563EB（hover #1D4ED8）
+ * 圆角：控件 6px、卡片 8px、弹窗 10px；无渐变、毛玻璃、重阴影与夸张图标。
+ */
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC",
+    "Hiragino Sans GB", sans-serif;
+  --font-heading: var(--font-sans);
+
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
 :root {
-  color: #16211d;
-  background: #edf3ef;
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+  --radius: 0.5rem;
+
+  --background: #fafafa;
+  --foreground: #18181b;
+  --card: #ffffff;
+  --card-foreground: #18181b;
+  --popover: #ffffff;
+  --popover-foreground: #18181b;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-foreground: #ffffff;
+  --secondary: #f7f7f6;
+  --secondary-foreground: #18181b;
+  --muted: #f7f7f6;
+  --muted-foreground: #71717a;
+  --accent: #f7f7f6;
+  --accent-foreground: #18181b;
+  --destructive: #18181b;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+  --ring: #2563eb;
 }
 
-* {
-  box-sizing: border-box;
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
 }
 
-body {
-  min-width: 320px;
-  min-height: 100vh;
-  margin: 0;
+/*
+ * 视觉合同的收口：不改动 shadcn-vue 生成的组件源码，只在未分层规则里统一圆角、阴影与遮罩。
+ * 故意不放进 @layer：分层规则优先级低于 Tailwind 的 utilities 层，无法覆盖组件自带的圆角与阴影工具类。
+ */
+[data-slot="card"] {
+  border-radius: 8px;
+  box-shadow: none;
 }
 
-.shell {
-  display: grid;
-  min-height: 100vh;
-  place-items: center;
-  padding: 2rem;
+[data-slot="dialog-content"],
+[data-slot="select-content"],
+[data-slot="dropdown-menu-content"] {
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgb(24 24 27 / 8%);
 }
 
-.hero {
-  width: min(42rem, 100%);
-  padding: clamp(2rem, 6vw, 4.5rem);
-  border: 1px solid rgb(22 33 29 / 12%);
-  border-radius: 1.5rem;
-  background: rgb(255 255 255 / 88%);
-  box-shadow: 0 1.5rem 4rem rgb(39 79 61 / 12%);
+[data-slot="sheet-content"] {
+  box-shadow: 0 8px 24px rgb(24 24 27 / 8%);
 }
 
-.eyebrow {
-  margin: 0 0 0.75rem;
-  color: #2d7658;
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-}
-
-h1 {
-  margin: 0;
-  font-size: clamp(2.25rem, 8vw, 4rem);
-  letter-spacing: -0.05em;
-  line-height: 1;
-}
-
-.summary {
-  margin: 1.5rem 0 2rem;
-  color: #4f5e57;
-  font-size: 1.05rem;
-  line-height: 1.75;
-}
-
-.foundation-list {
-  display: grid;
-  gap: 0.85rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.foundation-list li {
-  display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  font-weight: 600;
-}
-
-.foundation-list span {
-  display: grid;
-  width: 1.65rem;
-  height: 1.65rem;
-  flex: 0 0 auto;
-  place-items: center;
-  border-radius: 999px;
-  color: #f8fffb;
-  background: #2d7658;
+[data-slot="dialog-overlay"],
+[data-slot="sheet-overlay"] {
+  backdrop-filter: none;
 }

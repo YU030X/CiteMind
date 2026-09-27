@@ -49,6 +49,7 @@ from rag_backend.conversation.errors import (
 from rag_backend.conversation.repository import (
     CitationRecord,
     ConversationRepository,
+    ConversationSummaryRow,
     LlmUsageRecord,
     MessageRecord,
     QueryRunRecord,
@@ -183,6 +184,21 @@ class ConversationView:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ConversationSummaryView:
+    """会话列表的一行；不含任何消息正文。
+
+    ``pinned`` 由 ``pinned_at`` 非空派生；置顶排序只用于列表，不额外暴露 ``pinned_at``。
+    """
+
+    conversation_id: uuid.UUID
+    kb_ids: tuple[uuid.UUID, ...]
+    created_at: datetime
+    last_message_at: datetime | None
+    title: str | None
+    pinned: bool
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class HistoryView:
     """会话当前合法历史。"""
 
@@ -202,10 +218,127 @@ class _CitationDraft:
     quote_hash: str
 
 
+class ConversationListRepository(Protocol):
+    """会话列表只读接口；只需要一条聚合查询，不要求完整会话仓储。"""
+
+    async def list_conversations(
+        self, *, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[ConversationSummaryRow]: ...
+
+
 def _unique(values: Sequence[uuid.UUID]) -> list[uuid.UUID]:
     """保序去重；保持检索融合顺序。"""
 
     return list(dict.fromkeys(values))
+
+
+async def list_owned_conversations(
+    repository: ConversationListRepository,
+    *,
+    owner_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> list[ConversationSummaryView]:
+    """列出当前用户的会话摘要，置顶优先，其后按最近消息时间（无消息则创建时间）稳定倒序。
+
+    只读取会话 ``kb_scope``/``title``/``pinned_at`` 与消息时间聚合，不读取任何消息正文；
+    列表由仓储单次查询完成（带相关子查询聚合），不产生 N+1。
+    """
+
+    rows = await repository.list_conversations(
+        owner_id=owner_id, organization_id=organization_id
+    )
+    views = [_summary_view(row) for row in rows]
+    views.sort(
+        key=lambda view: (
+            view.pinned,
+            view.last_message_at or view.created_at,
+            str(view.conversation_id),
+        ),
+        reverse=True,
+    )
+    return views
+
+
+# 与 ``schemas.conversation.MAX_TITLE_CHARS`` 对齐的派生标题上限。
+CONVERSATION_TITLE_MAX_CHARS = 200
+
+
+def derive_conversation_title(question: str) -> str:
+    """从首轮问题派生展示标题：取首个非空行、折叠空白并按上限截断。
+
+    标题来源永远是用户自己的问题（真实输入），不编造内容；``question`` 已由请求 schema
+    保证非空非纯空白，兜底分支同样取自真实输入。
+    """
+
+    for raw_line in question.splitlines():
+        collapsed = " ".join(raw_line.split())
+        if collapsed:
+            return collapsed[:CONVERSATION_TITLE_MAX_CHARS]
+    return " ".join(question.split())[:CONVERSATION_TITLE_MAX_CHARS]
+
+
+def _summary_view(row: ConversationSummaryRow) -> ConversationSummaryView:
+    return ConversationSummaryView(
+        conversation_id=row.id,
+        kb_ids=row.kb_scope,
+        created_at=row.created_at,
+        last_message_at=row.last_message_at,
+        title=row.title,
+        pinned=row.pinned_at is not None,
+    )
+
+
+async def update_conversation(
+    repository: ConversationRepository,
+    *,
+    conversation_id: uuid.UUID,
+    owner_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    title: str | None,
+    pinned: bool | None,
+) -> ConversationSummaryView:
+    """改名/置顶当前用户的会话；不存在、已删除、越权统一抛 :class:`ConversationNotFound`。"""
+
+    updated = await repository.update_conversation_metadata(
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+        organization_id=organization_id,
+        title=title,
+        pinned=pinned,
+    )
+    if not updated:
+        await repository.release()
+        raise ConversationNotFound("会话不存在")
+    row = await repository.load_conversation_summary(
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+        organization_id=organization_id,
+    )
+    if row is None:
+        await repository.release()
+        raise ConversationNotFound("会话不存在")
+    await repository.commit()
+    return _summary_view(row)
+
+
+async def delete_conversation(
+    repository: ConversationRepository,
+    *,
+    conversation_id: uuid.UUID,
+    owner_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> None:
+    """逻辑删除当前用户的会话；重复删除幂等，不存在或越权抛 :class:`ConversationNotFound`。"""
+
+    deleted = await repository.soft_delete_conversation(
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+        organization_id=organization_id,
+    )
+    if not deleted:
+        await repository.release()
+        raise ConversationNotFound("会话不存在")
+    await repository.commit()
 
 
 async def create_conversation(
@@ -335,6 +468,8 @@ async def answer_question(
             return await _persist_turn(
                 repository,
                 conversation_id=conversation.id,
+                user_id=user_id,
+                organization_id=organization_id,
                 question=question,
                 standalone_question=standalone_question,
                 request_id=request_id,
@@ -392,6 +527,8 @@ async def answer_question(
             return await _persist_turn(
                 repository,
                 conversation_id=conversation.id,
+                user_id=user_id,
+                organization_id=organization_id,
                 question=question,
                 standalone_question=standalone_question,
                 request_id=request_id,
@@ -410,6 +547,8 @@ async def answer_question(
         return await _persist_turn(
             repository,
             conversation_id=conversation.id,
+            user_id=user_id,
+            organization_id=organization_id,
             question=question,
             standalone_question=standalone_question,
             request_id=request_id,
@@ -813,6 +952,8 @@ async def _persist_turn(
     repository: ConversationRepository,
     *,
     conversation_id: uuid.UUID,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
     question: str,
     standalone_question: str,
     request_id: str | None,
@@ -832,7 +973,23 @@ async def _persist_turn(
     ``scope_snapshot`` 是本次检索实际解析出的可检索 KB 子集；``degraded_stages`` 只含真实异常
     造成的降级。``question`` 是原始问题（回答提示用它），``standalone_question`` 是实际用于
     查询编码与关键词检索的独立问题。
+
+    写入前先取会话级 advisory 锁再重查会话（``deleted_at`` 过滤）：若会话在模型调用期间被
+    删除则抛 :class:`ConversationNotFound`，绝不把回答复活成删除后的新消息。删除路径同样先取
+    该锁，因此“查删除 + 插入”与删除互相串行。
     """
+
+    sequence = await repository.next_message_sequence(conversation_id=conversation_id)
+    still_present = await repository.load_conversation(
+        conversation_id=conversation_id, owner_id=user_id, organization_id=organization_id
+    )
+    if still_present is None:
+        raise ConversationNotFound("会话已删除")
+    if sequence == 1:
+        # 首轮提问派生标题，只写一次且不覆盖用户后来的改名；事务失败则一同回滚。
+        await repository.set_conversation_title_if_empty(
+            conversation_id=conversation_id, title=derive_conversation_title(question)
+        )
 
     query_run_id = uuid.uuid4()
     provider_prompt = outcome.prompt_tokens if outcome is not None else None
@@ -858,7 +1015,6 @@ async def _persist_turn(
             provider_completion_tokens=provider_completion,
         )
     )
-    sequence = await repository.next_message_sequence(conversation_id=conversation_id)
     user_message_id = uuid.uuid4()
     assistant_message_id = uuid.uuid4()
     await repository.insert_message(
@@ -945,6 +1101,9 @@ __all__ = [
     "TurnUsage",
     "answer_question",
     "create_conversation",
+    "delete_conversation",
+    "derive_conversation_title",
     "load_citation_detail",
     "load_conversation_history",
+    "update_conversation",
 ]
