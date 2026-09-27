@@ -16,7 +16,7 @@
 
 vps-lite 的初始内存预算：API 0.15～0.3 GB、worker 0.3～0.6 GB、Redis 0.1～0.2 GB、数据库 0.3～0.6 GB、inference 0.5～1.0 GB、前端/网关 0.03～0.1 GB，给操作系统至少约 0.8 GB。它们是容量假设，不是最小运行要求或已测峰值。紧张时先限制并发、暂停导入或跳过重排，不靠无限 swap 隐藏问题。
 
-初始进程数：API Uvicorn worker 1，Celery concurrency 1，inference Uvicorn worker 1。推理进程只加载一份权重，限制 CPU 线程、批量和信号量；导入与问答竞争时优先问答。Celery 完整运行及队列验收在 Linux/WSL2 容器。模型文件在构建期按固定 revision 下载、校验并烘入 inference 镜像，运行期不联网也不挂宿主模型卷，且每次加载前都按包内钉死摘要与 `model-manifest.json` 重新校验实际字节；首次下载发生在构建阶段，离线启动已实测，云 API 不可用的行为仍待记录。
+初始进程数：API Uvicorn worker 1，Celery concurrency 1，inference Uvicorn worker 1。推理进程只加载一份权重，限制 CPU 线程、批量和信号量；导入与问答竞争时优先问答。Celery 完整运行及队列验收在 Linux/WSL2 容器。模型文件在构建期按固定 revision 下载、校验并烘入 inference 镜像，运行期不联网也不挂宿主模型卷，且每次加载前都按包内钉死摘要与 `model-manifest.json` 重新校验实际字节；首次下载发生在构建阶段，离线启动已实测，云 API 不可用的行为仍待记录。问答生成的输入预算另需 api 镜像内的 DeepSeek V4.1 tokenizer 产物（`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` 固定 revision `6821d6ad3681a4b137b066b76094fa82ebd0a380` 的 `tokenizer.json`，按字节大小与 SHA-256 校验后离线加载）；该产物已由 api 镜像在构建期用 `backend/scripts/prepare_generation_tokenizer.py` 按固定 revision 下载，并以 Hub commit 与钉死字节大小/SHA-256（非 LFS 文件另核 Git blob SHA-1）双重校验后烘入 `/models/deepseek-v41/tokenizer.json`，运行期不联网也不读凭据，计数器不会退化为字符/字节估算（输入/输出预算由 `LLM_INPUT_TOKEN_BUDGET`/`LLM_OUTPUT_TOKEN_BUDGET` 配置，Compose 的 api 服务已透传；命令与实测见 [开发约定](development.md)）。
 
 ## 配置、观测与恢复
 

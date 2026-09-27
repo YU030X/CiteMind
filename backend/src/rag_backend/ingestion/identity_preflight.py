@@ -4,16 +4,16 @@
 消息。调用方（未来的 worker）自行读取 ``ingest_job.profile_id``、
 ``document.source_type``、``document_version.parser_version`` 与 ``index_profile`` 行，
 把结果作为普通数据传入；本模块返回互斥的静态判定枚举。``expected`` 契约由 worker
-启动时构造并校验一次后注入，``expected_parser_version`` 由调用方传入
-``rag_backend.ingestion.parsing.MARKDOWN_PARSER_VERSION``，因此本模块不导入解析、模型或数据库
-依赖，导入期只引入标准库。
+启动时构造并校验一次后注入，``expected_parser_version`` 由调用方按 ``source_type`` 选定
+当前实现版本（``markdown`` 用 ``MARKDOWN_PARSER_VERSION``，``pdf`` 用 ``PDF_PARSER_VERSION``），
+因此本模块不导入解析、模型或数据库依赖，导入期只引入标准库。
 
 判定优先级（前者命中即返回，保证互斥）：
 
 1. ``job_profile_id is None`` → ``PROFILE_UNBOUND``：旧任务未绑定，不自动补绑。
 2. ``stored_profile is None`` → ``PROFILE_MISSING``：已绑定但读不到对应行。
 3. ``stored_profile.profile_id != job_profile_id`` → ``PROFILE_ID_MISMATCH``：行与绑定不符。
-4. ``source_type`` 不在 :data:`SUPPORTED_SOURCE_TYPES` → ``SOURCE_UNSUPPORTED``（当前仅 markdown）。
+4. ``source_type`` 不在 :data:`SUPPORTED_SOURCE_TYPES` → ``SOURCE_UNSUPPORTED``。
 5. ``parser_version != expected_parser_version`` → ``PARSER_UNSUPPORTED``：占位版本不自动升级。
 6. 用行七字段构造契约失败（如 ``normalize=False`` 或非法 ``dimension``）→ ``CONTRACT_MISMATCH``。
 7. 行七字段规范 hash 与行 ``config_hash`` 不一致 → ``HASH_MISMATCH``。
@@ -33,10 +33,12 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from rag_backend.models.profile_contract import IndexProfileContract
 
-# 当前唯一受支持的来源类型；PDF 属于后续切片，不在这里实现。字面量与
-# ``rag_backend.ingestion.service.SOURCE_TYPE_MARKDOWN`` 由单测交叉约束。
+# 当前受支持的来源类型；字面量与 ``rag_backend.ingestion.service`` 的同名常量由单测交叉约束。
 SOURCE_TYPE_MARKDOWN: Final = "markdown"
-SUPPORTED_SOURCE_TYPES: Final[frozenset[str]] = frozenset({SOURCE_TYPE_MARKDOWN})
+SOURCE_TYPE_PDF: Final = "pdf"
+SUPPORTED_SOURCE_TYPES: Final[frozenset[str]] = frozenset(
+    {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF}
+)
 
 
 class ProfileIdentityDecision(Enum):

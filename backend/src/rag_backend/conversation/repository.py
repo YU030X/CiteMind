@@ -1,0 +1,516 @@
+"""问答会话的参数化 SQL 仓储。
+
+持有调用方 ``AsyncSession``，不自行创建连接；``commit`` 与 ``release`` 由用例显式调用，
+使模型调用期间不持有事务。所有者隔离在 SQL 内完成（``owner_id`` 与 ``organization_id``），
+引用读取还必须经 ``message → conversation`` 回到所有者，避免跨会话读取引用。
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+_LOAD_CONVERSATION_SQL = text(
+    """
+    SELECT id, organization_id, owner_id, kb_scope, created_at, updated_at
+    FROM conversation
+    WHERE id = :conversation_id
+      AND owner_id = :owner_id
+      AND organization_id = :organization_id
+    """
+)
+
+_INSERT_CONVERSATION_SQL = text(
+    """
+    INSERT INTO conversation (id, organization_id, owner_id, kb_scope)
+    VALUES (:id, :organization_id, :owner_id, CAST(:kb_scope AS jsonb))
+    RETURNING created_at
+    """
+)
+
+_LIST_MESSAGES_SQL = text(
+    """
+    SELECT id, sequence, role, content, query_run_id, created_at
+    FROM message
+    WHERE conversation_id = :conversation_id
+    ORDER BY sequence ASC
+    """
+)
+
+_CITATION_COLUMNS = (
+    "ci.id AS citation_id, ci.message_id, ci.display_label, ci.chunk_id, ci.version_id, "
+    "ci.locator_snapshot, ci.quote, ci.quote_hash, dv.version_no AS version_no, "
+    "d.id AS document_id, d.title AS document_title"
+)
+
+_LIST_CITATIONS_SQL = text(
+    f"""
+    SELECT {_CITATION_COLUMNS}
+    FROM citation AS ci
+    JOIN document_version AS dv ON dv.id = ci.version_id
+    JOIN document AS d ON d.id = dv.document_id
+    WHERE ci.message_id IN :message_ids
+    ORDER BY ci.display_label ASC
+    """
+).bindparams(bindparam("message_ids", expanding=True))
+
+_LOAD_CITATION_FOR_OWNER_SQL = text(
+    f"""
+    SELECT {_CITATION_COLUMNS}
+    FROM citation AS ci
+    JOIN message AS m ON m.id = ci.message_id
+    JOIN conversation AS cv ON cv.id = m.conversation_id
+    JOIN document_version AS dv ON dv.id = ci.version_id
+    JOIN document AS d ON d.id = dv.document_id
+    WHERE ci.id = :citation_id
+      AND cv.owner_id = :owner_id
+      AND cv.organization_id = :organization_id
+    """
+)
+
+# 会话级 advisory 事务锁：序列化同一会话的并发序号分配，且不需要给 api 角色任何 UPDATE
+# 权限（``SELECT ... FOR UPDATE`` 会额外要求 UPDATE 权限，而会话表在应用语义上是只写一次）。
+_LOCK_CONVERSATION_SQL = text(
+    "SELECT pg_advisory_xact_lock(hashtextextended(cast(:conversation_id AS text), 0))"
+)
+
+_NEXT_SEQUENCE_SQL = text(
+    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM message WHERE conversation_id = :conversation_id"
+)
+
+_INSERT_QUERY_RUN_SQL = text(
+    """
+    INSERT INTO query_run (
+        id, conversation_id, question, standalone_question, request_id,
+        scope_snapshot, input_token_budget, output_token_budget,
+        estimated_input_tokens, evidence_count, status, insufficient_evidence,
+        degraded_stages, llm_usage_id, provider_prompt_tokens, provider_completion_tokens
+    ) VALUES (
+        :id, :conversation_id, :question, :standalone_question, :request_id,
+        CAST(:scope_snapshot AS jsonb), :input_token_budget, :output_token_budget,
+        :estimated_input_tokens, :evidence_count, :status, :insufficient_evidence,
+        CAST(:degraded_stages AS jsonb), :llm_usage_id, :provider_prompt_tokens,
+        :provider_completion_tokens
+    )
+    """
+)
+
+_INSERT_MESSAGE_SQL = text(
+    """
+    INSERT INTO message (id, conversation_id, sequence, role, content, query_run_id)
+    VALUES (:id, :conversation_id, :sequence, :role, :content, :query_run_id)
+    """
+)
+
+_INSERT_CITATION_SQL = text(
+    """
+    INSERT INTO citation (
+        id, message_id, query_run_id, chunk_id, version_id, display_label,
+        locator_snapshot, quote, quote_hash
+    ) VALUES (
+        :id, :message_id, :query_run_id, :chunk_id, :version_id, :display_label,
+        CAST(:locator_snapshot AS jsonb), :quote, :quote_hash
+    )
+    """
+)
+
+# 与一次性探针使用同一张 append-only 账本；这里只写 provider 实际上报的事实。
+_INSERT_LLM_USAGE_SQL = text(
+    """
+    INSERT INTO llm_usage (
+        id, provider, model, stage, status, error_code, usage_source, attempt,
+        prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens, latency_ms
+    ) VALUES (
+        :id, :provider, :model, :stage, :status, :error_code, :usage_source, :attempt,
+        :prompt_tokens, :completion_tokens, :prompt_cache_hit_tokens,
+        :prompt_cache_miss_tokens, :latency_ms
+    )
+    """
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConversationRow:
+    """一次会话的持久事实。"""
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    owner_id: uuid.UUID
+    kb_scope: tuple[uuid.UUID, ...]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StoredMessage:
+    """会话内一条按 ``sequence`` 排序的消息。"""
+
+    id: uuid.UUID
+    sequence: int
+    role: str
+    content: str
+    query_run_id: uuid.UUID | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StoredCitation:
+    """一条引用快照及其来源版本信息。"""
+
+    id: uuid.UUID
+    message_id: uuid.UUID
+    display_label: str
+    chunk_id: uuid.UUID
+    version_id: uuid.UUID
+    document_id: uuid.UUID
+    document_title: str
+    version_no: int
+    locator: dict[str, Any]
+    quote: str
+    quote_hash: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LlmUsageRecord:
+    """一次 provider attempt 的账本事实；token 缺失时必须为 None，不得伪造。"""
+
+    id: uuid.UUID
+    provider: str
+    model: str
+    stage: str
+    status: str
+    error_code: str | None
+    usage_source: str
+    attempt: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    prompt_cache_hit_tokens: int | None
+    prompt_cache_miss_tokens: int | None
+    latency_ms: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class QueryRunRecord:
+    """一次问答运行的落库事实。"""
+
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    question: str
+    standalone_question: str
+    request_id: str | None
+    scope_snapshot: tuple[uuid.UUID, ...]
+    input_token_budget: int
+    output_token_budget: int
+    estimated_input_tokens: int | None
+    evidence_count: int
+    status: str
+    insufficient_evidence: bool
+    degraded_stages: tuple[str, ...]
+    llm_usage_id: uuid.UUID | None
+    provider_prompt_tokens: int | None
+    provider_completion_tokens: int | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MessageRecord:
+    """一条待写入的消息；``sequence`` 由仓储在会话行锁内分配。"""
+
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    sequence: int
+    role: str
+    content: str
+    query_run_id: uuid.UUID | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CitationRecord:
+    """一条待写入的引用快照；locator 与 quote 都来自服务端读取的 chunk。"""
+
+    id: uuid.UUID
+    message_id: uuid.UUID
+    query_run_id: uuid.UUID
+    chunk_id: uuid.UUID
+    version_id: uuid.UUID
+    display_label: str
+    locator: dict[str, Any]
+    quote: str
+    quote_hash: str
+
+
+class ConversationRepository(Protocol):
+    """问答会话读写接口；``commit``/``release`` 由调用方显式控制事务边界。"""
+
+    async def load_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> ConversationRow | None: ...
+
+    async def insert_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        kb_scope: Sequence[uuid.UUID],
+    ) -> datetime: ...
+
+    async def list_messages(self, *, conversation_id: uuid.UUID) -> list[StoredMessage]: ...
+
+    async def list_citations(
+        self, *, message_ids: Sequence[uuid.UUID]
+    ) -> list[StoredCitation]: ...
+
+    async def load_citation_for_owner(
+        self,
+        *,
+        citation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> StoredCitation | None: ...
+
+    async def next_message_sequence(self, *, conversation_id: uuid.UUID) -> int: ...
+
+    async def insert_query_run(self, record: QueryRunRecord) -> None: ...
+
+    async def insert_message(self, record: MessageRecord) -> None: ...
+
+    async def insert_citation(self, record: CitationRecord) -> None: ...
+
+    async def insert_llm_usage(self, record: LlmUsageRecord) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def release(self) -> None: ...
+
+
+class SqlConversationRepository:
+    """基于调用方 ``AsyncSession`` 的实现；不自行提交或回滚，除非调用方要求。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def load_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> ConversationRow | None:
+        row = (
+            await self._session.execute(
+                _LOAD_CONVERSATION_SQL,
+                {
+                    "conversation_id": conversation_id,
+                    "owner_id": owner_id,
+                    "organization_id": organization_id,
+                },
+            )
+        ).mappings().first()
+        if row is None:
+            return None
+        return ConversationRow(
+            id=row["id"],
+            organization_id=row["organization_id"],
+            owner_id=row["owner_id"],
+            kb_scope=tuple(uuid.UUID(str(item)) for item in row["kb_scope"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def insert_conversation(
+        self,
+        *,
+        conversation_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        kb_scope: Sequence[uuid.UUID],
+    ) -> datetime:
+        created_at = await self._session.scalar(
+            _INSERT_CONVERSATION_SQL,
+            {
+                "id": conversation_id,
+                "organization_id": organization_id,
+                "owner_id": owner_id,
+                "kb_scope": json.dumps([str(item) for item in kb_scope]),
+            },
+        )
+        assert isinstance(created_at, datetime)
+        return created_at
+
+    async def list_messages(self, *, conversation_id: uuid.UUID) -> list[StoredMessage]:
+        rows = (
+            await self._session.execute(
+                _LIST_MESSAGES_SQL, {"conversation_id": conversation_id}
+            )
+        ).mappings().all()
+        return [
+            StoredMessage(
+                id=row["id"],
+                sequence=int(row["sequence"]),
+                role=str(row["role"]),
+                content=str(row["content"]),
+                query_run_id=row["query_run_id"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def list_citations(
+        self, *, message_ids: Sequence[uuid.UUID]
+    ) -> list[StoredCitation]:
+        if not message_ids:
+            return []
+        rows = (
+            await self._session.execute(
+                _LIST_CITATIONS_SQL, {"message_ids": list(message_ids)}
+            )
+        ).mappings().all()
+        return [self._to_citation(row) for row in rows]
+
+    async def load_citation_for_owner(
+        self,
+        *,
+        citation_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+    ) -> StoredCitation | None:
+        row = (
+            await self._session.execute(
+                _LOAD_CITATION_FOR_OWNER_SQL,
+                {
+                    "citation_id": citation_id,
+                    "owner_id": owner_id,
+                    "organization_id": organization_id,
+                },
+            )
+        ).mappings().first()
+        return None if row is None else self._to_citation(row)
+
+    async def next_message_sequence(self, *, conversation_id: uuid.UUID) -> int:
+        # 会话行锁把同一会话的并发追问串行化，避免 (conversation_id, sequence) 冲突。
+        await self._session.execute(
+            _LOCK_CONVERSATION_SQL, {"conversation_id": conversation_id}
+        )
+        value = await self._session.scalar(
+            _NEXT_SEQUENCE_SQL, {"conversation_id": conversation_id}
+        )
+        return int(value or 1)
+
+    async def insert_query_run(self, record: QueryRunRecord) -> None:
+        await self._session.execute(
+            _INSERT_QUERY_RUN_SQL,
+            {
+                "id": record.id,
+                "conversation_id": record.conversation_id,
+                "question": record.question,
+                "standalone_question": record.standalone_question,
+                "request_id": record.request_id,
+                "scope_snapshot": json.dumps([str(item) for item in record.scope_snapshot]),
+                "input_token_budget": record.input_token_budget,
+                "output_token_budget": record.output_token_budget,
+                "estimated_input_tokens": record.estimated_input_tokens,
+                "evidence_count": record.evidence_count,
+                "status": record.status,
+                "insufficient_evidence": record.insufficient_evidence,
+                "degraded_stages": json.dumps(list(record.degraded_stages)),
+                "llm_usage_id": record.llm_usage_id,
+                "provider_prompt_tokens": record.provider_prompt_tokens,
+                "provider_completion_tokens": record.provider_completion_tokens,
+            },
+        )
+
+    async def insert_message(self, record: MessageRecord) -> None:
+        await self._session.execute(
+            _INSERT_MESSAGE_SQL,
+            {
+                "id": record.id,
+                "conversation_id": record.conversation_id,
+                "sequence": record.sequence,
+                "role": record.role,
+                "content": record.content,
+                "query_run_id": record.query_run_id,
+            },
+        )
+
+    async def insert_citation(self, record: CitationRecord) -> None:
+        await self._session.execute(
+            _INSERT_CITATION_SQL,
+            {
+                "id": record.id,
+                "message_id": record.message_id,
+                "query_run_id": record.query_run_id,
+                "chunk_id": record.chunk_id,
+                "version_id": record.version_id,
+                "display_label": record.display_label,
+                "locator_snapshot": json.dumps(record.locator),
+                "quote": record.quote,
+                "quote_hash": record.quote_hash,
+            },
+        )
+
+    async def insert_llm_usage(self, record: LlmUsageRecord) -> None:
+        await self._session.execute(
+            _INSERT_LLM_USAGE_SQL,
+            {
+                "id": record.id,
+                "provider": record.provider,
+                "model": record.model,
+                "stage": record.stage,
+                "status": record.status,
+                "error_code": record.error_code,
+                "usage_source": record.usage_source,
+                "attempt": record.attempt,
+                "prompt_tokens": record.prompt_tokens,
+                "completion_tokens": record.completion_tokens,
+                "prompt_cache_hit_tokens": record.prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": record.prompt_cache_miss_tokens,
+                "latency_ms": record.latency_ms,
+            },
+        )
+
+    async def commit(self) -> None:
+        await self._session.commit()
+
+    async def release(self) -> None:
+        await self._session.rollback()
+
+    @staticmethod
+    def _to_citation(row: Any) -> StoredCitation:
+        return StoredCitation(
+            id=row["citation_id"],
+            message_id=row["message_id"],
+            display_label=str(row["display_label"]),
+            chunk_id=row["chunk_id"],
+            version_id=row["version_id"],
+            document_id=row["document_id"],
+            document_title=str(row["document_title"]),
+            version_no=int(row["version_no"]),
+            locator=dict(row["locator_snapshot"]),
+            quote=str(row["quote"]),
+            quote_hash=str(row["quote_hash"]),
+        )
+
+
+__all__ = [
+    "CitationRecord",
+    "ConversationRepository",
+    "ConversationRow",
+    "LlmUsageRecord",
+    "MessageRecord",
+    "QueryRunRecord",
+    "SqlConversationRepository",
+    "StoredCitation",
+    "StoredMessage",
+]

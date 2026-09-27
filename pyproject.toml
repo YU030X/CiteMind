@@ -19,20 +19,22 @@ dependencies = [
   "python-multipart>=0.0.20,<1",
   "redis>=5,<7",
   "sqlalchemy>=2.0,<3",
+  # 业务 LLM 的输入预算估算固定使用 tokenizers==0.23.2：api 与 worker 阶段都安装。api 侧只
+  # 用它加载 DeepSeek tokenizer 产物，查询 embedding 客户端本身不依赖它。
+  "tokenizers==0.23.2",
   "uvicorn[standard]>=0.35,<1",
 ]
 
 [dependency-groups]
 dev = [
   "mypy>=1.17,<2",
+  "pypdf==6.19.0",
   "pytest>=8.4,<10",
   "ruff>=0.12,<1",
-  # 本地 dev 组供单测构造 fixture 并对照计数；生产镜像仅 worker stage 安装。
-  "tokenizers==0.23.2",
 ]
 worker = [
-  # worker 本地真实 token 计数依赖；api stage 不安装该依赖，也不复制 tokenizer 产物。
-  "tokenizers==0.23.2",
+  # worker 侧 PDF 解析依赖；api 镜像不安装 pypdf，也不复制 BGE tokenizer 产物。
+  "pypdf==6.19.0",
 ]
 
 [build-system]

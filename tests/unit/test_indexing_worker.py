@@ -27,17 +27,29 @@ def claim_facts(**overrides: Any) -> iw.ClaimFacts:
         "parser_version": "markdown-it-py-4.2.0-v1",
         "expected_parser_version": "markdown-it-py-4.2.0-v1",
         "version_no": 1,
-        "document_active_version_present": False,
+        "document_active_version_id": None,
         "ready_generation_present": False,
+        "expected_active_version_id": None,
     }
     values.update(overrides)
     return iw.ClaimFacts(**values)
+
+
+ACTIVE_VERSION = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
+STALE_VERSION = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
 
 
 @pytest.mark.parametrize(
     ("facts", "expected"),
     [
         (claim_facts(), iw.ClaimAction.CLAIM),
+        (
+            claim_facts(
+                parser_version="pypdf-6.19.0-v1",
+                expected_parser_version="pypdf-6.19.0-v1",
+            ),
+            iw.ClaimAction.CLAIM,
+        ),
         (claim_facts(status="READY"), iw.ClaimAction.NOT_QUEUED),
         (claim_facts(status="PARSING"), iw.ClaimAction.NOT_QUEUED),
         (claim_facts(status="FAILED"), iw.ClaimAction.NOT_QUEUED),
@@ -50,15 +62,33 @@ def claim_facts(**overrides: Any) -> iw.ClaimFacts:
         ),
         (claim_facts(profile_bound=False), iw.ClaimAction.LEGACY_UNSUPPORTED),
         (claim_facts(parser_version="markdown-v1"), iw.ClaimAction.LEGACY_UNSUPPORTED),
+        (claim_facts(expected_parser_version=None), iw.ClaimAction.LEGACY_UNSUPPORTED),
         (claim_facts(version_no=2), iw.ClaimAction.UNSUPPORTED_UPDATE),
         (
-            claim_facts(document_active_version_present=True),
+            claim_facts(
+                version_no=2,
+                document_active_version_id=ACTIVE_VERSION,
+                expected_active_version_id=ACTIVE_VERSION,
+            ),
+            iw.ClaimAction.CLAIM,
+        ),
+        (
+            claim_facts(
+                version_no=2,
+                document_active_version_id=ACTIVE_VERSION,
+                expected_active_version_id=STALE_VERSION,
+            ),
+            iw.ClaimAction.STALE_EXPECTED,
+        ),
+        (
+            claim_facts(document_active_version_id=ACTIVE_VERSION),
             iw.ClaimAction.UNSUPPORTED_UPDATE,
         ),
         (claim_facts(ready_generation_present=True), iw.ClaimAction.UNSUPPORTED_UPDATE),
     ],
     ids=[
         "claimable",
+        "claimable-pdf",
         "ready",
         "active",
         "failed",
@@ -68,7 +98,10 @@ def claim_facts(**overrides: Any) -> iw.ClaimFacts:
         "diagnostic",
         "unbound-profile",
         "legacy-parser",
+        "unsupported-source-none-version",
         "second-version",
+        "second-version-update",
+        "second-version-stale-expected",
         "already-active-version",
         "already-ready-generation",
     ],
@@ -290,9 +323,10 @@ def test_process_status_constants_are_distinct() -> None:
         iw.PROCESS_STATUS_LEGACY_UNSUPPORTED,
         iw.PROCESS_STATUS_EXISTING_DIAGNOSTIC,
         iw.PROCESS_STATUS_UNSUPPORTED_UPDATE,
+        iw.PROCESS_STATUS_STALE_EXPECTED,
         iw.PROCESS_STATUS_FAILED,
         iw.PROCESS_STATUS_LEASE_LOST,
         iw.PROCESS_STATUS_CLAIMED,
         iw.PROCESS_STATUS_PERSIST_UNCONFIRMED,
     }
-    assert len(statuses) == 12
+    assert len(statuses) == 13

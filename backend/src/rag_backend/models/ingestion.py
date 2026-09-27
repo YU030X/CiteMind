@@ -1,7 +1,10 @@
 """入库任务与 outbox 事件模型。
 
 ``ingest_job`` 在第二切片新增可空的 ``generation_id``，在第五切片新增可空的
-``profile_id`` 外键；租约由 owner/token/until 三列共同表达，三者必须同时为空
+``profile_id`` 外键，并在文档更新/删除切片新增可空的 ``request_title``：后者是受理那一刻
+的不可变请求标题快照，供幂等判定与原始请求比对（``document.title`` 会随新版本切换而改变，
+不能再作为请求身份）。既有行的 ``request_title`` 保持 NULL，应用对 NULL 行回退到既有
+``document.title`` 比较。租约由 owner/token/until 三列共同表达，三者必须同时为空
 或同时非空。新 Markdown 上传已写入 ``profile_id``，既有任务仍可为 NULL；
 worker 核对任务 profile 与目标 generation/profile 一致并限制更改的处理路径尚未接线，
 数据库也不阻止 UPDATE。
@@ -85,6 +88,8 @@ class IngestJob(CreatedAtMixin, UpdatedAtMixin, Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     dedupe_key: Mapped[str] = mapped_column(Text, nullable=False)
+    # 受理那一刻的规范化请求标题；不可变快照，仅用于幂等身份比对。旧任务为 NULL。
+    request_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

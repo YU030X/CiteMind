@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 
 from rag_backend.api.auth import router as auth_router
+from rag_backend.api.conversations import router as conversations_router
 from rag_backend.api.documents import router as documents_router
 from rag_backend.api.errors import (
     REQUEST_ID_HEADER,
@@ -15,6 +16,7 @@ from rag_backend.api.errors import (
     sanitize_request_id,
 )
 from rag_backend.api.knowledge_bases import router as knowledge_bases_router
+from rag_backend.api.retrieval import router as retrieval_router
 from rag_backend.auth.passwords import warm_password_hashing
 from rag_backend.auth.ratelimit import LoginRateLimiter, create_login_rate_limiter
 from rag_backend.config import Settings, get_settings
@@ -80,6 +82,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(knowledge_bases_router)
     app.include_router(documents_router)
+    app.include_router(retrieval_router)
+    app.include_router(conversations_router)
 
     @app.middleware("http")
     async def attach_request_id(

@@ -17,6 +17,7 @@ from rag_backend.api.errors import (
     CODE_AUTH_DEPENDENCY_UNAVAILABLE,
     CODE_AUTH_REQUIRED,
     CODE_CSRF_INVALID,
+    CODE_DOCUMENT_NOT_FOUND,
     CODE_KNOWLEDGE_BASE_NOT_FOUND,
     CODE_ORIGIN_NOT_ALLOWED,
     ApiError,
@@ -28,7 +29,12 @@ from rag_backend.auth.tokens import CSRF_HEADER_NAME, csrf_tokens_match
 from rag_backend.config import Settings, normalise_origin
 from rag_backend.database import get_database_session
 from rag_backend.knowledge.roles import KbRole, kb_role_rank
-from rag_backend.knowledge.service import KbAccess, resolve_knowledge_base_access
+from rag_backend.knowledge.service import (
+    DocumentAccess,
+    KbAccess,
+    resolve_document_access,
+    resolve_knowledge_base_access,
+)
 
 
 def get_login_rate_limiter(request: Request) -> LoginRateLimiter:
@@ -132,6 +138,37 @@ def require_kb_role(
                 404,
                 CODE_KNOWLEDGE_BASE_NOT_FOUND,
                 "知识库不存在或无权访问",
+            )
+        return access
+
+    return dependency
+
+
+def require_document_role(
+    minimum_role: KbRole,
+) -> Callable[..., Awaitable[DocumentAccess]]:
+    """构造「文档 → KB」最小角色依赖；角色由本次请求的数据库查询判定。
+
+    ``document_id`` 是路径参数；解析到文档所属 KB 后按会话组织与未撤销成员判定角色。
+    文档不存在、属于其他组织、成员已撤销或角色不足都统一返回不暴露存在性的 404。
+    """
+
+    async def dependency(
+        document_id: uuid.UUID,
+        context: AuthContext = Depends(get_auth_context),
+        session: AsyncSession = Depends(get_database_session),
+    ) -> DocumentAccess:
+        access = await resolve_document_access(
+            session,
+            document_id=document_id,
+            user_id=context.user_id,
+            organization_id=context.organization_id,
+        )
+        if access is None or kb_role_rank(access.role) < kb_role_rank(minimum_role):
+            raise ApiError(
+                404,
+                CODE_DOCUMENT_NOT_FOUND,
+                "文档不存在或无权访问",
             )
         return access
 

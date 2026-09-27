@@ -208,11 +208,21 @@ class Settings(BaseSettings):
     allow_llm_probe: bool = False
     # 云生成模型名保持配置化；默认值来自供应商文档，实际可用性由真实探针核对。
     llm_model: str = "deepseek-flash"
-    # 内部 embedding 服务的受限基址与单请求超时；只有 worker 侧受限客户端会读取它们。
-    # 三项都不加 CITEMIND_ 前缀。非 Compose 直接使用 Settings 时可不配置 token，进程仍能
-    # 正常启动；deploy/compose/compose.yml 的两个服务（inference、worker）已按既有插值把
-    # INFERENCE_TOKEN 声明为必填，因此 Compose 启动前必须提供该变量。无论哪种方式，只有真正
-    # 构造受限客户端时才会因 token 缺失或不合法而 failfast。
+    # 问答生成的初始 token 预算：输入目标由 api 侧本地 tokenizer 估算执行，输出上限交给 provider
+    # 的 max_tokens 精确强制。两者都是初值，需在开发集上再评估；本配置不发起任何 provider 调用。
+    llm_input_token_budget: int = 4000
+    llm_output_token_budget: int = 800
+    # 业务问答生成总开关：默认关闭，关闭时问答端点静态失败且绝不联网。开启时必须配置
+    # LLM_API_KEY（启动期可独立判断）。
+    llm_enabled: bool = False
+    # 业务生成的单次 provider 超时与有界响应体上限；超时返回 TIMEOUT 事实而不是重试。
+    llm_timeout_seconds: float = 60.0
+    llm_max_response_bytes: int = 262144
+    # 内部 embedding 服务的受限基址与单请求超时；worker 侧受限客户端与 api 侧检索/问答的查询
+    # 编码客户端都会读取它们。三项都不加 CITEMIND_ 前缀。非 Compose 直接使用 Settings 时可不
+    # 配置 token，进程仍能正常启动；deploy/compose/compose.yml 的 inference、worker 与 api
+    # 三个服务都按既有插值把 INFERENCE_TOKEN 声明为必填，因此 Compose 启动前必须提供该变量。
+    # 无论哪种方式，只有真正构造受限客户端时才会因 token 缺失或不合法而 failfast。
     inference_base_url: str = DEFAULT_INFERENCE_BASE_URL
     inference_timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS
     inference_token: SecretStr | None = None
@@ -290,6 +300,20 @@ class Settings(BaseSettings):
             self.llm_api_key = None
         if not self.llm_model.strip():
             raise ValueError("llm_model 不能为空字符串")
+        if self.llm_input_token_budget <= 0:
+            raise ValueError("llm_input_token_budget 必须为正数")
+        if self.llm_output_token_budget <= 0:
+            raise ValueError("llm_output_token_budget 必须为正数")
+        if (
+            not math.isfinite(self.llm_timeout_seconds)
+            or self.llm_timeout_seconds <= 0
+        ):
+            raise ValueError("llm_timeout_seconds 必须是有限正数")
+        if self.llm_max_response_bytes <= 0:
+            raise ValueError("llm_max_response_bytes 必须为正数")
+        if self.llm_enabled and self.llm_api_key is None:
+            # 业务生成必须能向固定 endpoint 发请求；缺失密钥属启动期可独立判断的无效配置。
+            raise ValueError("开启 llm_enabled 必须配置 LLM_API_KEY")
         if not self.inference_base_url.strip():
             raise ValueError("inference_base_url 不能为空字符串")
         if (

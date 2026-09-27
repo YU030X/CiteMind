@@ -28,6 +28,7 @@ from rag_backend.api.documents import (
 )
 from rag_backend.api.errors import (
     CODE_DOCUMENT_EMPTY,
+    CODE_DOCUMENT_NOT_PDF,
     CODE_DOCUMENT_NOT_TEXT,
     CODE_DOCUMENT_TITLE_INVALID,
     CODE_DOCUMENT_TOO_LARGE,
@@ -46,6 +47,7 @@ from rag_backend.ingestion import parsing
 from rag_backend.ingestion import service as ingestion_service
 from rag_backend.ingestion.errors import (
     DocumentEmpty,
+    DocumentNotPdf,
     DocumentNotText,
     DocumentTooLarge,
     IdempotencyConflict,
@@ -61,6 +63,7 @@ from rag_backend.ingestion.storage import (
     content_hash,
 )
 from rag_backend.ingestion.validation import (
+    MARKDOWN_MEDIA_TYPE,
     MAX_IDEMPOTENCY_KEY_LENGTH,
     MAX_MARKDOWN_BYTES,
     build_dedupe_key,
@@ -443,6 +446,7 @@ def test_upload_openapi_documents_multipart_body() -> None:
         (DocumentTooLarge("x"), 413, CODE_DOCUMENT_TOO_LARGE),
         (DocumentEmpty("x"), 422, CODE_DOCUMENT_EMPTY),
         (DocumentNotText("x"), 422, CODE_DOCUMENT_NOT_TEXT),
+        (DocumentNotPdf("x"), 422, CODE_DOCUMENT_NOT_PDF),
         (UnsupportedDocumentType("x"), 422, CODE_UNSUPPORTED_DOCUMENT_TYPE),
         (TitleInvalid("x"), 422, CODE_DOCUMENT_TITLE_INVALID),
         (IdempotencyKeyInvalid("x"), 422, CODE_IDEMPOTENCY_KEY_INVALID),
@@ -496,6 +500,9 @@ async def test_insert_upload_registers_parser_implementation_version(
         file_ref="ref",
         file_hash="hash",
         dedupe_key="key",
+        source_type=ingestion_service.SOURCE_TYPE_MARKDOWN,
+        media_type=MARKDOWN_MEDIA_TYPE,
+        parser_version=parsing.MARKDOWN_PARSER_VERSION,
     )
 
     assert outcome.reused is False
@@ -526,6 +533,8 @@ async def test_idempotent_replay_reuses_old_job_without_rewriting_version(
         version_id=uuid.uuid4(),
         title="t",
         file_hash=content_hash(content),
+        document_deleted=False,
+        expected_active_version_id=None,
     )
     write_calls: list[object] = []
 
@@ -825,6 +834,8 @@ async def test_insert_upload_reuses_job_on_dedupe_key_conflict(
         version_id=uuid.uuid4(),
         title="t",
         file_hash="hash",
+        document_deleted=False,
+        expected_active_version_id=None,
     )
     load_calls: list[str] = []
 
@@ -852,6 +863,9 @@ async def test_insert_upload_reuses_job_on_dedupe_key_conflict(
         file_ref="ref",
         file_hash="hash",
         dedupe_key="key",
+        source_type=ingestion_service.SOURCE_TYPE_MARKDOWN,
+        media_type=MARKDOWN_MEDIA_TYPE,
+        parser_version=parsing.MARKDOWN_PARSER_VERSION,
     )
 
     assert outcome.reused is True
@@ -899,6 +913,9 @@ async def test_insert_upload_reraises_non_dedupe_integrity_error(
             file_ref="ref",
             file_hash="hash",
             dedupe_key="key",
+            source_type=ingestion_service.SOURCE_TYPE_MARKDOWN,
+            media_type=MARKDOWN_MEDIA_TYPE,
+            parser_version=parsing.MARKDOWN_PARSER_VERSION,
         )
 
     assert raised.value is error
@@ -1141,3 +1158,60 @@ async def test_upload_profile_conflict_fails_closed_with_static_500(
     assert payload["message"] == "服务器内部错误"
     assert "embedding_model" not in response.text
     assert "config_hash" not in response.text
+
+
+@pytest.mark.anyio
+async def test_upload_pdf_dispatches_to_pdf_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.pdf 后缀分派到 create_pdf_document，而不是 Markdown 路径。"""
+
+    calls: list[str] = []
+
+    async def fake_pdf(*args: object, **kwargs: object) -> object:
+        calls.append("pdf")
+        return ingestion_service.UploadOutcome(
+            document_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            job_id=uuid.uuid4(),
+            reused=False,
+        )
+
+    async def forbidden_markdown(*args: object, **kwargs: object) -> object:
+        raise AssertionError("PDF 上传不得走 Markdown 分支")
+
+    monkeypatch.setattr(ingestion_service, "create_pdf_document", fake_pdf)
+    monkeypatch.setattr(ingestion_service, "create_markdown_document", forbidden_markdown)
+
+    app = build_upload_app()
+    body = multipart_body(
+        multipart_part("title", data="报告".encode()),
+        multipart_part("file", filename="report.pdf", data=b"%PDF-1.4 minimal"),
+    )
+    response = await post_upload(
+        app,
+        content_type=f"multipart/form-data; boundary={UPLOAD_BOUNDARY}",
+        body=body,
+    )
+
+    assert response.status_code == 202
+    assert calls == ["pdf"]
+
+
+@pytest.mark.anyio
+async def test_upload_pdf_without_magic_is_rejected_with_422() -> None:
+    """声明 .pdf 但内容无 PDF 魔数：受理期 fail closed，返回 422。"""
+
+    app = build_upload_app()
+    body = multipart_body(
+        multipart_part("title", data="报告".encode()),
+        multipart_part("file", filename="report.pdf", data=b"plain text not pdf"),
+    )
+    response = await post_upload(
+        app,
+        content_type=f"multipart/form-data; boundary={UPLOAD_BOUNDARY}",
+        body=body,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == CODE_DOCUMENT_NOT_PDF

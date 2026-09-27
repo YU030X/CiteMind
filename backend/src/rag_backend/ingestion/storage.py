@@ -28,7 +28,8 @@ from rag_backend.ingestion.errors import (
     DocumentNotText,
     IngestionError,
 )
-from rag_backend.ingestion.validation import MAX_MARKDOWN_BYTES, decode_markdown_content
+from rag_backend.ingestion.pdf_parsing import PDF_MAGIC
+from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES, decode_markdown_content
 
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 # 单次读取块大小；只影响内存占用与系统调用次数，不影响 20,000,000 字节上限判定。
@@ -96,6 +97,24 @@ class DocumentBlobStore:
     def exists(self, file_ref: str) -> bool:
         return self.path_for(file_ref).is_file()
 
+    def read_verified_blob(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> bytes:
+        """校验式有限读取二进制 blob，返回原始字节；不做 UTF-8/控制字节判定。
+
+        与 :meth:`read_verified_markdown` 共用同一严格的 ``file_ref``/父目录符号链接/
+        常规文件/大小/摘要校验，只是不把内容当作 Markdown 文本解码，因此 PDF 等二进制
+        原文件可被安全读回。调用方仍需自行校验二进制形状（如 PDF 魔数）。
+        """
+
+        if file_ref != self.blob_ref(kb_id, file_hash):
+            raise InvalidBlobReference("file_ref 与 kb_id/内容摘要不匹配")
+        target = self.path_for(file_ref)
+        data = self._read_bounded_regular_file(target)
+        if content_hash(data) != file_hash:
+            raise BlobCorrupt("blob 内容摘要与登记值不一致")
+        return data
+
     def read_verified_markdown(
         self, kb_id: uuid.UUID, file_ref: str, file_hash: str
     ) -> str:
@@ -117,19 +136,22 @@ class DocumentBlobStore:
         无论成功、超限还是校验失败，文件描述符都在 ``finally`` 中关闭。
         """
 
-        # 先做纯字符串级校验：blob_ref 会拒绝非法摘要，file_ref 必须与之完全一致，
-        # 从而拒绝跨 KB、跨摘要或用户构造的任意路径。
-        if file_ref != self.blob_ref(kb_id, file_hash):
-            raise InvalidBlobReference("file_ref 与 kb_id/内容摘要不匹配")
-        target = self.path_for(file_ref)
-        data = self._read_bounded_regular_file(target)
-        if content_hash(data) != file_hash:
-            raise BlobCorrupt("blob 内容摘要与登记值不一致")
+        data = self.read_verified_blob(kb_id, file_ref, file_hash)
         try:
             return decode_markdown_content(data)
         except (DocumentEmpty, DocumentNotText):
             # 空内容、非法 UTF-8 或二进制控制字节统一按内容损坏处理。
             raise BlobCorrupt("blob 内容不是有效的 Markdown 文本") from None
+
+    def read_verified_pdf(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> bytes:
+        """校验式有限读取 PDF blob：在二进制校验之外要求 ``%PDF-`` 魔数头。"""
+
+        data = self.read_verified_blob(kb_id, file_ref, file_hash)
+        if not data.startswith(PDF_MAGIC):
+            raise BlobCorrupt("blob 内容不是可识别的 PDF")
+        return data
 
     def _read_bounded_regular_file(self, target: Path) -> bytes:
         """以有界读取返回字节；拒绝符号链接/联接点、非常规文件、缺失与超限。"""
@@ -143,7 +165,7 @@ class DocumentBlobStore:
                 raise BlobUnsafe("无法读取 blob 文件状态") from None
             if not stat.S_ISREG(info.st_mode):
                 raise BlobUnsafe("blob 不是普通文件")
-            if info.st_size > MAX_MARKDOWN_BYTES:
+            if info.st_size > MAX_DOCUMENT_BYTES:
                 raise BlobTooLarge("blob 超过单文件字节上限")
             try:
                 return self._read_bytes(descriptor)
@@ -203,12 +225,12 @@ class DocumentBlobStore:
         total = 0
         while True:
             chunk = os.read(
-                descriptor, min(_READ_CHUNK_BYTES, MAX_MARKDOWN_BYTES - total + 1)
+                descriptor, min(_READ_CHUNK_BYTES, MAX_DOCUMENT_BYTES - total + 1)
             )
             if not chunk:
                 return b"".join(chunks)
             total += len(chunk)
-            if total > MAX_MARKDOWN_BYTES:
+            if total > MAX_DOCUMENT_BYTES:
                 raise BlobTooLarge("blob 超过单文件字节上限")
             chunks.append(chunk)
 

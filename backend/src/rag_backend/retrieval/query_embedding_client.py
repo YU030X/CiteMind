@@ -2,8 +2,8 @@
 
 专用于把**单条**用户查询编码为检索向量，供未来检索切片依赖注入。与 worker 的
 :mod:`rag_backend.ingestion.embedding_client` 分离：本模块不导入 tokenizer、worker 身份或
-ingestion 预算代码，因此 API 进程（不安装 ``tokenizers``）也能安全导入；查询本地没有
-tokenizer，因此不做 token 预算，只做字符/字节上限与响应契约校验。
+ingestion 预算代码，导入它也不会加载 ``tokenizers``；查询本地不做 token 预算，只做字符/字节
+上限与响应契约校验（生成侧的输入预算估算另由 :mod:`rag_backend.generation` 负责）。
 
 查询 instruction 前缀由 inference 服务端在编码前**恰好追加一次**（契约
 :data:`QUERY_ENCODING_CONTRACT`）；客户端只发送原始查询文本，绝不去重或改写用户输入。
@@ -71,6 +71,9 @@ MAX_MODEL_INPUT_CHARS = 8000
 MAX_MODEL_INPUT_BYTES = 262144
 PREFIX_CHARS = len(QUERY_INSTRUCTION_PREFIX)
 PREFIX_BYTES = len(QUERY_INSTRUCTION_PREFIX.encode("utf-8"))
+# 原始用户查询可接受的字符上限：完整模型输入上限减去服务端追加的前缀。请求层用同一常量
+# 在解析阶段早拒超长输入，避免为必然被拒的查询先付分词/网络成本；本客户端仍自行校验。
+MAX_QUERY_CHARS = MAX_MODEL_INPUT_CHARS - PREFIX_CHARS
 MIN_TOKEN_COUNT = 1
 MAX_TOKEN_COUNT = 512
 # 成功响应体上限；Content-Length 只用于早拒，真实字节仍按流累计。

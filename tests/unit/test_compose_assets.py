@@ -22,9 +22,17 @@ GITATTRIBUTES = REPO_ROOT / ".gitattributes"
 DOCKER_EXECUTABLE = shutil.which("docker")
 COMPOSE_CONFIG_TIMEOUT_SECONDS = 60
 INGEST_PROCESSING_ENV_VAR = "INGEST_PROCESSING_ENABLED"
+# 问答生成的 token 预算只在 api 生效；这两个键也必须从渲染环境里清掉，避免宿主同名变量改变结果。
+GENERATION_BUDGET_ENV_VARS = ("LLM_INPUT_TOKEN_BUDGET", "LLM_OUTPUT_TOKEN_BUDGET")
 # 这些进程环境键会改变 compose 的输入文件选择；渲染测试显式清掉以只读仓库文件。
 COMPOSE_ENV_OVERRIDE_KEYS = frozenset(
-    {INGEST_PROCESSING_ENV_VAR, "COMPOSE_ENV_FILES", "COMPOSE_FILE", "COMPOSE_PROJECT_NAME"}
+    {
+        INGEST_PROCESSING_ENV_VAR,
+        *GENERATION_BUDGET_ENV_VARS,
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_FILE",
+        "COMPOSE_PROJECT_NAME",
+    }
 )
 
 # 项目自有变量去前缀后不再有统一前缀，正则只能按形态抓取，因此显式排除第三方环境变量名，
@@ -438,7 +446,9 @@ def test_compose_worker_gets_ingest_processing_flag_and_api_does_not() -> None:
 
 
 def render_compose_config(
-    *extra_files: Path, ingest_processing: str | None
+    *extra_files: Path,
+    ingest_processing: str | None,
+    overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """用真实 `docker compose config --format json` 渲染配置。
 
@@ -456,6 +466,8 @@ def render_compose_config(
     }
     if ingest_processing is not None:
         env[INGEST_PROCESSING_ENV_VAR] = ingest_processing
+    if overrides:
+        env.update(overrides)
     command = [
         DOCKER_EXECUTABLE,
         "compose",
@@ -509,3 +521,72 @@ def test_compose_config_passes_ingest_processing_enable_to_worker_only(
 
     assert service_environment(config, "worker")[INGEST_PROCESSING_ENV_VAR] == "1"
     assert INGEST_PROCESSING_ENV_VAR not in service_environment(config, "api")
+
+
+# --- 问答生成 token 预算的 Compose 透传（只在 api） -----------------------------
+
+
+def test_compose_api_passes_generation_budgets_and_worker_does_not() -> None:
+    api_block = compose_service_block("api")
+    worker_block = compose_service_block("worker")
+
+    assert "LLM_INPUT_TOKEN_BUDGET: ${LLM_INPUT_TOKEN_BUDGET:-4000}" in api_block
+    assert "LLM_OUTPUT_TOKEN_BUDGET: ${LLM_OUTPUT_TOKEN_BUDGET:-800}" in api_block
+    for key in GENERATION_BUDGET_ENV_VARS:
+        assert key not in worker_block, "worker 不做问答生成，不得透传预算键"
+
+
+def test_env_example_documents_generation_budgets() -> None:
+    content = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    for key in GENERATION_BUDGET_ENV_VARS:
+        assert key in content
+
+
+@pytest.mark.parametrize(
+    "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
+)
+def test_compose_config_defaults_generation_budgets_for_api_only(
+    extra_files: tuple[Path, ...],
+) -> None:
+    config = render_compose_config(*extra_files, ingest_processing=None)
+    api_environment = service_environment(config, "api")
+    worker_environment = service_environment(config, "worker")
+
+    assert api_environment["LLM_INPUT_TOKEN_BUDGET"] == "4000"
+    assert api_environment["LLM_OUTPUT_TOKEN_BUDGET"] == "800"
+    for key in GENERATION_BUDGET_ENV_VARS:
+        assert key not in worker_environment
+
+
+@pytest.mark.parametrize(
+    "extra_files", [(), (QUEUE_COMPOSE_FILE,)], ids=["base", "queue-override"]
+)
+def test_compose_config_passes_generation_budget_overrides_to_api(
+    extra_files: tuple[Path, ...],
+) -> None:
+    config = render_compose_config(
+        *extra_files,
+        ingest_processing=None,
+        overrides={"LLM_INPUT_TOKEN_BUDGET": "1234", "LLM_OUTPUT_TOKEN_BUDGET": "321"},
+    )
+
+    assert service_environment(config, "api")["LLM_INPUT_TOKEN_BUDGET"] == "1234"
+    assert service_environment(config, "api")["LLM_OUTPUT_TOKEN_BUDGET"] == "321"
+
+
+def test_api_stage_bakes_the_pinned_deepseek_tokenizer() -> None:
+    content = DOCKERFILE.read_text(encoding="utf-8")
+    api_stage = content.split("FROM runtime AS api", 1)[1].split("FROM runtime AS worker", 1)[0]
+    worker_stage = content.split("FROM runtime AS worker", 1)[1]
+
+    assert "RUN python backend/scripts/prepare_generation_tokenizer.py" in api_stage
+    assert (
+        "COPY backend/third_party/deepseek-v4-flash-vision-exp-LICENSE.txt "
+        "/models/deepseek-v41-LICENSE.txt" in api_stage
+    )
+    # 构建期下载需要临时切回 root，但 api stage 必须以非 root 用户结束。
+    uvicorn_entrypoint = 'CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0"'
+    assert uvicorn_entrypoint in api_stage
+    assert api_stage.count("USER citemind") == 1
+    assert "prepare_generation_tokenizer" not in worker_stage

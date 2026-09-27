@@ -23,6 +23,10 @@ class DocumentNotText(IngestionError):
     """内容不是有效 UTF-8 文本，或含有伪装成文本的二进制控制字节。"""
 
 
+class DocumentNotPdf(IngestionError):
+    """内容不具备 PDF 魔数头，不是可识别的 PDF。"""
+
+
 class DocumentTooLarge(IngestionError):
     """内容超过单文件字节上限。"""
 
@@ -37,6 +41,18 @@ class IdempotencyKeyInvalid(IngestionError):
 
 class IdempotencyConflict(IngestionError):
     """同一 Idempotency-Key 已用于不同的内容或标题。"""
+
+
+class DocumentNotFound(IngestionError):
+    """目标文档不存在、不属于该 KB，或调用方无权访问；对外不区分。"""
+
+
+class DocumentDeleted(IngestionError):
+    """目标文档已被逻辑删除；不得把已删除文档当作有效资源继续写入或复用。"""
+
+
+class ExpectedVersionConflict(IngestionError):
+    """``expectedVersionId`` 与文档当前有效版本不一致；调用方需重读后重试。"""
 
 
 class BlobReadError(IngestionError):

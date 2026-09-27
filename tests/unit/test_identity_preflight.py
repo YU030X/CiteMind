@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from rag_backend.ingestion.identity_preflight import (
     SOURCE_TYPE_MARKDOWN,
+    SOURCE_TYPE_PDF,
     SUPPORTED_SOURCE_TYPES,
     ProfileIdentityDecision,
     StoredIndexProfile,
@@ -23,7 +24,9 @@ from rag_backend.ingestion.identity_preflight import (
     static_reason,
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.service import SOURCE_TYPE_MARKDOWN as SERVICE_SOURCE_TYPE
+from rag_backend.ingestion.service import SOURCE_TYPE_PDF as SERVICE_SOURCE_TYPE_PDF
 from rag_backend.models.profile_contract import (
     IndexProfileContract,
     ProfileContractError,
@@ -32,7 +35,7 @@ from rag_backend.models.profile_contract import (
 
 PARSER_VERSION = MARKDOWN_PARSER_VERSION
 LEGACY_PARSER_VERSION = "markdown-v1"
-UNSUPPORTED_SOURCE = "pdf"
+UNSUPPORTED_SOURCE = "docx"
 PROFILE_ID_A = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
 PROFILE_ID_B = uuid.UUID("00000000-0000-0000-0000-0000000000b2")
 
@@ -316,9 +319,24 @@ def test_profile_contract_error_is_a_value_error() -> None:
     assert issubclass(ProfileContractError, ValueError)
 
 
-def test_supported_source_types_cover_only_markdown() -> None:
-    assert SUPPORTED_SOURCE_TYPES == frozenset({SOURCE_TYPE_MARKDOWN})
+def test_supported_source_types_cover_markdown_and_pdf() -> None:
+    assert SUPPORTED_SOURCE_TYPES == frozenset({SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF})
     assert SOURCE_TYPE_MARKDOWN == SERVICE_SOURCE_TYPE
+    assert SOURCE_TYPE_PDF == SERVICE_SOURCE_TYPE_PDF
+    assert SOURCE_TYPE_PDF == "pdf"
+
+
+def test_pdf_source_with_pdf_parser_is_allowed(expected: IndexProfileContract) -> None:
+    assert (
+        _decide(
+            expected,
+            _stored(expected),
+            source_type=SOURCE_TYPE_PDF,
+            parser_version=PDF_PARSER_VERSION,
+            expected_parser_version=PDF_PARSER_VERSION,
+        )
+        is ProfileIdentityDecision.ALLOWED
+    )
 
 
 # ---------------------------------------------------------------------------

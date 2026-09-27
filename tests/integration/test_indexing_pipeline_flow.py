@@ -31,6 +31,7 @@ from rag_backend.ingestion.embedding_client import (
     EmbeddingPermanentError,
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy import Engine, create_engine, text
@@ -86,6 +87,7 @@ class FakeAnalyzer:
 class FakeIdentity:
     profile: IndexProfileContract
     parser_version: str
+    pdf_parser_version: str
     token_counter: FakeCounter
     keyword_analyzer: FakeAnalyzer
 
@@ -209,6 +211,7 @@ def seed_job(
     *,
     profile: IndexProfileContract = PROFILE,
     parser_version: str = MARKDOWN_PARSER_VERSION,
+    source_type: str = "markdown",
     version_no: int = 1,
     content: bytes = MARKDOWN_BODY.encode(),
     kb_id: uuid.UUID | None = None,
@@ -227,6 +230,7 @@ def seed_job(
     job_id = uuid.uuid4()
     file_hash = hashlib.sha256(content).hexdigest()
     file_ref = storage.blob_ref(kb_id, file_hash)
+    mime = "application/pdf" if source_type == "pdf" else "text/markdown"
     if write_blob:
         storage.publish(kb_id, file_hash, content)
 
@@ -248,16 +252,16 @@ def seed_job(
         connection.execute(
             text(
                 "INSERT INTO document (id, kb_id, title, source_type, lifecycle_status) "
-                "VALUES (:id, :kb_id, 'doc', 'markdown', 'CREATED')"
+                "VALUES (:id, :kb_id, 'doc', :source_type, 'CREATED')"
             ),
-            {"id": document_id, "kb_id": kb_id},
+            {"id": document_id, "kb_id": kb_id, "source_type": source_type},
         )
         connection.execute(
             text(
                 "INSERT INTO document_version (id, document_id, version_no, file_ref, "
                 "file_hash, mime, parser_version, status) "
                 "VALUES (:id, :document_id, :version_no, :file_ref, :file_hash, "
-                "'text/markdown', :parser_version, 'PENDING')"
+                ":mime, :parser_version, 'PENDING')"
             ),
             {
                 "id": version_id,
@@ -265,6 +269,7 @@ def seed_job(
                 "version_no": version_no,
                 "file_ref": file_ref,
                 "file_hash": file_hash,
+                "mime": mime,
                 "parser_version": parser_version,
             },
         )
@@ -318,6 +323,7 @@ def make_dependencies(
     resolved_identity = identity or FakeIdentity(
         profile=PROFILE,
         parser_version=MARKDOWN_PARSER_VERSION,
+        pdf_parser_version="pypdf-6.19.0-v1",
         token_counter=FakeCounter(),
         keyword_analyzer=FakeAnalyzer(),
     )
@@ -883,3 +889,115 @@ def test_concurrent_publish_of_two_documents_in_same_kb_keeps_pointer(
         document = read_document(pipeline_schema, seeded.document_id)
         assert document["lifecycle_status"] == "READY"
         assert document["active_version_id"] == seeded.version_id
+
+
+# --- 文本 PDF 真实入库（真解析子进程 + 假计数/编码器） -------------------------
+
+
+def _build_pdf(pages: list[str]) -> bytes:
+    """用 pypdf 构造带真实文本层的最小 PDF；空字符串表示空白页。"""
+
+    import io
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_ref = writer._add_object(font)
+    for page_text in pages:
+        page = writer.add_blank_page(width=200, height=200)
+        if page_text:
+            stream = DecodedStreamObject()
+            stream.set_data(
+                ("BT /F1 12 Tf 10 100 Td (" + page_text + ") Tj ET").encode("latin-1")
+            )
+            page[NameObject("/Contents")] = writer._add_object(stream)
+            page[NameObject("/Resources")] = DictionaryObject(
+                {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+            )
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def test_pdf_pipeline_publishes_ready_with_page_locator(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    raw = _build_pdf(["PDF page one body", "PDF page two body"])
+    seeded = seed_job(
+        pipeline_schema,
+        storage,
+        parser_version=PDF_PARSER_VERSION,
+        source_type="pdf",
+        content=raw,
+    )
+    dependencies = make_dependencies(worker_sessions, storage)
+
+    status = iw.process_ingest_event(
+        dependencies, job_id=seeded.job_id, event_id=str(uuid.uuid4())
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    job = read_job(pipeline_schema, seeded.job_id)
+    assert job["status"] == "READY"
+    document = read_document(pipeline_schema, seeded.document_id)
+    assert document["active_version_id"] == seeded.version_id
+    with pipeline_schema.connect() as connection:
+        locators = [
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT source_locator FROM chunk WHERE document_id = :id "
+                    "ORDER BY chunk_index"
+                ),
+                {"id": seeded.document_id},
+            )
+        ]
+    assert locators
+    for locator in locators:
+        assert locator["locator_version"] == 2
+        assert locator["source_type"] == "pdf"
+        assert len(locator["pages"]) == 1
+        assert "start_line" not in locator
+
+
+def test_pdf_zero_text_marks_version_needs_ocr(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    raw = _build_pdf([""])
+    seeded = seed_job(
+        pipeline_schema,
+        storage,
+        parser_version=PDF_PARSER_VERSION,
+        source_type="pdf",
+        content=raw,
+    )
+    dependencies = make_dependencies(worker_sessions, storage)
+
+    status = iw.process_ingest_event(
+        dependencies, job_id=seeded.job_id, event_id=str(uuid.uuid4())
+    )
+
+    assert status == iw.PROCESS_STATUS_FAILED
+    job = read_job(pipeline_schema, seeded.job_id)
+    assert job["status"] == "FAILED"
+    assert job["error_code"] == iw.ERROR_PIPELINE_NEEDS_OCR
+    with pipeline_schema.connect() as connection:
+        version_status = connection.scalar(
+            text("SELECT status FROM document_version WHERE id = :id"),
+            {"id": seeded.version_id},
+        )
+    assert version_status == "NEEDS_OCR"
+    assert count_rows(pipeline_schema, "index_generation", "version_id", seeded.version_id) == 0
+    assert read_document(pipeline_schema, seeded.document_id)["lifecycle_status"] == "FAILED"

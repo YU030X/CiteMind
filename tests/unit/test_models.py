@@ -20,8 +20,13 @@ FIRST_SLICE_TABLES = {
 SECOND_SLICE_TABLES = {"index_generation", "chunk", "chunk_embedding"}
 LLM_USAGE_TABLES = {"llm_usage"}
 IDENTITY_TABLES = {"user_account", "auth_session", "kb_member"}
+CONVERSATION_TABLES = {"conversation", "message", "query_run", "citation"}
 EXPECTED_TABLES = (
-    FIRST_SLICE_TABLES | SECOND_SLICE_TABLES | LLM_USAGE_TABLES | IDENTITY_TABLES
+    FIRST_SLICE_TABLES
+    | SECOND_SLICE_TABLES
+    | LLM_USAGE_TABLES
+    | IDENTITY_TABLES
+    | CONVERSATION_TABLES
 )
 
 # chunk_embedding 的主键来自 chunk，不是应用新生成的 UUID。
@@ -37,6 +42,7 @@ UPDATED_AT_TABLES = {
     "user_account",
     "auth_session",
     "kb_member",
+    "conversation",
 }
 
 # ``expires_at`` 由应用按会话 TTL 显式写入，是唯一非空但没有 server_default 的时间列。
@@ -141,6 +147,40 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "fk_kb_member_user_id_user_account",
         "uq_kb_member_kb_id_user_id",
         "ck_kb_member_role",
+    },
+    "conversation": {
+        "pk_conversation",
+        "fk_conversation_owner_id_user_account",
+    },
+    "query_run": {
+        "pk_query_run",
+        "fk_query_run_conversation_id_conversation",
+        "fk_query_run_llm_usage_id_llm_usage",
+        "ck_query_run_status",
+        "ck_query_run_input_token_budget_positive",
+        "ck_query_run_output_token_budget_positive",
+        "ck_query_run_estimated_input_tokens_non_negative",
+        "ck_query_run_evidence_count_non_negative",
+        "ck_query_run_provider_prompt_tokens_non_negative",
+        "ck_query_run_provider_completion_tokens_non_negative",
+        "ck_query_run_question_non_empty",
+    },
+    "message": {
+        "pk_message",
+        "fk_message_conversation_id_conversation",
+        "fk_message_query_run_id_query_run",
+        "uq_message_conversation_id_sequence",
+        "ck_message_role",
+        "ck_message_sequence_positive",
+    },
+    "citation": {
+        "pk_citation",
+        "fk_citation_message_id_message",
+        "fk_citation_query_run_id_query_run",
+        "fk_citation_chunk_id_chunk",
+        "fk_citation_version_id_document_version",
+        "uq_citation_message_id_display_label",
+        "ck_citation_display_label_non_empty",
     },
 }
 
@@ -302,6 +342,16 @@ def test_ingest_job_profile_id_is_a_nullable_restrict_foreign_key() -> None:
     assert foreign_key.onupdate == "RESTRICT"
     assert foreign_key.constraint is not None
     assert foreign_key.constraint.name == "fk_ingest_job_profile_id_index_profile"
+
+
+def test_ingest_job_request_title_is_a_nullable_text_snapshot() -> None:
+    """``request_title`` 是可空的受理快照列：无 server default、旧行为 NULL。"""
+
+    column = metadata.tables["ingest_job"].columns["request_title"]
+
+    assert column.nullable is True
+    assert isinstance(column.type, sa.Text)
+    assert column.server_default is None
 
 
 def test_chunk_embedding_vector_dimension_is_fixed_at_512() -> None:

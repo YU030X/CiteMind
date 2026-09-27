@@ -38,9 +38,10 @@ from test_core_migration import (
 
 pytestmark = pytest.mark.integration
 
-# 上传事务的 ORM 会显式写入 ``ingest_job.profile_id``（可空），该列由 ``20260925_0006``
-# 新增；因此上传片必须建在上含该列的线性 schema 上，不能用 0005。
-SCHEMA_REVISION = "20260925_0006"
+# 上传事务的 ORM 会显式写入 ``ingest_job.profile_id``（``20260925_0006``）与受理时刻的
+# ``ingest_job.request_title``（``20260926_0008``）；因此上传片必须建在建有这两列的线性
+# schema 上，不能用更旧的 revision。
+SCHEMA_REVISION = "20260926_0008"
 
 # 默认 index profile 契约与其规范 JSON 的 SHA-256；与 profile 契约/登记聚焦测试一致。
 GOLDEN_CONFIG_HASH = "4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa"
@@ -826,6 +827,14 @@ async def test_invalid_content_and_type_create_nothing(
             client,
             kb_id,
             idempotency_key=unique_key(),
+            filename="notes.docx",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            csrf=csrf,
+        )
+        wrong_pdf = await upload(
+            client,
+            kb_id,
+            idempotency_key=unique_key(),
             filename="notes.pdf",
             content_type="application/pdf",
             csrf=csrf,
@@ -837,6 +846,7 @@ async def test_invalid_content_and_type_create_nothing(
         wrong_type.status_code == 422
         and wrong_type.json()["code"] == "UNSUPPORTED_DOCUMENT_TYPE"
     )
+    assert wrong_pdf.status_code == 422 and wrong_pdf.json()["code"] == "DOCUMENT_NOT_PDF"
     assert count_rows(upload_schema, "document") == before
     assert blob_files(blob_directory) == before_files
 
@@ -1013,3 +1023,106 @@ def test_worker_role_cannot_register_index_profile(
         "tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash) "
         "VALUES ('00000000-0000-0000-0000-000000000099', 'm', 'r', 512, true, 't', 'c', 'k', 'h')",
     )
+
+
+# --- 文本 PDF 上传受理 -------------------------------------------------------
+
+
+def _minimal_pdf_bytes(pages: list[str]) -> bytes:
+    """用 pypdf 构造带文本层的最小 PDF（仅测试样本，不提交二进制）。"""
+
+    import io
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_ref = writer._add_object(font)
+    for page_text in pages:
+        page = writer.add_blank_page(width=200, height=200)
+        if page_text:
+            stream = DecodedStreamObject()
+            stream.set_data(
+                ("BT /F1 12 Tf 10 100 Td (" + page_text + ") Tj ET").encode("latin-1")
+            )
+            page[NameObject("/Contents")] = writer._add_object(stream)
+            page[NameObject("/Resources")] = DictionaryObject(
+                {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+            )
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+@pytest.mark.anyio
+async def test_editor_upload_pdf_writes_pdf_facts(
+    upload_schema: Engine, upload_settings: Settings, blob_directory: Path
+) -> None:
+    """`.pdf` 后缀上传登记 `source_type=pdf`、PDF MIME 与真实 PDF 解析器版本。"""
+
+    from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
+
+    raw = _minimal_pdf_bytes(["PDF upload page"])
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        response = await upload(
+            client,
+            kb_id,
+            idempotency_key=unique_key(),
+            title="PDF 报告",
+            content=raw,
+            filename="report.pdf",
+            content_type="application/pdf",
+            csrf=csrf,
+        )
+
+    assert response.status_code == 202, response.text
+    document_id = uuid.UUID(response.json()["documentId"])
+    version_id = uuid.UUID(response.json()["versionId"])
+    assert document_row(upload_schema, document_id)["source_type"] == "pdf"
+    digest = hashlib.sha256(raw).hexdigest()
+    version = version_row(upload_schema, version_id)
+    assert version["mime"] == "application/pdf"
+    assert version["parser_version"] == PDF_PARSER_VERSION
+    assert (blob_directory / f"{kb_id}/{digest}").read_bytes() == raw
+
+
+@pytest.mark.anyio
+async def test_editor_upload_pdf_without_magic_is_rejected(
+    upload_schema: Engine, upload_settings: Settings
+) -> None:
+    """`.pdf` 后缀但内容无 `%PDF-` 魔数：422，不落库。"""
+
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+    before = count_rows(upload_schema, "document")
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        response = await upload(
+            client,
+            kb_id,
+            idempotency_key=unique_key(),
+            content=b"plain text pretending pdf",
+            filename="report.pdf",
+            content_type="application/pdf",
+            csrf=csrf,
+        )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "DOCUMENT_NOT_PDF"
+    assert count_rows(upload_schema, "document") == before

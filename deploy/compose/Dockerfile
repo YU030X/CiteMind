@@ -33,14 +33,26 @@ USER citemind
 # --no-proxy-headers：由应用自己按 TRUSTED_PROXY_CIDRS 解析 X-Real-IP，
 # 不让 uvicorn 改写 request.client，避免两套代理信任规则并存。
 FROM runtime AS api
+# 构建期下载需要写入镜像根下的 /models；与 inference 构建期一致，只在构建阶段以 root 执行，
+# 随后立即恢复非 root 运行用户。
+USER root
+# 问答生成的输入预算需要 DeepSeek V4.1 tokenizer 产物：只在构建期从固定 revision 下载，
+# 并用 Hub commit 与包内钉死的字节大小/SHA-256 双重校验后烘入 /models/deepseek-v41；
+# 运行期完全离线、不读凭据、不挂载宿主模型卷。
+RUN python backend/scripts/prepare_generation_tokenizer.py
+# 随镜像分发上游许可与来源说明；放在模型目录之外，/models/deepseek-v41/ 仍恰为一个产物。
+COPY backend/third_party/deepseek-v4-flash-vision-exp-LICENSE.txt /models/deepseek-v41-LICENSE.txt
+USER citemind
 EXPOSE 8000
 CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]
 
 # worker final target：必须是最后一个 stage，未指定 --target 时默认构建它。
 FROM runtime AS worker
-# 只有 worker 需要本地真实 token 计数：tokenizers 依赖只装在 worker stage，api stage 不安装。
+# worker 额外安装 pypdf（PDF 解析，只在 worker 依赖组）。tokenizers 自 generation 切片起属主依赖，
+# api 与 worker 阶段都会安装；DeepSeek 生成预算所需 tokenizer 产物只在 api 阶段烘入（worker
+# 不做问答生成），依赖与镜像计划见 docs/development.md。
 RUN --mount=type=cache,target=/home/citemind/.cache/uv,uid=10001,gid=10001 uv sync --frozen --no-dev --group worker
-# tokenizer 产物只在 inference 构建期生成，通过 Compose 具名构建上下文 model_assets 复制。
+# BGE tokenizer 产物只在 inference 构建期生成，通过 Compose 具名构建上下文 model_assets 复制。
 # 只取计数所需的四个文件，使目录内恰为这四个，不含 config.json 与 model.safetensors。
 COPY --from=model_assets /models/bge-small-zh-v1.5/tokenizer.json /models/bge-small-zh-v1.5/tokenizer.json
 COPY --from=model_assets /models/bge-small-zh-v1.5/vocab.txt /models/bge-small-zh-v1.5/vocab.txt

@@ -104,6 +104,16 @@ services:
       # Phase 1：由 API 进程 lifespan 承载 outbox dispatcher，向 Redis 的 ingest 队列投递。
       # 非 Compose 默认关闭（Settings.dispatcher_enabled=false），避免测试进程意外连 broker。
       DISPATCHER_ENABLED: "true"
+      # 问答生成的 token 预算：输入目标由 api 侧本地 tokenizer 估算执行，输出上限留给 provider 的
+      # max_tokens 精确强制。Settings 默认值 4000/800，启动校验拒绝非正数。
+      LLM_INPUT_TOKEN_BUDGET: ${LLM_INPUT_TOKEN_BUDGET:-4000}
+      LLM_OUTPUT_TOKEN_BUDGET: ${LLM_OUTPUT_TOKEN_BUDGET:-800}
+      # 检索与问答都要做查询编码；未配置时这两个接口静态 503。
+      INFERENCE_TOKEN: ${INFERENCE_TOKEN:?必须设置 INFERENCE_TOKEN}
+      # 业务问答生成默认关闭；开启时必须同时注入非占位 LLM_API_KEY，否则启动校验失败。
+      LLM_ENABLED: ${LLM_ENABLED:-0}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
     volumes:
       # api 专用命名卷：镜像内该目录已归属 uid 10001，新建卷会继承该所有权。
       # api 是唯一写入者；worker 只读同卷；inference 不可见。

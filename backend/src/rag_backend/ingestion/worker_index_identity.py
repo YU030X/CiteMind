@@ -82,6 +82,7 @@ class WorkerIndexIdentity:
 
     profile: IndexProfileContract
     parser_version: str
+    pdf_parser_version: str
     token_counter: LocalTokenizerCounter
     keyword_analyzer: KeywordAnalyzer
 
@@ -158,10 +159,12 @@ def initialize_worker_index_identity(
         raise WorkerIndexIdentityError(_CONTRACT_FAILURE) from None
 
     from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+    from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 
     return WorkerIndexIdentity(
         profile=profile,
         parser_version=MARKDOWN_PARSER_VERSION,
+        pdf_parser_version=PDF_PARSER_VERSION,
         token_counter=token_counter,
         keyword_analyzer=keyword_analyzer,
     )

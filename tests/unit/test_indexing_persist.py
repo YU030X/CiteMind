@@ -17,8 +17,11 @@ from rag_backend.ingestion.identity_preflight import ProfileIdentityDecision
 from rag_backend.ingestion.parse_subprocess import (
     ParseSubprocessError,
     ParseSubprocessTimeout,
+    PdfEncryptedSubprocessError,
+    PdfInvalidSubprocessError,
+    PdfTooManyPagesSubprocessError,
 )
-from rag_backend.ingestion.parsing import parse_markdown
+from rag_backend.ingestion.parsing import ParsedDocument, parse_markdown
 from rag_backend.ingestion.storage import DocumentBlobStore
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy.exc import OperationalError
@@ -51,6 +54,7 @@ class FakeAnalyzer:
 class FakeIdentity:
     profile = PROFILE
     parser_version = "markdown-it-py-4.2.0-v1"
+    pdf_parser_version = "pypdf-6.19.0-v1"
     token_counter = FakeCounter()
     keyword_analyzer = FakeAnalyzer()
 
@@ -69,9 +73,17 @@ class FakeStorage:
     ) -> str:
         return MARKDOWN_TEXT
 
+    def read_verified_pdf(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> bytes:
+        return b"%PDF-1.4"
+
 
 MARKDOWN_TEXT = "# 标题\n\n正文段落。\n"
 MARKDOWN_SHA256 = hashlib.sha256(MARKDOWN_TEXT.encode("utf-8")).hexdigest()
+PDF_TEXT = "PDF page text\n"
+PDF_SHA256 = hashlib.sha256(PDF_TEXT.encode("utf-8")).hexdigest()
+PDF_PARSER_VERSION = "pypdf-6.19.0-v1"
 
 
 def dummy_session_factory() -> Any:
@@ -80,6 +92,7 @@ def dummy_session_factory() -> Any:
 
 def build_dependencies(
     parse_document: iw.ParseDocument | None = None,
+    parse_pdf_document: iw.ParseDocument | None = None,
 ) -> iw.PipelineDependencies:
     resolved_parse = parse_document or (lambda data: parse_markdown(data))
     return iw.PipelineDependencies(
@@ -88,10 +101,17 @@ def build_dependencies(
         identity_provider=lambda: FakeIdentity(),
         embedder_factory=lambda counter: FakeEmbedder(),
         parse_document=resolved_parse,
+        parse_pdf_document=parse_pdf_document or resolved_parse,
     )
 
 
-def claimed_job() -> iw.ClaimedJob:
+def claimed_job(*, source_type: str = "markdown") -> iw.ClaimedJob:
+    if source_type == "pdf":
+        parser_version = PDF_PARSER_VERSION
+        file_hash = PDF_SHA256
+    else:
+        parser_version = "markdown-it-py-4.2.0-v1"
+        file_hash = MARKDOWN_SHA256
     return iw.ClaimedJob(
         job_id=uuid.uuid4(),
         lease_token="lease",
@@ -100,10 +120,10 @@ def claimed_job() -> iw.ClaimedJob:
         kb_id=uuid.uuid4(),
         organization_id=uuid.uuid4(),
         profile_id=uuid.uuid4(),
-        parser_version="markdown-it-py-4.2.0-v1",
-        source_type="markdown",
+        parser_version=parser_version,
+        source_type=source_type,
         file_ref="kb/hash",
-        file_hash=MARKDOWN_SHA256,
+        file_hash=file_hash,
     )
 
 
@@ -370,3 +390,99 @@ def test_pipeline_parser_version_mismatch_fails_before_chunking(
     run_parse_failure(
         monkeypatch, mismatched, expected_code=iw.ERROR_PIPELINE_PARSE_FAILED
     )
+
+
+def _run_pdf_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    parse_pdf_document: iw.ParseDocument,
+    *,
+    expected_code: str,
+) -> None:
+    """驱动 PDF 管线在解析阶段失败，断言具名静态错误码且不进入暂存/发布。"""
+
+    claimed = claimed_job(source_type="pdf")
+    patch_pipeline(monkeypatch, claimed)
+    captured: list[str] = []
+
+    def record_fail(
+        session_factory: Any,
+        *,
+        job_id: Any,
+        lease_token: Any,
+        error_code: str,
+        generation_id: Any = None,
+    ) -> bool:
+        captured.append(error_code)
+        return True
+
+    monkeypatch.setattr(iw, "fail_ingest_job", record_fail)
+
+    def not_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("PDF 解析失败不得 embed/stage/publish")
+
+    monkeypatch.setattr(iw, "create_staging_generation", not_called)
+    monkeypatch.setattr(iw, "publish_ingest_generation", not_called)
+
+    status = iw.process_ingest_event(
+        build_dependencies(parse_pdf_document=parse_pdf_document),
+        job_id=claimed.job_id,
+        event_id="e",
+    )
+
+    assert status == iw.PROCESS_STATUS_FAILED
+    assert captured == [expected_code]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (PdfEncryptedSubprocessError("x"), iw.ERROR_PIPELINE_PDF_ENCRYPTED),
+        (PdfTooManyPagesSubprocessError("x"), iw.ERROR_PIPELINE_PDF_TOO_MANY_PAGES),
+        (PdfInvalidSubprocessError("x"), iw.ERROR_PIPELINE_PDF_INVALID),
+    ],
+)
+def test_pipeline_pdf_named_parse_errors_map_to_static_codes(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, expected_code: str
+) -> None:
+    def failure(data: bytes) -> Any:
+        raise error
+
+    _run_pdf_failure(monkeypatch, failure, expected_code=expected_code)
+
+
+def test_pipeline_pdf_source_uses_pdf_parser_version_and_blob_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claimed = claimed_job(source_type="pdf")
+    patch_pipeline(monkeypatch, claimed)
+    captured: list[str] = []
+
+    def record_fail(*a: Any, error_code: str, **k: Any) -> bool:
+        captured.append(error_code)
+        return True
+
+    def record_needs_ocr(*a: Any, **k: Any) -> bool:
+        captured.append(iw.ERROR_PIPELINE_NEEDS_OCR)
+        return True
+
+    monkeypatch.setattr(iw, "fail_ingest_job", record_fail)
+    monkeypatch.setattr(iw, "mark_ingest_needs_ocr", record_needs_ocr)
+
+    def empty_pdf(data: bytes) -> ParsedDocument:
+        return ParsedDocument(
+            source_sha256=PDF_SHA256,
+            text="",
+            blocks=(),
+            parser_version=PDF_PARSER_VERSION,
+            source_type="pdf",
+        )
+
+    status = iw.process_ingest_event(
+        build_dependencies(parse_pdf_document=empty_pdf),
+        job_id=claimed.job_id,
+        event_id="e",
+    )
+
+    # 零可提取文本（扫描件）走 NEEDS_OCR，而不是 Markdown 的 CONTENT_EMPTY。
+    assert status == iw.PROCESS_STATUS_FAILED
+    assert captured == [iw.ERROR_PIPELINE_NEEDS_OCR]

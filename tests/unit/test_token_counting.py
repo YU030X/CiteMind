@@ -118,7 +118,9 @@ def test_pinned_artifacts_match_inference_identity_and_build_script() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 部署接线：tokenizers 只在 worker stage，产物由 inference 构建上下文提供
+# 部署接线：BGE tokenizer 产物只在 worker stage 由 inference 构建上下文提供。
+# tokenizers 依赖自 generation 切片起已是主依赖，api/worker 都会安装。
+# DeepSeek 侧产物只在 api stage 烘入，并由构建脚本按钉死摘要校验。
 # ---------------------------------------------------------------------------
 
 

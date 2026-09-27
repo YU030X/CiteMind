@@ -18,6 +18,8 @@ LLM_USAGE_REVISION = "20260923_0004"
 IDENTITY_REVISION = "20260923_0005"
 INGEST_JOB_PROFILE_REVISION = "20260925_0006"
 WORKER_KB_PUBLISH_REVISION = "20260925_0007"
+INGEST_JOB_REQUEST_TITLE_REVISION = "20260926_0008"
+CONVERSATION_REVISION = "20260927_0009"
 
 CORE_TABLES = (
     "index_profile",
@@ -30,7 +32,14 @@ CORE_TABLES = (
 SECOND_SLICE_TABLES = ("index_generation", "chunk", "chunk_embedding")
 LLM_USAGE_TABLES = ("llm_usage",)
 IDENTITY_TABLES = ("user_account", "auth_session", "kb_member")
-ALL_TABLES = CORE_TABLES + SECOND_SLICE_TABLES + LLM_USAGE_TABLES + IDENTITY_TABLES
+CONVERSATION_TABLES = ("conversation", "message", "query_run", "citation")
+ALL_TABLES = (
+    CORE_TABLES
+    + SECOND_SLICE_TABLES
+    + LLM_USAGE_TABLES
+    + IDENTITY_TABLES
+    + CONVERSATION_TABLES
+)
 
 EXPECTED_CHECK_CONSTRAINTS = (
     "ck_index_profile_dimension_is_512",
@@ -66,6 +75,17 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_llm_usage_failure_has_error_code",
     "ck_llm_usage_price_consistent",
     "ck_kb_member_role",
+    "ck_query_run_status",
+    "ck_query_run_input_token_budget_positive",
+    "ck_query_run_output_token_budget_positive",
+    "ck_query_run_estimated_input_tokens_non_negative",
+    "ck_query_run_evidence_count_non_negative",
+    "ck_query_run_provider_prompt_tokens_non_negative",
+    "ck_query_run_provider_completion_tokens_non_negative",
+    "ck_query_run_question_non_empty",
+    "ck_message_role",
+    "ck_message_sequence_positive",
+    "ck_citation_display_label_non_empty",
 )
 
 SECOND_SLICE_GRANTS = (
@@ -87,6 +107,10 @@ WORKER_KB_PUBLISH_GRANTS = (
     "GRANT UPDATE (active_index_profile_id, kb_revision) ON TABLE knowledge_base "
     "TO citemind_worker;",
 )
+CONVERSATION_GRANTS = tuple(
+    f"GRANT SELECT, INSERT ON TABLE {table} TO citemind_api;"
+    for table in CONVERSATION_TABLES
+)
 
 
 def alembic_config() -> Config:
@@ -102,9 +126,11 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [WORKER_KB_PUBLISH_REVISION]
+    assert script_directory.get_heads() == [CONVERSATION_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    conversation = script_directory.get_revision(CONVERSATION_REVISION)
+    request_title = script_directory.get_revision(INGEST_JOB_REQUEST_TITLE_REVISION)
     worker_kb_publish = script_directory.get_revision(WORKER_KB_PUBLISH_REVISION)
     ingest_job_profile = script_directory.get_revision(INGEST_JOB_PROFILE_REVISION)
     identity = script_directory.get_revision(IDENTITY_REVISION)
@@ -113,8 +139,12 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     core = script_directory.get_revision(CORE_REVISION)
     legacy = script_directory.get_revision(PGVECTOR_REVISION)
 
+    assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
+    assert conversation.nextrev == set()
+    assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
+    assert request_title.nextrev == {CONVERSATION_REVISION}
     assert worker_kb_publish.down_revision == INGEST_JOB_PROFILE_REVISION
-    assert worker_kb_publish.nextrev == set()
+    assert worker_kb_publish.nextrev == {INGEST_JOB_REQUEST_TITLE_REVISION}
     assert ingest_job_profile.down_revision == IDENTITY_REVISION
     assert ingest_job_profile.nextrev == {WORKER_KB_PUBLISH_REVISION}
     assert identity.down_revision == LLM_USAGE_REVISION
@@ -242,6 +272,42 @@ def test_offline_downgrade_sql_removes_only_the_profile_id_fk_and_column(
     assert "REVOKE " not in output
 
 
+def test_offline_upgrade_sql_adds_only_a_nullable_request_title_column(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{WORKER_KB_PUBLISH_REVISION}:{INGEST_JOB_REQUEST_TITLE_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE ingest_job ADD COLUMN request_title TEXT;" in output
+    # 不加 server default、不回填、不建索引、不改授权。
+    assert "DEFAULT" not in output
+    assert "UPDATE ingest_job" not in output
+    assert "CREATE INDEX" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_removes_only_the_request_title_column(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{INGEST_JOB_REQUEST_TITLE_REVISION}:{WORKER_KB_PUBLISH_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP COLUMN request_title" in output
+    # 降级只删本列，不对其它表或 ACL 做任何事。
+    assert "DROP TABLE" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
 def test_offline_upgrade_sql_grants_the_business_tables_exactly(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -258,6 +324,7 @@ def test_offline_upgrade_sql_grants_the_business_tables_exactly(
         + len(LLM_USAGE_GRANTS)
         + len(IDENTITY_GRANTS)
         + len(WORKER_KB_PUBLISH_GRANTS)
+        + len(CONVERSATION_GRANTS)
     )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
@@ -347,6 +414,45 @@ def test_offline_downgrade_sql_removes_identity_tables(
 
     for table in IDENTITY_TABLES:
         assert f"DROP TABLE {table};" in output
+
+
+def test_offline_upgrade_sql_creates_conversation_tables_with_exact_grants(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{INGEST_JOB_REQUEST_TITLE_REVISION}:{CONVERSATION_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    for table in CONVERSATION_TABLES:
+        assert f"CREATE TABLE {table} (" in output
+        assert f"REVOKE ALL ON TABLE {table} FROM PUBLIC;" in output
+        assert f"GRANT SELECT, INSERT ON TABLE {table} TO citemind_api;" in output
+        for statement in ("UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+            assert f"GRANT {statement} ON TABLE {table}" not in output
+        assert f"{table} TO citemind_worker" not in output
+    assert "ARRAY" not in output
+    assert "SERIAL" not in output.upper()
+    assert "CREATE SEQUENCE" not in output.upper()
+    assert "NEXTVAL" not in output.upper()
+
+
+def test_offline_downgrade_sql_removes_conversation_tables(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{CONVERSATION_REVISION}:{INGEST_JOB_REQUEST_TITLE_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    for table in CONVERSATION_TABLES:
+        assert f"DROP TABLE {table};" in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(

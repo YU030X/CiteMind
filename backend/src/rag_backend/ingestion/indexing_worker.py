@@ -42,7 +42,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final, Protocol
@@ -78,10 +78,20 @@ from rag_backend.ingestion.identity_preflight import (
 from rag_backend.ingestion.parse_subprocess import (
     ParseSubprocessError,
     ParseSubprocessTimeout,
+    PdfEncryptedSubprocessError,
+    PdfInvalidSubprocessError,
+    PdfTooManyPagesSubprocessError,
     parse_markdown_in_subprocess,
+    parse_pdf_in_subprocess,
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION, ParsedDocument
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore, InvalidBlobReference
+from rag_backend.ingestion.validation import (
+    SOURCE_TYPE_MARKDOWN,
+    SOURCE_TYPE_PDF,
+    parse_version_dedupe_key,
+)
 from rag_backend.models.profile_contract import IndexProfileContract
 
 logger = logging.getLogger(__name__)
@@ -111,6 +121,8 @@ PROCESS_STATUS_VERSION_MISMATCH: Final = "version_mismatch"
 PROCESS_STATUS_LEGACY_UNSUPPORTED: Final = "legacy_unsupported"
 PROCESS_STATUS_EXISTING_DIAGNOSTIC: Final = "existing_diagnostic"
 PROCESS_STATUS_UNSUPPORTED_UPDATE: Final = "unsupported_update"
+# 陈旧 expected：可解析的 expected 已不等于文档当前 active，本任务永远无法发布，领取期静态拒绝。
+PROCESS_STATUS_STALE_EXPECTED: Final = "stale_expected"
 PROCESS_STATUS_FAILED: Final = "failed"
 PROCESS_STATUS_LEASE_LOST: Final = "lease_lost"
 # 数据库持续不可用、无法落任何终态：诚实上报，不当作成功，也不谎报 FAILED。
@@ -129,8 +141,15 @@ ERROR_PIPELINE_EMBEDDING_REJECTED: Final = "PIPELINE_EMBEDDING_REJECTED"
 ERROR_PIPELINE_STAGING_INVALID: Final = "PIPELINE_STAGING_INVALID"
 ERROR_PIPELINE_PUBLISH_CONFLICT: Final = "PIPELINE_PUBLISH_CONFLICT"
 ERROR_PIPELINE_UNSUPPORTED_UPDATE: Final = "PIPELINE_UNSUPPORTED_UPDATE"
+# 领取期即可确认任务携带的 expected active 已被更早的发布超越；静态冲突码，不重试。
+ERROR_PIPELINE_STALE_EXPECTED: Final = "PIPELINE_STALE_EXPECTED"
 ERROR_PIPELINE_PARSE_TIMEOUT: Final = "PIPELINE_PARSE_TIMEOUT"
 ERROR_PIPELINE_PARSE_FAILED: Final = "PIPELINE_PARSE_FAILED"
+# PDF 具名静态失败：加密/超页/结构损坏分别可区分；零可提取文本单独走 NEEDS_OCR。
+ERROR_PIPELINE_PDF_ENCRYPTED: Final = "PIPELINE_PDF_ENCRYPTED"
+ERROR_PIPELINE_PDF_TOO_MANY_PAGES: Final = "PIPELINE_PDF_TOO_MANY_PAGES"
+ERROR_PIPELINE_PDF_INVALID: Final = "PIPELINE_PDF_INVALID"
+ERROR_PIPELINE_NEEDS_OCR: Final = "PIPELINE_NEEDS_OCR"
 # 已领取任务后发生数据库错误，未能完成：尝试落这个静态诊断码。
 ERROR_PIPELINE_DB_ERROR: Final = "PIPELINE_DB_ERROR"
 
@@ -167,6 +186,9 @@ class ResolvedIdentity(Protocol):
 
     @property
     def parser_version(self) -> str: ...
+
+    @property
+    def pdf_parser_version(self) -> str: ...
 
     @property
     def token_counter(self) -> chunking.TokenCounter: ...
@@ -229,6 +251,7 @@ SELECT_JOB_FOR_CLAIM_SQL: Final = text(
         j.lease_owner,
         j.heartbeat_at,
         j.profile_id,
+        j.dedupe_key,
         j.document_id,
         j.version_id,
         dv.parser_version,
@@ -304,6 +327,7 @@ class ClaimAction(Enum):
     EXISTING_DIAGNOSTIC = "EXISTING_DIAGNOSTIC"
     LEGACY_UNSUPPORTED = "LEGACY_UNSUPPORTED"
     UNSUPPORTED_UPDATE = "UNSUPPORTED_UPDATE"
+    STALE_EXPECTED = "STALE_EXPECTED"
 
 
 _CLAIM_ACTION_STATUS: Final[dict[ClaimAction, str]] = {
@@ -314,6 +338,14 @@ _CLAIM_ACTION_STATUS: Final[dict[ClaimAction, str]] = {
     ClaimAction.EXISTING_DIAGNOSTIC: PROCESS_STATUS_EXISTING_DIAGNOSTIC,
     ClaimAction.LEGACY_UNSUPPORTED: PROCESS_STATUS_LEGACY_UNSUPPORTED,
     ClaimAction.UNSUPPORTED_UPDATE: PROCESS_STATUS_UNSUPPORTED_UPDATE,
+    ClaimAction.STALE_EXPECTED: PROCESS_STATUS_STALE_EXPECTED,
+}
+
+# 领取期静态拒绝动作到具名 error_code 的固定映射；只有这些动作才写入 FAILED 终态。
+_REJECT_ERROR_CODE: Final[dict[ClaimAction, str]] = {
+    ClaimAction.LEGACY_UNSUPPORTED: "LEGACY_JOB_UNSUPPORTED",
+    ClaimAction.UNSUPPORTED_UPDATE: ERROR_PIPELINE_UNSUPPORTED_UPDATE,
+    ClaimAction.STALE_EXPECTED: ERROR_PIPELINE_STALE_EXPECTED,
 }
 
 
@@ -328,17 +360,25 @@ class ClaimFacts:
     existing_error_code: str | None
     profile_bound: bool
     parser_version: str
-    expected_parser_version: str
+    expected_parser_version: str | None
     version_no: int
-    document_active_version_present: bool
+    document_active_version_id: uuid.UUID | None
     ready_generation_present: bool
+    expected_active_version_id: uuid.UUID | None
 
 
 def decide_claim_action(facts: ClaimFacts) -> ClaimAction:
     """按已验收的固定优先级判定领取动作；不修改任何状态、不做 IO。
 
     优先级：非 QUEUED → 已删除 → 版本归属不符 → 已有接收 marker → 已有非 NULL 诊断 →
-    旧 job（profile 未绑定或 parser 非当前实现版本）→ 超范围更新 → 领取。
+    旧 job（profile 未绑定或 parser 非当前实现版本）→ 超出本实现范围的版本/重建 →
+    陈旧 expected → 领取。
+
+    首次版本（``version_no == 1``）要求文档尚无 active version 且本版本尚无 READY generation；
+    新版本更新（``version_no > 1``）要求去重键携带可解析的 ``expected_active_version``、文档
+    已有 active version；无法解析 expected 的更新任务按超范围静态拒绝，不猜发布语义。当
+    expected 可解析且文档 active 已存在，但二者不等时，任务已永远无法发布（active 只前进不
+    回退），在领取期以静态冲突码早拒；发布事务仍保留同一 CAS，作为并发变化的最后防线。
     """
 
     if facts.status != JOB_STATUS_QUEUED:
@@ -351,14 +391,26 @@ def decide_claim_action(facts: ClaimFacts) -> ClaimAction:
         return ClaimAction.ALREADY_RECEIVED
     if facts.existing_error_code is not None:
         return ClaimAction.EXISTING_DIAGNOSTIC
-    if not facts.profile_bound or facts.parser_version != facts.expected_parser_version:
-        return ClaimAction.LEGACY_UNSUPPORTED
     if (
-        facts.version_no != 1
-        or facts.document_active_version_present
+        not facts.profile_bound
+        or facts.expected_parser_version is None
+        or facts.parser_version != facts.expected_parser_version
+    ):
+        return ClaimAction.LEGACY_UNSUPPORTED
+    if facts.version_no == 1:
+        if facts.document_active_version_id is not None or facts.ready_generation_present:
+            return ClaimAction.UNSUPPORTED_UPDATE
+        return ClaimAction.CLAIM
+    # 文档新版本：必须有可解析的 expected active，且文档已有 active version。
+    if (
+        facts.expected_active_version_id is None
+        or facts.document_active_version_id is None
         or facts.ready_generation_present
     ):
         return ClaimAction.UNSUPPORTED_UPDATE
+    if facts.expected_active_version_id != facts.document_active_version_id:
+        # expected 已被更早的发布超越；active 只前进不回退，本任务不可能成功。
+        return ClaimAction.STALE_EXPECTED
     return ClaimAction.CLAIM
 
 
@@ -395,10 +447,15 @@ def claim_ingest_job(
     *,
     job_id: uuid.UUID,
     event_id: str,
-    expected_parser_version: str,
+    expected_parser_versions: Mapping[str, str],
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
 ) -> ClaimResult:
-    """行锁读取 job，按固定优先级永久拒绝旧任务/超范围更新，或原子领取 lease。"""
+    """行锁读取 job，按固定优先级永久拒绝旧任务/超范围更新，或原子领取 lease。
+
+    ``expected_parser_versions`` 按 ``document.source_type`` 给出当前实现的期望解析器版本；
+    来源不在映射中或版本不符都判为 ``LEGACY_UNSUPPORTED``，因此 PDF 新 job 不会被 Markdown
+    期望版本误杀，而旧占位版本仍被静态拒绝。
+    """
 
     lease_token = uuid.uuid4().hex
     with session_factory() as session, session.begin():
@@ -407,6 +464,8 @@ def claim_ingest_job(
         ).mappings().first()
         if row is None:
             return ClaimResult(PROCESS_STATUS_NOT_QUEUED)
+        source_type = str(row["source_type"])
+        parsed_dedupe = parse_version_dedupe_key(str(row["dedupe_key"]))
         facts = ClaimFacts(
             status=str(row["status"]),
             document_deleted=row["deleted_at"] is not None,
@@ -417,20 +476,19 @@ def claim_ingest_job(
             existing_error_code=row["error_code"],
             profile_bound=row["profile_id"] is not None,
             parser_version=str(row["parser_version"]),
-            expected_parser_version=expected_parser_version,
+            expected_parser_version=expected_parser_versions.get(source_type),
             version_no=int(row["version_no"]),
-            document_active_version_present=row["active_version_id"] is not None,
+            document_active_version_id=row["active_version_id"],
             ready_generation_present=bool(row["ready_generation_present"]),
+            expected_active_version_id=(
+                parsed_dedupe[1] if parsed_dedupe is not None else None
+            ),
         )
         action = decide_claim_action(facts)
-        if action in (ClaimAction.LEGACY_UNSUPPORTED, ClaimAction.UNSUPPORTED_UPDATE):
-            error_code = (
-                "LEGACY_JOB_UNSUPPORTED"
-                if action is ClaimAction.LEGACY_UNSUPPORTED
-                else ERROR_PIPELINE_UNSUPPORTED_UPDATE
-            )
+        if action in _REJECT_ERROR_CODE:
             rejected = session.execute(
-                REJECT_JOB_SQL, {"job_id": job_id, "error_code": error_code}
+                REJECT_JOB_SQL,
+                {"job_id": job_id, "error_code": _REJECT_ERROR_CODE[action]},
             ).first()
             if rejected is None:
                 return ClaimResult(PROCESS_STATUS_NOT_QUEUED)
@@ -530,6 +588,16 @@ FAIL_VERSION_SQL: Final = text(
     """
 )
 
+# 零可提取文本 PDF 的专用版本终态：document_version 置 NEEDS_OCR，绝不伪造正文或行号。
+FAIL_VERSION_NEEDS_OCR_SQL: Final = text(
+    """
+    UPDATE document_version
+    SET status = 'NEEDS_OCR', updated_at = clock_timestamp()
+    WHERE id = :version_id AND status = 'PENDING'
+    RETURNING id
+    """
+)
+
 FAIL_DOCUMENT_SQL: Final = text(
     """
     UPDATE document
@@ -591,6 +659,35 @@ def fail_ingest_job(
                 FAIL_GENERATION_SQL, {"generation_id": effective_generation}
             )
         session.execute(FAIL_VERSION_SQL, {"version_id": row["version_id"]})
+        session.execute(FAIL_DOCUMENT_SQL, {"document_id": row["document_id"]})
+        return True
+
+
+def mark_ingest_needs_ocr(
+    session_factory: SyncSessionFactory,
+    *,
+    job_id: uuid.UUID,
+    lease_token: str,
+) -> bool:
+    """零可提取文本 PDF 的终态：job FAILED/PIPELINE_NEEDS_OCR、version NEEDS_OCR。
+
+    与 :func:`fail_ingest_job` 同样只在仍持租约时写入，且只在 version 仍为 PENDING 时置
+    NEEDS_OCR，不建 generation、不置 ``document.active_version_id``；文档仍按
+    ``active_version_id IS NULL`` 守卫标记 FAILED，不会使既有有效文档下线。
+    """
+
+    with session_factory() as session, session.begin():
+        row = session.execute(
+            FAIL_JOB_SQL,
+            {
+                "job_id": job_id,
+                "lease_token": lease_token,
+                "error_code": ERROR_PIPELINE_NEEDS_OCR,
+            },
+        ).mappings().first()
+        if row is None:
+            return False
+        session.execute(FAIL_VERSION_NEEDS_OCR_SQL, {"version_id": row["version_id"]})
         session.execute(FAIL_DOCUMENT_SQL, {"document_id": row["document_id"]})
         return True
 
@@ -980,12 +1077,15 @@ SELECT_JOB_FOR_PUBLISH_SQL: Final = text(
         j.profile_id,
         j.document_id,
         j.version_id,
+        j.dedupe_key,
+        dv.version_no,
         d.kb_id,
         d.active_version_id,
         d.deleted_at,
         d.lifecycle_status
     FROM ingest_job AS j
     JOIN document AS d ON d.id = j.document_id
+    JOIN document_version AS dv ON dv.id = j.version_id
     WHERE j.id = :job_id
     FOR UPDATE OF j, d
     """
@@ -1025,6 +1125,21 @@ PUBLISH_DOCUMENT_SQL: Final = text(
         updated_at = clock_timestamp()
     WHERE id = :document_id
       AND active_version_id IS NULL
+    RETURNING id
+    """
+)
+
+# 文档新版本发布：行锁内原子 compare expected active version 且未删除，命中才切换指针。
+# 并发更新者或删除者先提交时该 UPDATE 不命中，整个事务回滚，旧版本继续服务。
+PUBLISH_DOCUMENT_UPDATE_SQL: Final = text(
+    """
+    UPDATE document
+    SET active_version_id = :version_id,
+        lifecycle_status = 'READY',
+        updated_at = clock_timestamp()
+    WHERE id = :document_id
+      AND active_version_id = :expected_active_version_id
+      AND deleted_at IS NULL
     RETURNING id
     """
 )
@@ -1097,9 +1212,25 @@ def publish_ingest_generation(
             if row["generation_id"] != generation_id or row["profile_id"] is None:
                 session.rollback()
                 return PublishOutcome.CONFLICT
-            if (
+            if row["deleted_at"] is not None:
+                session.rollback()
+                return PublishOutcome.OUT_OF_SCOPE
+
+            # 首次版本直接激活；文档新版本在行锁内原子 compare expected active 且未删除。
+            version_no = int(row["version_no"])
+            parsed_dedupe = parse_version_dedupe_key(str(row["dedupe_key"]))
+            is_update = version_no > 1
+            expected_active_version_id: uuid.UUID | None = None
+            if is_update:
+                if parsed_dedupe is None or parsed_dedupe[0] != row["document_id"]:
+                    session.rollback()
+                    return PublishOutcome.CONFLICT
+                expected_active_version_id = parsed_dedupe[1]
+                if row["active_version_id"] != expected_active_version_id:
+                    session.rollback()
+                    return PublishOutcome.CONFLICT
+            elif (
                 row["active_version_id"] is not None
-                or row["deleted_at"] is not None
                 or str(row["lifecycle_status"]) not in ("CREATED", "INDEXING")
             ):
                 session.rollback()
@@ -1135,13 +1266,23 @@ def publish_ingest_generation(
             if generation is None:
                 session.rollback()
                 return PublishOutcome.CONFLICT
-            document = session.execute(
-                PUBLISH_DOCUMENT_SQL,
-                {"document_id": row["document_id"], "version_id": row["version_id"]},
-            ).first()
+            if is_update:
+                document = session.execute(
+                    PUBLISH_DOCUMENT_UPDATE_SQL,
+                    {
+                        "document_id": row["document_id"],
+                        "version_id": row["version_id"],
+                        "expected_active_version_id": expected_active_version_id,
+                    },
+                ).first()
+            else:
+                document = session.execute(
+                    PUBLISH_DOCUMENT_SQL,
+                    {"document_id": row["document_id"], "version_id": row["version_id"]},
+                ).first()
             if document is None:
                 session.rollback()
-                return PublishOutcome.OUT_OF_SCOPE
+                return PublishOutcome.CONFLICT if is_update else PublishOutcome.OUT_OF_SCOPE
             version = session.execute(
                 PUBLISH_VERSION_SQL, {"version_id": row["version_id"]}
             ).first()
@@ -1213,13 +1354,18 @@ def load_ingest_identity() -> ResolvedIdentity:
 
 @dataclass(frozen=True)
 class PipelineDependencies:
-    """一次管线执行所需的可注入依赖；生产入口负责构造真实实现。"""
+    """一次管线执行所需的可注入依赖；生产入口负责构造真实实现。
+
+    ``parse_document`` 是 Markdown 解析入口，``parse_pdf_document`` 是 PDF 解析入口；管线
+    按 ``document.source_type`` 分派，两者都默认走受控子进程。
+    """
 
     session_factory: SyncSessionFactory
     storage: DocumentBlobStore
     identity_provider: IdentityProvider
     embedder_factory: EmbedderFactory
     parse_document: ParseDocument = parse_markdown_in_subprocess
+    parse_pdf_document: ParseDocument = parse_pdf_in_subprocess
 
 
 def process_ingest_event(
@@ -1239,7 +1385,10 @@ def process_ingest_event(
         session_factory,
         job_id=job_id,
         event_id=event_id,
-        expected_parser_version=MARKDOWN_PARSER_VERSION,
+        expected_parser_versions={
+            SOURCE_TYPE_MARKDOWN: MARKDOWN_PARSER_VERSION,
+            SOURCE_TYPE_PDF: PDF_PARSER_VERSION,
+        },
         lease_seconds=lease_seconds,
     )
     if claim.status != PROCESS_STATUS_CLAIMED or claim.claimed is None:
@@ -1265,6 +1414,11 @@ def process_ingest_event(
                 error_code=ERROR_PIPELINE_IDENTITY_UNAVAILABLE,
             )
 
+        expected_parser_version = (
+            identity.pdf_parser_version
+            if claimed.source_type == SOURCE_TYPE_PDF
+            else identity.parser_version
+        )
         try:
             stored = load_stored_profile(session_factory, claimed.profile_id)
         except SQLAlchemyError:
@@ -1277,7 +1431,7 @@ def process_ingest_event(
             parser_version=claimed.parser_version,
             stored_profile=stored,
             expected=identity.profile,
-            expected_parser_version=identity.parser_version,
+            expected_parser_version=expected_parser_version,
         )
         identity_error = classify_identity_decision(decision)
         if identity_error is not None:
@@ -1307,9 +1461,17 @@ def process_ingest_event(
             return PROCESS_STATUS_LEASE_LOST
 
         try:
-            markdown_text = dependencies.storage.read_verified_markdown(
-                claimed.kb_id, claimed.file_ref, claimed.file_hash
-            )
+            if claimed.source_type == SOURCE_TYPE_PDF:
+                parsed = dependencies.parse_pdf_document(
+                    dependencies.storage.read_verified_pdf(
+                        claimed.kb_id, claimed.file_ref, claimed.file_hash
+                    )
+                )
+            else:
+                markdown_text = dependencies.storage.read_verified_markdown(
+                    claimed.kb_id, claimed.file_ref, claimed.file_hash
+                )
+                parsed = dependencies.parse_document(markdown_text.encode("utf-8"))
         except (BlobReadError, InvalidBlobReference):
             return _fail(
                 session_factory,
@@ -1318,8 +1480,6 @@ def process_ingest_event(
                 lease_token=lease_token,
                 error_code=ERROR_PIPELINE_BLOB_INVALID,
             )
-        try:
-            parsed = dependencies.parse_document(markdown_text.encode("utf-8"))
         except ParseSubprocessTimeout:
             return _fail(
                 session_factory,
@@ -1327,6 +1487,30 @@ def process_ingest_event(
                 job_id=job_id,
                 lease_token=lease_token,
                 error_code=ERROR_PIPELINE_PARSE_TIMEOUT,
+            )
+        except PdfEncryptedSubprocessError:
+            return _fail(
+                session_factory,
+                heartbeat,
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=ERROR_PIPELINE_PDF_ENCRYPTED,
+            )
+        except PdfTooManyPagesSubprocessError:
+            return _fail(
+                session_factory,
+                heartbeat,
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=ERROR_PIPELINE_PDF_TOO_MANY_PAGES,
+            )
+        except PdfInvalidSubprocessError:
+            return _fail(
+                session_factory,
+                heartbeat,
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=ERROR_PIPELINE_PDF_INVALID,
             )
         except ParseSubprocessError:
             return _fail(
@@ -1344,7 +1528,7 @@ def process_ingest_event(
                 lease_token=lease_token,
                 error_code=ERROR_PIPELINE_SOURCE_HASH_MISMATCH,
             )
-        if parsed.parser_version != identity.parser_version:
+        if parsed.parser_version != expected_parser_version:
             # 解析结果声明的 parser 版本必须与本次索引身份一致；不符不 embed/stage/publish。
             return _fail(
                 session_factory,
@@ -1356,6 +1540,14 @@ def process_ingest_event(
         try:
             chunks = chunk_markdown(parsed, identity.token_counter)
         except NoChunkableContent:
+            if claimed.source_type == SOURCE_TYPE_PDF:
+                # 零可提取文本（扫描件）：不把空提取当成功，落 NEEDS_OCR 终态。
+                return _fail_needs_ocr(
+                    session_factory,
+                    heartbeat,
+                    job_id=job_id,
+                    lease_token=lease_token,
+                )
             return _fail(
                 session_factory,
                 heartbeat,
@@ -1534,6 +1726,33 @@ def _fail(
     return PROCESS_STATUS_FAILED
 
 
+def _fail_needs_ocr(
+    session_factory: SyncSessionFactory,
+    heartbeat: LeaseHeartbeat,
+    *,
+    job_id: uuid.UUID,
+    lease_token: str,
+) -> str:
+    """零可提取文本 PDF 的终态写入；失租约则返回 ``lease_lost`` 且不覆盖他人。"""
+
+    if heartbeat.lost:
+        return PROCESS_STATUS_LEASE_LOST
+    try:
+        marked = mark_ingest_needs_ocr(
+            session_factory, job_id=job_id, lease_token=lease_token
+        )
+    except SQLAlchemyError:
+        return recover_from_db_error(
+            session_factory, heartbeat, job_id=job_id, lease_token=lease_token
+        )
+    if not marked:
+        return PROCESS_STATUS_LEASE_LOST
+    logger.info(
+        "ingest pipeline needs ocr job_id=%s error_code=%s", job_id, ERROR_PIPELINE_NEEDS_OCR
+    )
+    return PROCESS_STATUS_FAILED
+
+
 __all__ = [
     "ClaimAction",
     "ClaimFacts",
@@ -1548,10 +1767,15 @@ __all__ = [
     "ERROR_PIPELINE_DB_ERROR",
     "ERROR_PIPELINE_EMBEDDING_FAILED",
     "ERROR_PIPELINE_IDENTITY_UNAVAILABLE",
+    "ERROR_PIPELINE_NEEDS_OCR",
     "ERROR_PIPELINE_PARSE_FAILED",
     "ERROR_PIPELINE_PARSE_TIMEOUT",
+    "ERROR_PIPELINE_PDF_ENCRYPTED",
+    "ERROR_PIPELINE_PDF_INVALID",
+    "ERROR_PIPELINE_PDF_TOO_MANY_PAGES",
     "ERROR_PIPELINE_PROFILE_MISMATCH",
     "ERROR_PIPELINE_PUBLISH_CONFLICT",
+    "ERROR_PIPELINE_STALE_EXPECTED",
     "ERROR_PIPELINE_STAGING_INVALID",
     "ERROR_PIPELINE_UNSUPPORTED_UPDATE",
     "IdentityProvider",
@@ -1562,6 +1786,7 @@ __all__ = [
     "PipelineDependencies",
     "PipelineDependencyUnavailable",
     "PROCESS_STATUS_PERSIST_UNCONFIRMED",
+    "PROCESS_STATUS_STALE_EXPECTED",
     "PublishOutcome",
     "ResolveOutcome",
     "ResolvedIdentity",
@@ -1576,6 +1801,7 @@ __all__ = [
     "fail_ingest_job",
     "load_stored_profile",
     "load_ingest_identity",
+    "mark_ingest_needs_ocr",
     "process_ingest_event",
     "publish_ingest_generation",
     "recover_from_db_error",

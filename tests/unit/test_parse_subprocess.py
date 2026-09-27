@@ -12,7 +12,9 @@ from typing import Any
 import pytest
 from rag_backend.ingestion import parse_subprocess as ps
 from rag_backend.ingestion.parsing import parse_markdown
-from rag_backend.ingestion.validation import MAX_MARKDOWN_BYTES
+from rag_backend.ingestion.pdf_parsing import parse_pdf
+from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES, MAX_MARKDOWN_BYTES
+from test_pdf_parsing import _build_pdf
 
 
 class _FakeProcess:
@@ -143,3 +145,52 @@ def test_deserialize_rejects_malformed_structure() -> None:
         ps._deserialize({"source_sha256": "x"}, text="body")
     with pytest.raises(ps.ParseSubprocessFailed):
         ps._deserialize({"source_sha256": "x", "parser_version": "v", "blocks": "no"}, text="b")
+
+
+def test_real_pdf_subprocess_parse_matches_direct() -> None:
+    content = _build_pdf(["Subprocess page one", "Subprocess page two"])
+
+    parsed = ps.parse_pdf_in_subprocess(content)
+
+    expected = parse_pdf(content)
+    assert parsed.source_sha256 == expected.source_sha256
+    assert parsed.parser_version == expected.parser_version
+    assert parsed.source_type == "pdf"
+    assert [(b.text, b.page, b.heading_path) for b in parsed.blocks] == [
+        (b.text, b.page, b.heading_path) for b in expected.blocks
+    ]
+    assert all(b.start_line is None and b.end_line is None for b in parsed.blocks)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (ps.EXIT_PDF_ENCRYPTED, ps.PdfEncryptedSubprocessError),
+        (ps.EXIT_PDF_TOO_MANY_PAGES, ps.PdfTooManyPagesSubprocessError),
+        (ps.EXIT_PDF_INVALID, ps.PdfInvalidSubprocessError),
+    ],
+)
+def test_pdf_named_exit_codes_map_to_static_errors(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, expected: type[Exception]
+) -> None:
+    process = _FakeProcess(returncode=returncode)
+    _install_fake_popen(monkeypatch, process)
+
+    with pytest.raises(expected):
+        ps.parse_pdf_in_subprocess(b"%PDF-1.4")
+
+
+def test_pdf_oversized_input_is_rejected_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("超限输入不得启动子进程")
+
+    monkeypatch.setattr(subprocess, "Popen", explode)
+
+    with pytest.raises(ps.ParseSubprocessFailed):
+        ps.parse_pdf_in_subprocess(b"x" * (MAX_DOCUMENT_BYTES + 1))
+
+
+def test_unknown_source_argument_is_rejected() -> None:
+    assert ps.main(["docx"]) == ps.EXIT_INVALID_INPUT

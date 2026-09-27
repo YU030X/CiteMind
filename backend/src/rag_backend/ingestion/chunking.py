@@ -1,4 +1,4 @@
-"""Markdown 切分：按标题分段、按 token 预算打包，并保留可回到原文的来源位置。
+"""Markdown 与文本 PDF 切分：按标题/页边界分段、按 token 预算打包，并保留可回到原文的来源位置。
 
 本模块只做纯计算，不接触数据库、模型或日志。它接受一个注入的 :class:`TokenCounter`
 接口来测量**完整模型输入**（标题前缀 + 正文）的 token 数，因此测试可以用显式假计数器
@@ -13,11 +13,13 @@
 
 来源位置：
 
-- ``source_locator`` 是稳定、可版本化的 JSON-compatible 字典，只包含来源 hash、1-based
-  行范围、block ordinal 以及每个 piece 在其 *块规范化正文* 中的字符区间。它不包含文件
-  名、页码或任何未派生的字段。
-- 因为块正文已去掉行内标记，字符区间是相对块正文的偏移，不是对原始文件的偏移；结合
-  ``source_sha256`` + ordinal + 行范围可重新解析并定位回原文。
+- ``source_locator`` 是稳定、可版本化的 JSON-compatible 字典，只包含来源 hash、定位键、
+  block ordinal 以及每个 piece 在其 *块规范化正文* 中的字符区间。它不包含文件名。
+- Markdown 输出 ``locator_version=1``：1-based 块级 ``start_line``/``end_line``、
+  ``block_ordinals`` 与 ``segments`` 的块内字符区间。因为块正文已去掉行内标记，字符区间是
+  相对块正文的偏移，不是对原始文件的偏移；结合 ``source_sha256`` + ordinal + 行范围可重放。
+- PDF 输出 ``locator_version=2``：不伪造行号，改用 ``pages`` 与每个 segment 的 ``page``；
+  页边界强制 flush 且不携带上一页重叠，因此 chunk 绝不跨页。
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ DEFAULT_TARGET_TOKENS = 360
 DEFAULT_OVERLAP_TOKENS = 60
 DEFAULT_MAX_TOKENS = 512
 LOCATOR_VERSION = 1
+# PDF 页定位版本；与 Markdown 的块级行范围 locator 区分，绝不混用键集合。
+PDF_LOCATOR_VERSION = 2
+SOURCE_TYPE_PDF = "pdf"
 
 
 class ChunkingError(Exception):
@@ -103,6 +108,7 @@ class _Piece:
     char_end: int
     text: str
     heading_path: tuple[str, ...]
+    page: int | None = None
 
 
 def build_model_input(heading_path: Sequence[str], body: str) -> str:
@@ -131,9 +137,13 @@ def chunk_markdown(
     chunks: list[Chunk] = []
     current: list[_Piece] = []
     current_heading: tuple[str, ...] | None = None
+    current_page: int | None = None
 
     for unit in units:
-        if current and unit.heading_path != current_heading:
+        # 标题变化或页变化都强制新 chunk；PDF 的页边界绝不跨页合并，也不携带上一页重叠。
+        if current and (
+            unit.heading_path != current_heading or unit.page != current_page
+        ):
             _emit(chunks, current, document, blocks_by_ordinal, counter)
             current = []
         if current and unit.ordinal == current[-1].ordinal:
@@ -144,6 +154,7 @@ def chunk_markdown(
         if not current:
             current = [unit]
             current_heading = unit.heading_path
+            current_page = unit.page
             continue
         assert current_heading is not None
         trial = [*current, unit]
@@ -152,6 +163,11 @@ def chunk_markdown(
             continue
         previous = current[-1]
         _emit(chunks, current, document, blocks_by_ordinal, counter)
+        if unit.page != current_page:
+            # 页边界不携带重叠，避免下一 chunk 混入上一页文本。
+            current = [unit]
+            current_page = unit.page
+            continue
         # 顶部已保证 unit 与 current[-1] 属于不同块，这里可以直接取尾段重叠。
         overlap = _tail_piece(previous, counter, effective_budget)
         current = ([overlap] if overlap is not None else []) + [unit]
@@ -200,6 +216,7 @@ def _split_oversized_blocks(
             char_end=len(block.text),
             text=block.text,
             heading_path=block.heading_path,
+            page=block.page,
         )
         if (
             counter.count_tokens(build_model_input(block.heading_path, block.text))
@@ -232,6 +249,7 @@ def _split_block(
                 char_end=end,
                 text=text[start:end],
                 heading_path=block.heading_path,
+                page=block.page,
             )
         )
         if end >= length:
@@ -359,6 +377,7 @@ def _tail_piece(
         char_end=piece.char_end,
         text=suffix(best),
         heading_path=piece.heading_path,
+        page=piece.page,
     )
 
 
@@ -399,7 +418,7 @@ def _build_locator(
         if not ordinals or ordinals[-1] != piece.ordinal:
             ordinals.append(piece.ordinal)
     spanned = [blocks_by_ordinal[ordinal] for ordinal in ordinals]
-    segments = [
+    segments: list[dict[str, object]] = [
         {
             "block_ordinal": piece.ordinal,
             "block_char_start": piece.char_start,
@@ -407,13 +426,31 @@ def _build_locator(
         }
         for piece in pieces
     ]
+    if document.source_type == SOURCE_TYPE_PDF:
+        pages: list[int] = []
+        for piece in pieces:
+            if piece.page is not None and piece.page not in pages:
+                pages.append(piece.page)
+        for segment, piece in zip(segments, pieces):
+            segment["page"] = piece.page
+        return {
+            "locator_version": PDF_LOCATOR_VERSION,
+            "source_type": SOURCE_TYPE_PDF,
+            "parser_version": document.parser_version,
+            "source_sha256": document.source_sha256,
+            "pages": pages,
+            "block_ordinals": ordinals,
+            "segments": segments,
+        }
+    start_lines = [block.start_line for block in spanned if block.start_line is not None]
+    end_lines = [block.end_line for block in spanned if block.end_line is not None]
     return {
         "locator_version": LOCATOR_VERSION,
         "source_type": "markdown",
         "parser_version": document.parser_version,
         "source_sha256": document.source_sha256,
-        "start_line": min(block.start_line for block in spanned),
-        "end_line": max(block.end_line for block in spanned),
+        "start_line": min(start_lines),
+        "end_line": max(end_lines),
         "block_ordinals": ordinals,
         "segments": segments,
     }

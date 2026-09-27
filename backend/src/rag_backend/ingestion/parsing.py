@@ -48,27 +48,37 @@ _LIST_CLOSE = frozenset({"bullet_list_close", "ordered_list_close"})
 
 @dataclass(frozen=True)
 class ParsedBlock:
-    """一个带来源位置的纯数据块；所有线路字段都是 1-based 闭区间。"""
+    """一个带来源位置的纯数据块；Markdown 的线路字段是 1-based 闭区间。
+
+    ``start_line``/``end_line`` 仅对 Markdown 有意义；PDF 按页抽取时没有可靠行号，
+    因此保持 ``None``，绝不伪造行号。``page`` 仅 PDF 使用，1-based。
+    """
 
     ordinal: int
     kind: str
     heading_path: tuple[str, ...]
     text: str
-    start_line: int
-    end_line: int
+    start_line: int | None = None
+    end_line: int | None = None
     list_depth: int = 0
     level: int | None = None
     code_info: str | None = None
+    page: int | None = None
 
 
 @dataclass(frozen=True)
 class ParsedDocument:
-    """一次解析结果；``source_sha256`` 只由输入 bytes 决定。"""
+    """一次解析结果；``source_sha256`` 只由输入 bytes 决定。
+
+    ``source_type`` 与 ``parser_version`` 共同决定来源 locator 的形状：Markdown 使用
+    ``locator_version=1`` 的块级行范围，PDF 使用 ``locator_version=2`` 的页定位。
+    """
 
     source_sha256: str
     text: str
     blocks: tuple[ParsedBlock, ...]
     parser_version: str = MARKDOWN_PARSER_VERSION
+    source_type: str = "markdown"
 
 
 def parse_markdown(content: bytes) -> ParsedDocument:

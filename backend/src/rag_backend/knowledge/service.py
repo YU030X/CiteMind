@@ -25,7 +25,7 @@ from rag_backend.knowledge.roles import (
     validate_member_replacements,
 )
 from rag_backend.models.identity import KbMember, UserAccount
-from rag_backend.models.knowledge import KnowledgeBase
+from rag_backend.models.knowledge import Document, KnowledgeBase
 
 
 @dataclass(frozen=True)
@@ -47,6 +47,56 @@ class ValidMember:
     user_id: uuid.UUID
     username: str
     role: KbRole
+
+
+@dataclass(frozen=True)
+class DocumentAccess:
+    """当前用户在某个文档上的有效 KB 角色快照，仅在本请求内有效。"""
+
+    document_id: uuid.UUID
+    kb_id: uuid.UUID
+    organization_id: uuid.UUID
+    role: KbRole
+
+
+async def resolve_document_access(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> DocumentAccess | None:
+    """把文档解析到其 KB 的有效成员角色；不存在、跨组织、已撤销都返回 None。
+
+    与 ``resolve_knowledge_base_access`` 一样不缓存；它**不过滤** ``deleted_at``，使已删除
+    文档仍可由有权限的调用方得到确定状态（更新返回冲突、删除返回幂等），而不暴露给无权限者。
+    """
+
+    statement = (
+        select(
+            Document.id,
+            Document.kb_id,
+            KnowledgeBase.organization_id,
+            KbMember.role,
+        )
+        .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+        .join(KbMember, KbMember.kb_id == Document.kb_id)
+        .where(
+            Document.id == document_id,
+            KnowledgeBase.organization_id == organization_id,
+            KbMember.user_id == user_id,
+            KbMember.revoked_at.is_(None),
+        )
+    )
+    row = (await session.execute(statement)).first()
+    if row is None:
+        return None
+    return DocumentAccess(
+        document_id=row[0],
+        kb_id=row[1],
+        organization_id=row[2],
+        role=KbRole(row[3]),
+    )
 
 
 async def list_accessible_knowledge_bases(
