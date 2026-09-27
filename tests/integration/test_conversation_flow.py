@@ -418,10 +418,11 @@ async def test_full_http_flow_maps_citations_and_records_usage(
         payload = answer.json()
 
         assert payload["insufficientEvidence"] is False
-        assert payload["answer"] == "制度规定。"
+        # 服务端在句末追加与 display_label 一致的 [n] 引用标记。
+        assert payload["answer"] == "制度规定。[1]"
         assert len(payload["citations"]) == 1
         citation = payload["citations"][0]
-        assert citation["displayLabel"] == "E1"
+        assert citation["displayLabel"] == "1"
         assert citation["locator"] == json.loads(LOCATOR)
         assert citation["quote"] == CHUNK_TEXT[:500]
         assert citation["version"] == 1
@@ -451,7 +452,7 @@ async def test_full_http_flow_maps_citations_and_records_usage(
     assert _llm_usage_count(conversation_schema) == 1
     assert _message_role_pairs(conversation_schema) == [
         ("user", "hello"),
-        ("assistant", "制度规定。"),
+        ("assistant", "制度规定。[1]"),
     ]
     with conversation_schema.connect() as connection:
         row = connection.execute(
@@ -1029,7 +1030,8 @@ async def test_version_updated_history_keeps_old_answer_with_old_version_marker(
         history = await client.get(f"/api/v1/conversations/{conversation_id}/messages")
         messages = history.json()["messages"]
         assert [message["role"] for message in messages] == ["user", "assistant"]
-        assert messages[1]["content"] == "制度规定。"
+        # 旧版本引用仍保留服务端生成的 [1] 内联标记，历史刷新后可点。
+        assert messages[1]["content"] == "制度规定。[1]"
         assert messages[1]["citations"][0]["version"] == 1
         assert messages[1]["citations"][0]["isCurrentVersion"] is False
 
@@ -1086,8 +1088,8 @@ async def test_partial_citation_revocation_hides_whole_assistant_message(
         first = await _ask(client, conversation_id, "hello")
         assert first.status_code == 200, first.text
         assert {citation["displayLabel"] for citation in first.json()["citations"]} == {
-            "E1",
-            "E2",
+            "1",
+            "2",
         }
 
         with conversation_schema.begin() as connection:

@@ -59,7 +59,12 @@ from rag_backend.conversation.repository import (
     QueryRunRecord,
     StoredCitation,
 )
-from rag_backend.generation.answer_schema import AnswerSchemaError, ParsedAnswer, parse_answer
+from rag_backend.generation.answer_schema import (
+    AnswerSchemaError,
+    ParsedAnswer,
+    citation_display_label,
+    parse_answer,
+)
 from rag_backend.generation.context_budget import (
     REASON_UNSUPPORTED_TEXT,
     ChatContextPlan,
@@ -962,7 +967,7 @@ def _citation_drafts(
         row = evidence_by_id[evidence_id]
         drafts.append(
             _CitationDraft(
-                display_label=evidence_id,
+                display_label=citation_display_label(evidence_id),
                 chunk_id=row.chunk_id,
                 version_id=row.version_id,
                 document_title=row.document_title,

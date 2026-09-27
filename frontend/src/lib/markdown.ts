@@ -59,6 +59,22 @@ md.renderer.rules.link_open = (tokens, idx, options, _env, self) => {
 };
 
 /**
+ * 由一条消息的引用列表构造「标号 → 引用 ID」映射。
+ *
+ * 标号取自服务端持久化的 `displayLabel`（正文 `[n]` 里的 n），ID 是对应 citation 的 UUID。
+ * 只有这条消息确实带有的引用才会进入映射，正文无法凭自己造出引用入口。
+ */
+export function citationIdMap(
+  citations: readonly { displayLabel: string; citationId: string }[],
+): ReadonlyMap<string, string> {
+  const markers = new Map<string, string>();
+  for (const citation of citations) {
+    markers.set(citation.displayLabel, citation.citationId);
+  }
+  return markers;
+}
+
+/**
  * 渲染一段助手回答。
  *
  * @param source Markdown 原文。

@@ -26,8 +26,8 @@ import CitationPanel from "@/components/CitationPanel.vue";
 import ConversationList from "@/components/ConversationList.vue";
 import KnowledgeBaseSelect from "@/components/KnowledgeBaseSelect.vue";
 import { kbRoleLabel, citationVersionLabel, formatTime } from "@/labels";
-import { renderMarkdown } from "@/lib/markdown";
-import type { ReasoningEffort } from "@/api/types";
+import { citationIdMap, renderMarkdown } from "@/lib/markdown";
+import type { ConversationMessage, ReasoningEffort } from "@/api/types";
 import {
   activeKnowledgeBase,
   ask,
@@ -143,7 +143,9 @@ const renderedMessages = computed(
     new Map(
       messages.value.map((message) => [
         message.messageId,
-        message.role === "assistant" ? renderMarkdown(message.content) : "",
+        message.role === "assistant"
+          ? renderMarkdown(message.content, citationIdMap(message.citations))
+          : "",
       ]),
     ),
 );
@@ -200,6 +202,17 @@ function applyFollowUp(text: string): void {
 
 function cite(citationId: string): void {
   void openCitation(citationId);
+}
+
+/**
+ * 引用按钮由 Markdown 渲染器用服务端映射生成，这里只读取 data 属性里的 UUID，
+ * 不执行正文里的任何标签；正文自带的编号不会出现在这个属性里。
+ */
+function onMessageClick(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const id = target.closest("[data-citation-id]")?.getAttribute("data-citation-id");
+  if (id !== null && id !== undefined) cite(id);
 }
 </script>
 
@@ -271,7 +284,11 @@ function cite(citationId: string): void {
                 </span>
               </div>
 
-              <div class="md-body text-sm leading-7" v-html="renderedMessages.get(message.messageId)" />
+              <div
+                class="md-body text-sm leading-7"
+                v-html="renderedMessages.get(message.messageId)"
+                @click="onMessageClick"
+              />
 
               <div v-if="message.citations.length > 0" class="flex flex-wrap gap-2">
                 <button
@@ -598,6 +615,32 @@ function cite(citationId: string): void {
 }
 
 .citation-chip:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+/* 正文内联引用 [n]：由 renderMarkdown 在合法映射下生成，点击打开右侧引用 Sheet。 */
+.md-body :deep(.md-citation) {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0.1rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--card);
+  padding: 0 0.25rem;
+  color: var(--primary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.25rem;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.md-body :deep(.md-citation:hover) {
+  background: var(--secondary);
+}
+
+.md-body :deep(.md-citation:focus-visible) {
   outline: 2px solid var(--primary);
   outline-offset: 1px;
 }

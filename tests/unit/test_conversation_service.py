@@ -585,11 +585,11 @@ async def test_happy_path_maps_server_side_citation_and_records_usage() -> None:
         repository=repository, evidence=evidence, estimator=estimator, generator=generator
     )
 
-    assert result.answer == "制度规定。"
+    assert result.answer == "制度规定。[1]"
     assert result.insufficient_evidence is False
     assert len(result.citations) == 1
     citation = result.citations[0]
-    assert citation.display_label == "E1"
+    assert citation.display_label == "1"
     assert citation.locator == {"page": 3, "start_line": 5}
     assert citation.quote == "制度原文很长。"
     assert citation.version == 2
@@ -626,8 +626,115 @@ async def test_happy_path_maps_server_side_citation_and_records_usage() -> None:
     assert "制度原文很长。" in sent
     assert [message.role for message in repository.messages] == ["user", "assistant"]
     assert repository.messages[0].content == "制度怎么规定？"
-    assert repository.messages[1].content == "制度规定。"
+    assert repository.messages[1].content == "制度规定。[1]"
     assert len(repository.citations) == 1
+
+
+@pytest.mark.anyio
+async def test_answer_text_markers_dedupe_and_multi_source_labels() -> None:
+    """多句重复引用与多来源：标号与服务端 display_label/UUID 一一对应，快照去重。"""
+
+    other_chunk = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [
+            _evidence_row(text="制度原文。", chunk_id=CHUNK_ID),
+            _evidence_row(text="补充说明。", chunk_id=other_chunk),
+        ]
+    )
+    retrieval = FakeRetrieval([[_candidate(CHUNK_ID), _candidate(other_chunk)]])
+    content = json.dumps(
+        {
+            "sentences": [
+                {"text": "第一句。", "citationIds": ["E1", "E1"]},
+                {"text": "第二句。", "citationIds": ["E2", "E1"]},
+            ],
+            "insufficientEvidence": False,
+            "followUp": None,
+        },
+        ensure_ascii=False,
+    )
+    generator = FakeGenerator([_outcome(content=content)])
+
+    result, repository, _evidence, _generator = await _run(
+        repository=repository,
+        evidence=evidence,
+        retrieval=retrieval,
+        generator=generator,
+    )
+
+    # 同一来源跨句标号一致；同句重复编号不重复追加；每个来源只存一条引用快照。
+    assert result.answer == "第一句。[1]\n第二句。[2] [1]"
+    assert [view.display_label for view in result.citations] == ["1", "2"]
+    assert len(repository.citations) == 2
+    # 每个标号对应一个稳定 UUID，可据此打开引用详情。
+    labels_to_ids = {view.display_label: view.citation_id for view in result.citations}
+    assert set(labels_to_ids) == {"1", "2"}
+    assert labels_to_ids["1"] != labels_to_ids["2"]
+
+
+@pytest.mark.anyio
+async def test_persisted_citation_uuid_resolves_to_detail() -> None:
+    """点击正文 [n] 时携带的是持久化 UUID，能解析到引用详情。"""
+
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row()], states=[_state(CHUNK_ID, version_id=VERSION_ID)]
+    )
+    result, repository, _evidence, _generator = await _run(
+        repository=repository, evidence=evidence
+    )
+
+    view = await load_citation_detail(
+        repository,
+        evidence,
+        citation_id=result.citations[0].citation_id,
+        user_id=USER_ID,
+        organization_id=ORG_ID,
+    )
+
+    assert view.citation_id == result.citations[0].citation_id
+    assert view.display_label == "1"
+    assert view.quote == "制度原文。"
+
+
+@pytest.mark.anyio
+async def test_model_literal_marker_does_not_forge_authorized_citation() -> None:
+    """模型正文自带的 [n] 不是引用入口；只有结构化 citationIds 派生的标记才是。"""
+
+    other_chunk = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [
+            _evidence_row(text="制度原文。", chunk_id=CHUNK_ID),
+            _evidence_row(text="补充说明。", chunk_id=other_chunk),
+        ]
+    )
+    retrieval = FakeRetrieval([[_candidate(CHUNK_ID), _candidate(other_chunk)]])
+    content = json.dumps(
+        {
+            "sentences": [
+                # 第一句只引用 E1，却在正文里自写 [2]；第二句才真正引用 E2。
+                {"text": "伪造[2]来源。", "citationIds": ["E1"]},
+                {"text": "真实第二来源。", "citationIds": ["E2"]},
+            ],
+            "insufficientEvidence": False,
+            "followUp": None,
+        },
+        ensure_ascii=False,
+    )
+    generator = FakeGenerator([_outcome(content=content)])
+
+    result, repository, _evidence, _generator = await _run(
+        repository=repository,
+        evidence=evidence,
+        retrieval=retrieval,
+        generator=generator,
+    )
+
+    # 消息里确实存在标号 2，但第一句自写的 [2] 已被转义，不会被当成引用入口。
+    assert result.answer == "伪造\\[2\\]来源。[1]\n真实第二来源。[2]"
+    assert [view.display_label for view in result.citations] == ["1", "2"]
 
 
 @pytest.mark.anyio
@@ -954,7 +1061,7 @@ async def test_unsupported_evidence_is_skipped_while_valid_evidence_answers() ->
     )
 
     assert result.insufficient_evidence is False
-    assert result.citations[0].display_label == "E2"
+    assert result.citations[0].display_label == "2"
     assert result.citations[0].quote == "合法证据。"
     assert result.degraded_stages == ("unsupported_text",)
     assert repository.query_runs[0].evidence_count == 1
