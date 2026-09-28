@@ -21,12 +21,14 @@ SECOND_SLICE_TABLES = {"index_generation", "chunk", "chunk_embedding"}
 LLM_USAGE_TABLES = {"llm_usage"}
 IDENTITY_TABLES = {"user_account", "auth_session", "kb_member"}
 CONVERSATION_TABLES = {"conversation", "message", "query_run", "citation"}
+DOCUMENT_ACL_TABLES = {"document_acl"}
 EXPECTED_TABLES = (
     FIRST_SLICE_TABLES
     | SECOND_SLICE_TABLES
     | LLM_USAGE_TABLES
     | IDENTITY_TABLES
     | CONVERSATION_TABLES
+    | DOCUMENT_ACL_TABLES
 )
 
 # chunk_embedding 的主键来自 chunk，不是应用新生成的 UUID。
@@ -66,6 +68,15 @@ EXPECTED_NAMED_CONSTRAINTS = {
         "fk_document_active_version_id_document_version",
         "ck_document_source_type",
         "ck_document_lifecycle_status",
+        "ck_document_acl_mode",
+    },
+    "document_acl": {
+        "pk_document_acl",
+        "fk_document_acl_document_id_document",
+        "fk_document_acl_principal_id_user_account",
+        "uq_document_acl_document_principal_permission",
+        "ck_document_acl_principal_type",
+        "ck_document_acl_permission",
     },
     "document_version": {
         "pk_document_version",

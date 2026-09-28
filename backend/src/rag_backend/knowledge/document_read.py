@@ -22,6 +22,8 @@ from typing import Any, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag_backend.knowledge.document_acl import acl_read_clause
+from rag_backend.models.identity import KbMember
 from rag_backend.models.ingestion import IngestJob
 from rag_backend.models.knowledge import Document, DocumentVersion, KnowledgeBase
 
@@ -167,7 +169,11 @@ class DocumentReadRepository(Protocol):
     """文档只读仓储；实现持有调用方 ``AsyncSession``，不自建事务边界。"""
 
     async def list_documents(
-        self, *, kb_id: uuid.UUID, organization_id: uuid.UUID
+        self,
+        *,
+        kb_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> list[DocumentRow]: ...
 
     async def get_document(
@@ -188,7 +194,11 @@ class SqlDocumentReadRepository:
         self._session = session
 
     async def list_documents(
-        self, *, kb_id: uuid.UUID, organization_id: uuid.UUID
+        self,
+        *,
+        kb_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        user_id: uuid.UUID,
     ) -> list[DocumentRow]:
         statement = (
             select(
@@ -201,11 +211,15 @@ class SqlDocumentReadRepository:
                 Document.updated_at,
             )
             .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+            .join(KbMember, KbMember.kb_id == Document.kb_id)
             .where(
                 Document.kb_id == kb_id,
                 KnowledgeBase.organization_id == organization_id,
+                KbMember.user_id == user_id,
+                KbMember.revoked_at.is_(None),
                 Document.deleted_at.is_(None),
                 Document.lifecycle_status != DOCUMENT_LIFECYCLE_DELETED,
+                acl_read_clause(user_id),
             )
             .order_by(Document.created_at.desc(), Document.id.desc())
         )
@@ -319,11 +333,12 @@ async def list_knowledge_base_documents(
     *,
     kb_id: uuid.UUID,
     organization_id: uuid.UUID,
+    user_id: uuid.UUID,
 ) -> list[DocumentView]:
-    """列出 KB 内未删除文档及其版本/任务视图；保持仓储返回的稳定倒序。"""
+    """列出 KB 内当前用户可读的未删除文档及其版本/任务视图；保持仓储稳定倒序。"""
 
     documents = await repository.list_documents(
-        kb_id=kb_id, organization_id=organization_id
+        kb_id=kb_id, organization_id=organization_id, user_id=user_id
     )
     if not documents:
         return []

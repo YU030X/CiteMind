@@ -48,8 +48,22 @@ _KB_SCOPE_SQL = text(
     """
 ).bindparams(bindparam("kb_ids", expanding=True))
 
+# 文档 ACL 只收紧读取：``INHERIT`` 沿用 KB 成员权限；``RESTRICTED`` 时只有 ``document_acl``
+# 里显式登记为 ``USER``/``READ`` 的用户可见。两个候选路、证据正文与来源状态复核都用这同
+# 一子句，且都绑定 ``:user_id``，不做字符串拼接。
+_ACL_ALLOWED_SQL = (
+    "("
+    "d.acl_mode = 'INHERIT' OR EXISTS ("
+    "SELECT 1 FROM document_acl AS a "
+    "WHERE a.document_id = d.id "
+    "AND a.principal_type = 'USER' "
+    "AND a.principal_id = :user_id "
+    "AND a.permission = 'READ'"
+    "))"
+)
+
 _VECTOR_SQL = text(
-    """
+    f"""
     SELECT
         c.id AS chunk_id,
         d.id AS document_id,
@@ -74,13 +88,14 @@ _VECTOR_SQL = text(
       AND d.deleted_at IS NULL
       AND d.active_version_id = dv.id
       AND dv.status = 'READY'
+      AND {_ACL_ALLOWED_SQL}
     ORDER BY distance ASC, c.id ASC
     LIMIT :limit
     """
 ).bindparams(bindparam("kb_ids", expanding=True))
 
 _KEYWORD_SQL = text(
-    """
+    f"""
     SELECT
         c.id AS chunk_id,
         d.id AS document_id,
@@ -105,6 +120,7 @@ _KEYWORD_SQL = text(
       AND d.deleted_at IS NULL
       AND d.active_version_id = dv.id
       AND dv.status = 'READY'
+      AND {_ACL_ALLOWED_SQL}
       AND c.fts @@ plainto_tsquery('simple', :query_terms)
     ORDER BY score DESC, c.id ASC
     LIMIT :limit
@@ -113,7 +129,7 @@ _KEYWORD_SQL = text(
 
 # 证据正文读取：与两条候选路复用同一授权 JOIN，按 chunk id 取回原文、版本号与 locator。
 _EVIDENCE_SQL = text(
-    """
+    f"""
     SELECT
         c.id AS chunk_id,
         d.id AS document_id,
@@ -139,15 +155,17 @@ _EVIDENCE_SQL = text(
       AND d.deleted_at IS NULL
       AND d.active_version_id = dv.id
       AND dv.status = 'READY'
+      AND {_ACL_ALLOWED_SQL}
       AND c.id IN :chunk_ids
     """
 ).bindparams(bindparam("chunk_ids", expanding=True))
 
 # 来源状态复核：不过滤 active version，供「历史引用是否仍被授权」与「证据版本是否变更」使用。
 # ``kb_member`` 必须用 LEFT JOIN：无成员行时 ``revoked_at`` 也是 NULL，若不显式判定行是否存在，
-# 缺失成员会被误判成有效成员（撤权/删除成员行后旧引用仍被当作可交付）。
+# 缺失成员会被误判成有效成员（撤权/删除成员行后旧引用仍被当作可交付）。ACL 不参与行过滤，
+# 只作为一个布尔列返回，避免把 LEFT JOIN 出来的行过滤掉而误判成「已授权」。
 _CHUNK_STATE_SQL = text(
-    """
+    f"""
     SELECT
         c.id AS chunk_id,
         d.id AS document_id,
@@ -156,7 +174,8 @@ _CHUNK_STATE_SQL = text(
         d.deleted_at AS deleted_at,
         kb.id AS kb_id,
         kb.organization_id AS kb_organization_id,
-        (m.user_id IS NOT NULL AND m.revoked_at IS NULL) AS member_active
+        (m.user_id IS NOT NULL AND m.revoked_at IS NULL) AS member_active,
+        {_ACL_ALLOWED_SQL} AS acl_allowed
     FROM chunk AS c
     JOIN index_generation AS g ON g.id = c.generation_id
     JOIN document_version AS dv ON dv.id = g.version_id
@@ -209,11 +228,17 @@ class ChunkSourceState:
     deleted: bool
     member_active: bool
     in_organization: bool
+    acl_allowed: bool
 
     def is_authorized(self) -> bool:
-        """来源是否仍可交付（成员有效、同组织、文档未删除；允许历史版本）。"""
+        """来源是否仍可交付（成员有效、同组织、文档未删除、ACL 放行；允许历史版本）。"""
 
-        return self.member_active and self.in_organization and not self.deleted
+        return (
+            self.member_active
+            and self.in_organization
+            and not self.deleted
+            and self.acl_allowed
+        )
 
     def is_current(self) -> bool:
         """来源是否仍是生成时的 active version（用于版本变化检测）。"""
@@ -433,6 +458,7 @@ class SqlRetrievalRepository:
                 # 无成员行与已撤销成员一样都是未授权；不能只看 ``revoked_at IS NULL``。
                 member_active=bool(row["member_active"]),
                 in_organization=row["kb_organization_id"] == organization_id,
+                acl_allowed=bool(row["acl_allowed"]),
             )
             for row in result.mappings().all()
         ]

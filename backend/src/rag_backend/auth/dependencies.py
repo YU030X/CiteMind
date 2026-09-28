@@ -28,6 +28,10 @@ from rag_backend.auth.service import build_auth_context
 from rag_backend.auth.tokens import CSRF_HEADER_NAME, csrf_tokens_match
 from rag_backend.config import Settings, normalise_origin
 from rag_backend.database import get_database_session
+from rag_backend.knowledge.document_acl import (
+    DocumentReadAccess,
+    resolve_document_read_access,
+)
 from rag_backend.knowledge.roles import KbRole, kb_role_rank
 from rag_backend.knowledge.service import (
     DocumentAccess,
@@ -165,6 +169,36 @@ def require_document_role(
             organization_id=context.organization_id,
         )
         if access is None or kb_role_rank(access.role) < kb_role_rank(minimum_role):
+            raise ApiError(
+                404,
+                CODE_DOCUMENT_NOT_FOUND,
+                "文档不存在或无权访问",
+            )
+        return access
+
+    return dependency
+
+
+def require_document_read() -> Callable[..., Awaitable[DocumentReadAccess]]:
+    """构造「文档读取」依赖：KB 成员 + 未删除 + ACL 放行，三者缺一即 404。
+
+    与 ``require_document_role`` 不同，这里**收紧**读取：``RESTRICTED`` 文档只有名单内
+    且仍是同组织有效成员的用户可读，空名单连 OWNER 也不能读；删除、跨组织、撤权与
+    ACL 拒绝统一返回不暴露存在性的 404。写操作仍用 ``require_document_role`` 判定。
+    """
+
+    async def dependency(
+        document_id: uuid.UUID,
+        context: AuthContext = Depends(get_auth_context),
+        session: AsyncSession = Depends(get_database_session),
+    ) -> DocumentReadAccess:
+        access = await resolve_document_read_access(
+            session,
+            document_id=document_id,
+            user_id=context.user_id,
+            organization_id=context.organization_id,
+        )
+        if access is None:
             raise ApiError(
                 404,
                 CODE_DOCUMENT_NOT_FOUND,

@@ -84,8 +84,8 @@ from test_retrieval_flow import (
 
 pytestmark = pytest.mark.integration
 
-# 问答与会话表、生成选项快照都需要升到当前 head；与 ``test_conversation_flow`` 一致。
-SCHEMA_REVISION = "20260927_0011"
+# 问答与会话表、生成选项快照与文档 ACL 都需要升到当前 head；与 ``test_conversation_flow`` 一致。
+SCHEMA_REVISION = "20260928_0012"
 
 CORPUS = Path(__file__).resolve().parents[1] / "evaluation" / "corpus"
 MD_V2 = (CORPUS / "handbook-v2.md").read_bytes()

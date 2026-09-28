@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）给 `ingest_job` 增加可空 `profile_id` 外键，且新 Markdown 上传写路径已在同一四表事务内登记默认全局 profile 并显式绑定该列（独立 tester 已在隔离 PostgreSQL 17 + Redis 上验收，详见下文）；问答四表 `conversation`/`message`/`query_run`/`citation` 已由迁移 `20260927_0009` 落地并由证据问答主流程实现与验收（见下文）。文档 ACL、缓存、`retrieval_hit`/`feedback` 与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）给 `ingest_job` 增加可空 `profile_id` 外键，且新 Markdown 上传写路径已在同一四表事务内登记默认全局 profile 并显式绑定该列（独立 tester 已在隔离 PostgreSQL 17 + Redis 上验收，详见下文）；问答四表 `conversation`/`message`/`query_run`/`citation` 已由迁移 `20260927_0009` 落地并由证据问答主流程实现与验收；文档 ACL（`document.acl_mode` 与 `document_acl`）已由迁移 `20260928_0012` 落地，读取收紧与原文下载已实现并在隔离 PostgreSQL 17 上聚焦验收（见下文）。缓存、`retrieval_hit`/`feedback` 与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `index_profile` | id, embedding_model, model_revision, tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash, dimension, normalize, created_at | `dimension = 512` 的具名 CHECK、`config_hash` 唯一、不可变（无 UPDATE 授权）；它是全局编码契约登记表，登记一个 profile 不代表任何 KB 可检索；api SELECT+INSERT，worker SELECT |
 | `knowledge_base` | id, organization_id, name, active_index_profile_id, kb_revision, acl_revision, created_at, updated_at | `organization_id` 暂不建组织外键；两个 revision 默认 0 且 `>= 0`；`active_index_profile_id` 可空、外键 RESTRICT（语义见下文“index profile 契约与 KB active 可见性”）；api SELECT+INSERT+UPDATE，worker SELECT |
-| `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`(kb_id, lifecycle_status)` 索引；本切片不建 `acl_mode`；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
+| `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, acl_mode, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`acl_mode IN (INHERIT, RESTRICTED)`（文档 ACL 切片 `20260928_0012` 补加，`server_default='INHERIT'`）；`(kb_id, lifecycle_status)` 索引；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `document_version` | id, document_id, version_no, file_ref, file_hash, mime, parser_version, status, created_at, updated_at | `version_no > 0`；`status IN (PENDING, READY, FAILED, NEEDS_OCR)`；`(document_id, version_no)` 唯一；本切片不添加解析警告字段；`parser_version` 无 CHECK，既有行历史值为占位 `markdown-v1`，新上传按 `source_type` 写真实实现版本（Markdown `markdown-it-py-4.2.0-v1`、PDF `pypdf-6.19.0-v1`；Markdown 新版行为已由独立 tester 在隔离 PostgreSQL 17 + Redis 上验收，`tests/integration/test_document_upload_flow.py` 11 passed/0 skipped），既有行不自动升级、需受控处理；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `ingest_job` | id, document_id, version_id, status, attempt, lease_owner, lease_token, lease_until, heartbeat_at, next_run_at, dedupe_key, request_title, error_code, created_at, updated_at | `status IN (QUEUED, PARSING, CHUNKING, EMBEDDING, INDEXING, READY, FAILED, CANCELLED)`；`attempt >= 0`；租约 owner/token/until 三列全空或全非空；`dedupe_key` 唯一；`(status, next_run_at)` 索引；第一切片不含 `generation_id` 与独立 progress，第二切片补加可空 `generation_id`，第五切片（`20260925_0006`）再补加可空 `profile_id`，文档更新/删除切片（`20260926_0008`）再补加可空 `request_title`（受理时刻的标题快照，旧任务为 NULL，可空、无 server default/回填/索引，api/worker 表级授权已覆盖）；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `outbox_event` | id, job_id, event_type, status, dispatch_attempt, next_send_at, lease_owner, lease_token, lease_until, sent_at, created_at, updated_at | `status IN (PENDING, SENT, FAILED)`；`dispatch_attempt >= 0`；租约三列全空或全非空；`job_id` 不唯一；不建 payload；`(status, next_send_at)` 索引；api SELECT+INSERT+UPDATE，worker 无权限 |
@@ -81,7 +81,7 @@ profile 一致，发布事务必须用带谓词的条件 UPDATE 拒绝非 NULL �
 
 ## 已实现：文档更新/删除切片（迁移 20260926_0008）
 
-文档更新/删除切片复用既有列与状态：`document.deleted_at`、`document.lifecycle_status='DELETED'`、`document_version.status`、`ingest_job.status='CANCELLED'` 与 `index_generation.status`；另新增迁移 `20260926_0008_ingest_job_request_title`，只给 `ingest_job` 加一个可空 Text 列 `request_title`（不加 server default/回填/索引/授权）。它固化受理那一刻的规范化请求标题，使幂等身份不再依赖会被新版本改写的 `document.title`；`request_title IS NULL` 的旧任务回退到 `document.title` 比较（旧数据边界，不回填、不静默改变旧 key 语义）。SQLAlchemy 模型与迁移结构同步。新版本去重键复用 `ingest_job.dedupe_key`（text，无结构变更），在更新命名空间 `ver1:<document_id>:<sha256>:<expected_active_version_id>` 下存储，与首次上传的裸 SHA-256 键互不匹配；该列因此不是数据库强制的结构化字段，一致性由应用写路径维护。`document_version(document_id, version_no)` 唯一约束是并发分配的最后防线（应用在 `document` 行锁内取 `max+1`）。删除只写 `document` 两列并递增 `knowledge_base.kb_revision`；删除事务锁序与 worker 相反导致的死锁由 API 侧完整事务重试收敛（见 [入库](ingestion.md)）。api 角色对 `document`/`document_version`/`ingest_job` 的既有 SELECT+INSERT+UPDATE 覆盖本次写入；worker 角色对 `document`/`document_version`/`ingest_job` 的 SELECT+UPDATE 覆盖更新发布与领取期静态拒绝，KB 两列权限仍由 `20260925_0007` 提供。物理回收、`document_acl` 与 `cleanupJobId` 属后续切片。
+文档更新/删除切片复用既有列与状态：`document.deleted_at`、`document.lifecycle_status='DELETED'`、`document_version.status`、`ingest_job.status='CANCELLED'` 与 `index_generation.status`；另新增迁移 `20260926_0008_ingest_job_request_title`，只给 `ingest_job` 加一个可空 Text 列 `request_title`（不加 server default/回填/索引/授权）。它固化受理那一刻的规范化请求标题，使幂等身份不再依赖会被新版本改写的 `document.title`；`request_title IS NULL` 的旧任务回退到 `document.title` 比较（旧数据边界，不回填、不静默改变旧 key 语义）。SQLAlchemy 模型与迁移结构同步。新版本去重键复用 `ingest_job.dedupe_key`（text，无结构变更），在更新命名空间 `ver1:<document_id>:<sha256>:<expected_active_version_id>` 下存储，与首次上传的裸 SHA-256 键互不匹配；该列因此不是数据库强制的结构化字段，一致性由应用写路径维护。`document_version(document_id, version_no)` 唯一约束是并发分配的最后防线（应用在 `document` 行锁内取 `max+1`）。删除只写 `document` 两列并递增 `knowledge_base.kb_revision`；删除事务锁序与 worker 相反导致的死锁由 API 侧完整事务重试收敛（见 [入库](ingestion.md)）。api 角色对 `document`/`document_version`/`ingest_job` 的既有 SELECT+INSERT+UPDATE 覆盖本次写入；worker 角色对 `document`/`document_version`/`ingest_job` 的 SELECT+UPDATE 覆盖更新发布与领取期静态拒绝，KB 两列权限仍由 `20260925_0007` 提供。物理回收与 `cleanupJobId` 属后续切片。
 
 ## 已实现：问答切片（迁移 20260927_0009）
 
@@ -124,13 +124,23 @@ GRANT UPDATE (title, pinned_at, deleted_at, updated_at) ON TABLE conversation TO
 
 默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口现已接入**新 Markdown 上传写路径**（同一四表事务内调用，已由独立 tester 验收），KB 创建路径仍不调用；默认关闭的真实入库管线在领取任务后改用身份预检与 `worker_index_identity` 工厂、不调用本入口。该 profile 登记切片没有新迁移、没有 seed 独立 profile，dev 库 `knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言已前置到 `worker_index_identity` 工厂，登记成功不代表任何 KB 可检索。
 
+## 已实现：文档 ACL 切片（迁移 20260928_0012）
+
+迁移 `20260928_0012` 紧接 `20260927_0011`，线性单 head，新增：
+
+1. 给 `document` 增加非空 `acl_mode TEXT DEFAULT 'INHERIT'`，具名 CHECK `ck_document_acl_mode` 限定 `INHERIT`/`RESTRICTED`；`server_default` 只服务既有行升级回填，应用或数据库默认均为 `INHERIT`。本迁移不给 `document` 新增授权（既有表级 SELECT+INSERT+UPDATE 已覆盖新列）。
+2. 创建 `document_acl`：`id` 主键、`document_id` 外键 ``document``（RESTRICT）、`principal_type TEXT NOT NULL`（CHECK 限定 `USER`）、`principal_id` 外键 `user_account`（RESTRICT）、`permission TEXT NOT NULL`（CHECK 限定 `READ`）、`created_at`；`(document_id, principal_type, principal_id, permission)` 具名唯一约束 `uq_document_acl_document_principal_permission`。
+
+授权：`document_acl` 逐表 `REVOKE ALL ... FROM PUBLIC` 后只给 `citemind_api` **SELECT + INSERT + DELETE**，这是运行角色首次获得 DELETE（全量替换需要删除旧名单行）；不给 UPDATE（名单行不可变）、也不给 TRUNCATE/REFERENCES/TRIGGER、sequence 或 PostgreSQL ENUM。`citemind_worker` 不获任何权限。降级只删除 `document_acl` 表、`acl_mode` 列与其 CHECK。
+
+数据模型不强制“名单用户是同组织有效 KB 成员”与“`INHERIT` 时名单为空”：前者由写入事务核对，后者由应用校验并保证写入时清空；直接写库可以绕过，二者都由读取判定的权威链与服务端校验共同保障。真实迁移与授权验收由 `tests/integration/test_document_acl_migration.py` 承担（升级、精确授权、api 插入/删除与 UPDATE 拒绝、worker 拒绝、降级无残留）；权限、revision 与锁序由 `tests/integration/test_document_acl_flow.py` 承担。
+
 ## 计划中：后续切片
 
 以下实体与字段仍未实现。
 
 | 实体 | 主要字段 | 关键约束与用途 |
 | --- | --- | --- |
-| `document_acl` | document_id, principal_type, principal_id, permission | 完整范围才启用；只能收紧 KB 成员权限 |
 | `embedding_cache` | cache_key, model_revision, dimension, vector_payload, last_used_at | 只在本组织内复用，不复用来源位置 |
 | `conversation` / `message` | owner_id, kb_scope；role, content, query_run_id, status | 会话属于用户；历史访问按当前 ACL 复核（已由 `20260927_0009` 落地，见上文） |
 | `query_run` / `retrieval_hit` | 问题、scope_snapshot、配置、版本、阶段耗时、tokens、cost；chunk_id、两路排名、RRF/rerank 分数 | 调试与复算；权限撤销后也需过滤（`query_run` 已落地；`retrieval_hit` 仍为计划） |
@@ -138,7 +148,8 @@ GRANT UPDATE (title, pinned_at, deleted_at, updated_at) ON TABLE conversation TO
 | `eval_dataset` / `eval_case` / `eval_run` / `eval_result` | 数据集版本、角色、gold spans、split；配置、模型 revision、逐题结果 | 保留历史运行，不覆盖；gold 使用源区间而非 chunk ID |
 | `audit_event` | actor_id, action, target_id, before_hash, after_hash, request_id, created_at | 记录授权、删除、索引切换等，默认不记正文 |
 
-第一切片已实现的 `ingest_job` 已在第二切片新增可空 `generation_id`；第一切片已实现的 `document` 尚无 `acl_mode`，它属于完整范围的字段。完整主关系仍是 `knowledge_base → document → document_version → index_generation → chunk → chunk_embedding`；任务为 `ingest_job → outbox_event → Celery 消息`；问答为 `conversation → message → query_run / citation`，检索命中归 `query_run`。授权沿 `auth_session → user_account → kb_member → document_acl` 应用于资源读取与两路检索。
+`document_acl` 已于文档 ACL 切片（迁移 `20260928_0012`）落地，不再列入计划表。
+第一切片已实现的 `ingest_job` 已在第二切片新增可空 `generation_id`；第一切片已实现的 `document` 已在文档 ACL 切片（`20260928_0012`）补加 `acl_mode`；`document_acl` 也已落地。完整主关系仍是 `knowledge_base → document → document_version → index_generation → chunk → chunk_embedding`；任务为 `ingest_job → outbox_event → Celery 消息`；问答为 `conversation → message → query_run / citation`，检索命中归 `query_run`。授权沿 `auth_session → user_account → kb_member → document_acl` 应用于资源读取与两路检索。
 
 ## 数据库约束和索引
 

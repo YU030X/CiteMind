@@ -1,6 +1,8 @@
-"""知识库、文档与文档版本模型（第一切片）。
+"""知识库、文档、文档版本与文档读取允许名单模型。
 
-第一切片不包含 ``document_acl``；``document`` 暂不建 ``acl_mode``。
+第一切片不包含 ``document_acl``；文档 ACL 切片后 ``document`` 增加 ``acl_mode``，
+并新增 ``document_acl``。``acl_mode`` 只收紧读取：``INHERIT`` 沿用 KB 成员读权限，
+``RESTRICTED`` 只允许 ``document_acl`` 中显式登记的用户读取。
 """
 
 import uuid
@@ -48,7 +50,11 @@ class KnowledgeBase(CreatedAtMixin, UpdatedAtMixin, Base):
 
 
 class Document(CreatedAtMixin, UpdatedAtMixin, Base):
-    """文档；``active_version_id`` 指向当前服务版本，删除版本时置空。"""
+    """文档；``active_version_id`` 指向当前服务版本，删除版本时置空。
+
+    ``acl_mode`` 新上传默认 ``INHERIT``；``RESTRICTED`` 时读取只允许 ``document_acl``
+    显式登记且仍是有效 KB 成员的用户，空名单连 OWNER 也不能读。
+    """
 
     __tablename__ = "document"
     __table_args__ = (
@@ -58,6 +64,9 @@ class Document(CreatedAtMixin, UpdatedAtMixin, Base):
         CheckConstraint(
             "lifecycle_status IN ('CREATED', 'INDEXING', 'READY', 'FAILED', 'DELETED')",
             name="lifecycle_status",
+        ),
+        CheckConstraint(
+            "acl_mode IN ('INHERIT', 'RESTRICTED')", name="acl_mode"
         ),
         Index("ix_document_kb_id_lifecycle_status", "kb_id", "lifecycle_status"),
     )
@@ -82,9 +91,48 @@ class Document(CreatedAtMixin, UpdatedAtMixin, Base):
         nullable=True,
     )
     lifecycle_status: Mapped[str] = mapped_column(Text, nullable=False)
+    acl_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'INHERIT'")
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class DocumentAcl(CreatedAtMixin, Base):
+    """文档读取允许名单；首片只有 ``USER``/``READ``，只收紧读取、不授予管理权。
+
+    行不可变（运行角色没有 UPDATE），全量替换按 ``document_id`` 删除后重新插入。
+    ``principal_id`` 外键指向 ``user_account``；它是否仍是同组织活跃 KB 成员由写入
+    事务在服务端核对，数据库不强制组织一致。
+    """
+
+    __tablename__ = "document_acl"
+    __table_args__ = (
+        CheckConstraint("principal_type IN ('USER')", name="principal_type"),
+        CheckConstraint("permission IN ('READ')", name="permission"),
+        UniqueConstraint(
+            "document_id",
+            "principal_type",
+            "principal_id",
+            "permission",
+            name="uq_document_acl_document_principal_permission",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("document.id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=False,
+    )
+    principal_type: Mapped[str] = mapped_column(Text, nullable=False)
+    principal_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("user_account.id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=False,
+    )
+    permission: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class DocumentVersion(CreatedAtMixin, UpdatedAtMixin, Base):

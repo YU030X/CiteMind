@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+import anyio
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from python_multipart.exceptions import MultipartParseError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,9 @@ from starlette.formparsers import MultiPartException
 from starlette.types import Message, Receive
 
 from rag_backend.api.errors import (
+    CODE_DOCUMENT_ACL_INVALID,
+    CODE_DOCUMENT_ACL_MEMBER_INVALID,
+    CODE_DOCUMENT_CONTENT_UNAVAILABLE,
     CODE_DOCUMENT_DELETED,
     CODE_DOCUMENT_EMPTY,
     CODE_DOCUMENT_NOT_FOUND,
@@ -42,7 +46,9 @@ from rag_backend.api.errors import (
 from rag_backend.auth.context import AuthContext
 from rag_backend.auth.dependencies import (
     enforce_allowed_origin,
+    get_auth_context,
     require_csrf,
+    require_document_read,
     require_document_role,
     require_kb_role,
 )
@@ -50,6 +56,7 @@ from rag_backend.config import Settings
 from rag_backend.database import get_database_session
 from rag_backend.ingestion import service as ingestion_service
 from rag_backend.ingestion.errors import (
+    BlobReadError,
     DocumentDeleted,
     DocumentEmpty,
     DocumentNotFound,
@@ -63,12 +70,29 @@ from rag_backend.ingestion.errors import (
     TitleInvalid,
     UnsupportedDocumentType,
 )
-from rag_backend.ingestion.storage import DocumentBlobStore
+from rag_backend.ingestion.storage import DocumentBlobStore, InvalidBlobReference
 from rag_backend.ingestion.validation import (
+    MARKDOWN_MEDIA_TYPE,
     MAX_DOCUMENT_BYTES,
     MAX_TITLE_LENGTH,
+    PDF_MEDIA_TYPE,
+    SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     resolve_upload_format,
+)
+from rag_backend.knowledge.document_acl import (
+    DocumentAclDocumentNotFound,
+    DocumentAclError,
+    DocumentAclInvalid,
+    DocumentAclMember,
+    DocumentAclMemberInvalid,
+    DocumentReadAccess,
+    replace_document_acl,
+)
+from rag_backend.knowledge.document_content import (
+    DocumentContentRepository,
+    SqlDocumentContentRepository,
+    load_document_content_target,
 )
 from rag_backend.knowledge.document_read import (
     DocumentReadRepository,
@@ -84,6 +108,9 @@ from rag_backend.knowledge.service import (
     resolve_document_access,
 )
 from rag_backend.schemas.documents import (
+    DocumentAclMemberSummary,
+    DocumentAclResponse,
+    DocumentAclUpdateRequest,
     DocumentJobSummary,
     DocumentListResponse,
     DocumentSummary,
@@ -95,8 +122,9 @@ router = APIRouter(prefix="/api/v1", tags=["documents"])
 
 require_reader = require_kb_role(KbRole.READER)
 require_editor = require_kb_role(KbRole.EDITOR)
-require_document_reader = require_document_role(KbRole.READER)
+require_document_reader = require_document_read()
 require_document_editor = require_document_role(KbRole.EDITOR)
+require_document_owner = require_document_role(KbRole.OWNER)
 
 # 删除事务先锁 ``document`` 再锁 ``ingest_job``，而 worker 的失败/发布事务先锁
 # ``ingest_job`` 再锁 ``document``；两者并发时 PostgreSQL 会以死锁（SQLSTATE ``40P01``）
@@ -270,19 +298,29 @@ def get_document_read_repository(
     return SqlDocumentReadRepository(session)
 
 
+def get_document_content_repository(
+    session: AsyncSession = Depends(get_database_session),
+) -> DocumentContentRepository:
+    """按请求构造下载目标仓储；不缓存、不跨请求复用事务。"""
+
+    return SqlDocumentContentRepository(session)
+
+
 @router.get(
     "/knowledge-bases/{kb_id}/documents", response_model=DocumentListResponse
 )
 async def list_knowledge_base_documents_route(
     access: KbAccess = Depends(require_reader),
+    context: AuthContext = Depends(get_auth_context),
     repository: DocumentReadRepository = Depends(get_document_read_repository),
 ) -> DocumentListResponse:
-    """列出 KB 内未删除文档；已删除文档不出现，本片不分页。"""
+    """列出 KB 内当前用户可读的未删除文档；ACL 收紧时受限文档不出现，本片不分页。"""
 
     views = await list_knowledge_base_documents(
         repository,
         kb_id=access.kb_id,
         organization_id=access.organization_id,
+        user_id=context.user_id,
     )
     return DocumentListResponse(documents=[_document_summary(view) for view in views])
 
@@ -290,10 +328,10 @@ async def list_knowledge_base_documents_route(
 @router.get("/documents/{document_id}", response_model=DocumentSummary)
 async def get_document(
     document_id: uuid.UUID,
-    access: DocumentAccess = Depends(require_document_reader),
+    access: DocumentReadAccess = Depends(require_document_reader),
     repository: DocumentReadRepository = Depends(get_document_read_repository),
 ) -> DocumentSummary:
-    """读取单个未删除文档；已删除或越权统一返回不暴露存在性的 404。"""
+    """读取单个**可读**未删除文档；ACL 拒绝、已删除或越权统一返回不暴露存在性的 404。"""
 
     view = await load_document_detail(
         repository,
@@ -303,6 +341,143 @@ async def get_document(
     if view is None:
         raise ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
     return _document_summary(view)
+
+
+def _content_media_type(source_type: str) -> tuple[str, str] | None:
+    """按来源返回受控 MIME 与安全后缀；未知来源返回 ``None``，由路由静态失败。
+
+    只接受服务端写入的 ``markdown``/``pdf``（`document.source_type` 的 CHECK 值）；
+    不把未知值一律当 PDF，避免类型伪装。
+    """
+
+    if source_type == SOURCE_TYPE_MARKDOWN:
+        return MARKDOWN_MEDIA_TYPE, ".md"
+    if source_type == SOURCE_TYPE_PDF:
+        return PDF_MEDIA_TYPE, ".pdf"
+    return None
+
+
+@router.get("/documents/{document_id}/content")
+async def get_document_content(
+    request: Request,
+    document_id: uuid.UUID,
+    version_id: uuid.UUID | None = Query(default=None, alias="versionId"),
+    context: AuthContext = Depends(get_auth_context),
+    repository: DocumentContentRepository = Depends(get_document_content_repository),
+    session: AsyncSession = Depends(get_database_session),
+) -> Response:
+    """下载原文件字节；默认当前 active 版本，``versionId`` 可显式指定同文档历史版本。
+
+    授权与读取统一：KB 成员 + ACL 放行 + 未删除，跨文档/跨组织/未授权/deleted 一律 404。
+    读取在 IO 线程进行，期间先结束数据库事务；交付前重新鉴权并核对版本（默认 active 变
+    化时返回 409，显式历史版本仍可下载）。blob 损坏等读失败返回静态 500，不泄露路径。
+    """
+
+    settings: Settings = request.app.state.settings
+    target = await load_document_content_target(
+        repository,
+        document_id=document_id,
+        user_id=context.user_id,
+        organization_id=context.organization_id,
+        version_id=version_id,
+    )
+    # 读取前先结束只读事务，把连接交还连接池；IO 期间不持有数据库连接。
+    await session.rollback()
+    if target is None:
+        raise ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
+
+    store = DocumentBlobStore(settings.document_storage_directory)
+    try:
+        content = await anyio.to_thread.run_sync(
+            store.read_verified_blob, target.kb_id, target.file_ref, target.file_hash
+        )
+    except (InvalidBlobReference, BlobReadError) as error:
+        # 损坏、缺失、超限或非法引用统一静态 500；错误信息不含路径或底层异常。
+        raise ApiError(
+            500, CODE_DOCUMENT_CONTENT_UNAVAILABLE, "文档内容暂不可用"
+        ) from error
+
+    # 交付前重新鉴权并核对版本：撤权/删除立即 404；默认 active 变化返回 409，
+    # 不允许用新 active 的授权去交付旧字节。
+    current = await load_document_content_target(
+        repository,
+        document_id=document_id,
+        user_id=context.user_id,
+        organization_id=context.organization_id,
+        version_id=version_id,
+    )
+    await session.rollback()
+    if current is None:
+        # 撤权/删除与首次不可读一致：不以任何版本变化为由暴露差异，统一 404。
+        raise ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
+    if current.version_id != target.version_id:
+        # 默认 active 在读取期间真正变化 → 409；显式版本不匹配按 404 处理。
+        if version_id is None:
+            raise ApiError(
+                409, CODE_DOCUMENT_VERSION_CONFLICT, "文档当前版本已变化，请重试"
+            )
+        raise ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
+
+    resolved_media_type = _content_media_type(target.source_type)
+    if resolved_media_type is None:
+        # 未知来源不猜类型，与 blob 损坏同类的静态 500。
+        raise ApiError(500, CODE_DOCUMENT_CONTENT_UNAVAILABLE, "文档内容暂不可用")
+    media_type, extension = resolved_media_type
+    filename = f"document-{document_id}{extension}"
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(content=content, media_type=media_type, headers=headers)
+
+
+def _document_acl_error(error: DocumentAclError) -> ApiError:
+    """把文档 ACL 领域错误映射为具名错误体；不存在与越权统一 404。"""
+
+    if isinstance(error, DocumentAclDocumentNotFound):
+        return ApiError(404, CODE_DOCUMENT_NOT_FOUND, "文档不存在或无权访问")
+    if isinstance(error, DocumentAclInvalid):
+        return ApiError(422, CODE_DOCUMENT_ACL_INVALID, str(error))
+    if isinstance(error, DocumentAclMemberInvalid):
+        return ApiError(422, CODE_DOCUMENT_ACL_MEMBER_INVALID, str(error))
+    return ApiError(400, CODE_INGESTION_ERROR, "文档 ACL 请求失败")
+
+
+@router.put("/documents/{document_id}/acl", response_model=DocumentAclResponse)
+async def replace_document_acl_route(
+    request: Request,
+    document_id: uuid.UUID,
+    payload: DocumentAclUpdateRequest,
+    access: DocumentAccess = Depends(require_document_owner),
+    context: AuthContext = Depends(require_csrf),
+    session: AsyncSession = Depends(get_database_session),
+) -> DocumentAclResponse:
+    """OWNER 全量替换文档读取 ACL；只收紧读取，不影响更新/删除等管理权。"""
+
+    settings: Settings = request.app.state.settings
+    enforce_allowed_origin(request, settings)
+
+    members = [DocumentAclMember(user_id=member.user_id) for member in payload.members]
+    try:
+        view = await replace_document_acl(
+            session,
+            document_id=document_id,
+            organization_id=access.organization_id,
+            actor_user_id=context.user_id,
+            mode=payload.mode,
+            members=members,
+        )
+    except DocumentAclError as error:
+        raise _document_acl_error(error) from error
+    return DocumentAclResponse(
+        document_id=view.document_id,
+        mode=view.mode,
+        members=[
+            DocumentAclMemberSummary(user_id=user_id) for user_id in view.member_ids
+        ],
+        acl_revision=view.acl_revision,
+    )
 
 
 @router.post(

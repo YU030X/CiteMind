@@ -38,10 +38,9 @@ from test_core_migration import (
 
 pytestmark = pytest.mark.integration
 
-# 上传事务的 ORM 会显式写入 ``ingest_job.profile_id``（``20260925_0006``）与受理时刻的
-# ``ingest_job.request_title``（``20260926_0008``）；因此上传片必须建在建有这两列的线性
-# schema 上，不能用更旧的 revision。
-SCHEMA_REVISION = "20260926_0008"
+# 上传事务的 ORM 写入 ``ingest_job.profile_id``（0006）、受理时刻的 ``request_title``
+# （0008），并依赖 ``document.acl_mode`` 的 server default（0012）；因此上传片建在当前 head。
+SCHEMA_REVISION = "20260928_0012"
 
 # 默认 index profile 契约与其规范 JSON 的 SHA-256；与 profile 契约/登记聚焦测试一致。
 GOLDEN_CONFIG_HASH = "4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa"
@@ -461,6 +460,15 @@ async def test_editor_upload_writes_single_transaction_facts(
         "lifecycle_status": "CREATED",
         "deleted_at": None,
     }
+    # 新上传默认 INHERIT（读取沿用 KB 成员权限），不因本片改成 RESTRICTED。
+    with upload_schema.connect() as connection:
+        assert (
+            connection.scalar(
+                text("SELECT acl_mode FROM document WHERE id = :id"),
+                {"id": document_id},
+            )
+            == "INHERIT"
+        )
 
     digest = hashlib.sha256(MARKDOWN_BYTES).hexdigest()
     version = version_row(upload_schema, version_id)

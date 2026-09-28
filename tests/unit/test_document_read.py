@@ -23,6 +23,7 @@ from rag_backend.auth.context import AuthContext
 from rag_backend.auth.dependencies import get_auth_context
 from rag_backend.config import Settings
 from rag_backend.database import get_database_session
+from rag_backend.knowledge.document_acl import DocumentReadAccess
 from rag_backend.knowledge.document_read import (
     DocumentRow,
     JobRow,
@@ -32,7 +33,7 @@ from rag_backend.knowledge.document_read import (
     list_knowledge_base_documents,
 )
 from rag_backend.knowledge.roles import KbRole
-from rag_backend.knowledge.service import DocumentAccess, KbAccess
+from rag_backend.knowledge.service import KbAccess
 
 ORIGIN = "http://127.0.0.1"
 USER_ID = uuid.uuid4()
@@ -179,12 +180,15 @@ async def test_list_documents_query_excludes_deleted_and_filters_organization() 
     session = _CapturingSession()
     repository = SqlDocumentReadRepository(session)  # type: ignore[arg-type]
 
-    await repository.list_documents(kb_id=KB_ID, organization_id=ORG_ID)
+    await repository.list_documents(kb_id=KB_ID, organization_id=ORG_ID, user_id=USER_ID)
 
     sql = str(session.statements[0])
     assert "deleted_at IS NULL" in sql
     assert "lifecycle_status" in sql
     assert "knowledge_base.organization_id" in sql
+    assert "kb_member.revoked_at IS NULL" in sql
+    assert "document_acl" in sql
+    assert "acl_mode" in sql
     assert "ORDER BY document.created_at DESC" in sql
 
 
@@ -239,7 +243,7 @@ class FakeDocumentReadRepository:
         self.jobs = list(jobs or [])
 
     async def list_documents(
-        self, *, kb_id: uuid.UUID, organization_id: uuid.UUID
+        self, *, kb_id: uuid.UUID, organization_id: uuid.UUID, user_id: uuid.UUID
     ) -> list[DocumentRow]:
         return list(self.documents.values())
 
@@ -287,13 +291,13 @@ def _allow_kb(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _allow_document(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_resolve(*_args: Any, **_kwargs: Any) -> DocumentAccess:
-        return DocumentAccess(
+    async def fake_resolve(*_args: Any, **_kwargs: Any) -> DocumentReadAccess:
+        return DocumentReadAccess(
             document_id=DOC_ID, kb_id=KB_ID, organization_id=ORG_ID, role=KbRole.READER
         )
 
     monkeypatch.setattr(
-        "rag_backend.auth.dependencies.resolve_document_access", fake_resolve
+        "rag_backend.auth.dependencies.resolve_document_read_access", fake_resolve
     )
 
 
@@ -387,7 +391,7 @@ async def test_document_detail_returns_404_without_access(
     async def deny(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr("rag_backend.auth.dependencies.resolve_document_access", deny)
+    monkeypatch.setattr("rag_backend.auth.dependencies.resolve_document_read_access", deny)
     read_app.dependency_overrides[get_document_read_repository] = (
         lambda: FakeDocumentReadRepository()
     )
@@ -442,7 +446,7 @@ async def test_list_service_uses_repository_once_per_level() -> None:
         [_document()], versions=[_version(V1, 1, "READY")]
     )
     views = await list_knowledge_base_documents(
-        repository, kb_id=KB_ID, organization_id=ORG_ID
+        repository, kb_id=KB_ID, organization_id=ORG_ID, user_id=USER_ID
     )
 
     assert len(views) == 1

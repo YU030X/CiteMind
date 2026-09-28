@@ -12,3 +12,4 @@
 | Note | 主题 |
 | --- | --- |
 | [bge-zh-query-v1](implemented/bge-zh-query-v1.md) | BGE 中文查询 instruction 前缀与 `bge-zh-query-v1` 命名契约 |
+| [document-acl-read-narrowing](implemented/document-acl-read-narrowing.md) | 文档 ACL 只收紧读取、首次 DELETE 授权与下载鉴权时序 |

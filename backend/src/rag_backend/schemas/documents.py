@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
+from rag_backend.knowledge.document_acl import DocumentAclMode
 from rag_backend.schemas.base import CamelModel
 
 
@@ -54,3 +55,31 @@ class DocumentListResponse(CamelModel):
     """KB 内未删除文档列表；本片不分页。"""
 
     documents: list[DocumentSummary]
+
+
+class DocumentAclMemberInput(CamelModel):
+    """文档读取允许名单条目；首片只有用户主体。"""
+
+    user_id: uuid.UUID
+
+
+class DocumentAclUpdateRequest(CamelModel):
+    """全量替换文档读取 ACL；``INHERIT`` 时必须为空名单。"""
+
+    mode: DocumentAclMode
+    members: list[DocumentAclMemberInput] = []
+
+
+class DocumentAclMemberSummary(CamelModel):
+    """响应中的名单条目；只暴露用户 id。"""
+
+    user_id: uuid.UUID
+
+
+class DocumentAclResponse(CamelModel):
+    """替换后的 ACL 快照与所属 KB 当前 ``aclRevision``。"""
+
+    document_id: uuid.UUID
+    mode: DocumentAclMode
+    members: list[DocumentAclMemberSummary]
+    acl_revision: int

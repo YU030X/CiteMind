@@ -45,7 +45,7 @@ from test_core_migration import alembic_config, alembic_revision, business_table
 
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260925_0007"
+SCHEMA_REVISION = "20260928_0012"
 # 集成用的假分析器身份；profile 行必须登记同一值，否则检索按契约 fail closed。
 ANALYZER_ID = "test-analyzer"
 

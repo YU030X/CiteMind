@@ -109,6 +109,7 @@ def _state(
     deleted: bool = False,
     member_active: bool = True,
     in_organization: bool = True,
+    acl_allowed: bool = True,
 ) -> ChunkSourceState:
     return ChunkSourceState(
         chunk_id=chunk_id,
@@ -118,6 +119,7 @@ def _state(
         deleted=deleted,
         member_active=member_active,
         in_organization=in_organization,
+        acl_allowed=acl_allowed,
     )
 
 

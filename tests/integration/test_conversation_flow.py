@@ -72,7 +72,7 @@ from test_retrieval_flow import (
 
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260927_0011"
+SCHEMA_REVISION = "20260928_0012"
 ORIGIN = "http://127.0.0.1"
 CSRF_TOKEN = "integration-conversation-csrf"
 

@@ -88,9 +88,9 @@ from test_retrieval_flow import (
 pytestmark = pytest.mark.integration
 
 # 发布事务需要 worker 对 ``knowledge_base(active_index_profile_id, kb_revision)`` 的列级
-# UPDATE（0007），而上传/新版本 ORM 还写入受理时刻的 ``ingest_job.request_title``
-# （0008），因此本片 schema 必须升到 0008。
-SCHEMA_REVISION = "20260926_0008"
+# UPDATE（0007），上传/新版本 ORM 写入受理时刻的 ``ingest_job.request_title``（0008），
+# 而检索 SQL 还引用文档 ACL（0012），因此本片 schema 必须升到 0012。
+SCHEMA_REVISION = "20260928_0012"
 V1_BODY = b"# alpha\n\nbeta gamma\n"
 V2_BODY = b"# delta\n\nepsilon zeta\n"
 V1_TITLE = "版本一"

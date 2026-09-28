@@ -22,6 +22,7 @@ INGEST_JOB_REQUEST_TITLE_REVISION = "20260926_0008"
 CONVERSATION_REVISION = "20260927_0009"
 CONVERSATION_METADATA_REVISION = "20260927_0010"
 QUERY_RUN_OPTIONS_REVISION = "20260927_0011"
+DOCUMENT_ACL_REVISION = "20260928_0012"
 
 CORE_TABLES = (
     "index_profile",
@@ -35,12 +36,14 @@ SECOND_SLICE_TABLES = ("index_generation", "chunk", "chunk_embedding")
 LLM_USAGE_TABLES = ("llm_usage",)
 IDENTITY_TABLES = ("user_account", "auth_session", "kb_member")
 CONVERSATION_TABLES = ("conversation", "message", "query_run", "citation")
+DOCUMENT_ACL_TABLES = ("document_acl",)
 ALL_TABLES = (
     CORE_TABLES
     + SECOND_SLICE_TABLES
     + LLM_USAGE_TABLES
     + IDENTITY_TABLES
     + CONVERSATION_TABLES
+    + DOCUMENT_ACL_TABLES
 )
 
 EXPECTED_CHECK_CONSTRAINTS = (
@@ -49,6 +52,7 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_knowledge_base_acl_revision_non_negative",
     "ck_document_source_type",
     "ck_document_lifecycle_status",
+    "ck_document_acl_mode",
     "ck_document_version_version_no_positive",
     "ck_document_version_status",
     "ck_ingest_job_status",
@@ -89,6 +93,8 @@ EXPECTED_CHECK_CONSTRAINTS = (
     "ck_message_role",
     "ck_message_sequence_positive",
     "ck_citation_display_label_non_empty",
+    "ck_document_acl_principal_type",
+    "ck_document_acl_permission",
 )
 
 SECOND_SLICE_GRANTS = (
@@ -118,6 +124,9 @@ CONVERSATION_METADATA_GRANTS = (
     "GRANT UPDATE (title, pinned_at, deleted_at, updated_at) "
     "ON TABLE conversation TO citemind_api;",
 )
+DOCUMENT_ACL_GRANTS = (
+    "GRANT SELECT, INSERT, DELETE ON TABLE document_acl TO citemind_api;",
+)
 
 
 def alembic_config() -> Config:
@@ -133,9 +142,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [QUERY_RUN_OPTIONS_REVISION]
+    assert script_directory.get_heads() == [DOCUMENT_ACL_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    document_acl = script_directory.get_revision(DOCUMENT_ACL_REVISION)
     query_run_options = script_directory.get_revision(QUERY_RUN_OPTIONS_REVISION)
     conversation_metadata = script_directory.get_revision(CONVERSATION_METADATA_REVISION)
     conversation = script_directory.get_revision(CONVERSATION_REVISION)
@@ -151,7 +161,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     assert conversation_metadata.down_revision == CONVERSATION_REVISION
     assert conversation_metadata.nextrev == {QUERY_RUN_OPTIONS_REVISION}
     assert query_run_options.down_revision == CONVERSATION_METADATA_REVISION
-    assert query_run_options.nextrev == set()
+    assert query_run_options.nextrev == {DOCUMENT_ACL_REVISION}
+    assert document_acl.down_revision == QUERY_RUN_OPTIONS_REVISION
+    assert document_acl.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -339,10 +351,13 @@ def test_offline_upgrade_sql_grants_the_business_tables_exactly(
         + len(WORKER_KB_PUBLISH_GRANTS)
         + len(CONVERSATION_GRANTS)
         + len(CONVERSATION_METADATA_GRANTS)
+        + len(DOCUMENT_ACL_GRANTS)
     )
     for grant in SECOND_SLICE_GRANTS:
         assert grant in output
     for grant in WORKER_KB_PUBLISH_GRANTS:
+        assert grant in output
+    for grant in DOCUMENT_ACL_GRANTS:
         assert grant in output
 
 
@@ -552,6 +567,46 @@ def test_offline_downgrade_sql_removes_only_query_run_generation_options(
     assert "DROP COLUMN generation_options" in output
     assert "DROP TABLE" not in output
     assert "GRANT " not in output
+
+
+def test_offline_upgrade_sql_adds_document_acl(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{QUERY_RUN_OPTIONS_REVISION}:{DOCUMENT_ACL_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE document ADD COLUMN acl_mode TEXT DEFAULT 'INHERIT' NOT NULL;" in output
+    assert "CHECK (acl_mode IN ('INHERIT', 'RESTRICTED'))" in output
+    assert "CREATE TABLE document_acl (" in output
+    assert "REVOKE ALL ON TABLE document_acl FROM PUBLIC;" in output
+    assert DOCUMENT_ACL_GRANTS[0] in output
+    # 只收紧读取：不新建索引、不 seed、不回填、不碰其它表。
+    assert "CREATE INDEX" not in output
+    assert "UPDATE document" not in output
+    assert "document_acl TO citemind_worker" not in output
+    for statement in ("UPDATE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+        assert f"GRANT {statement} ON TABLE document_acl" not in output
+
+
+def test_offline_downgrade_sql_removes_document_acl(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{DOCUMENT_ACL_REVISION}:{QUERY_RUN_OPTIONS_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP TABLE document_acl;" in output
+    assert "DROP CONSTRAINT ck_document_acl_mode" in output
+    assert "DROP COLUMN acl_mode" in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(
