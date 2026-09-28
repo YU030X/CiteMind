@@ -60,6 +60,30 @@ uv run pytest tests/unit/test_evaluation_dataset.py -q
 
 以下验收仍未完成，需在真实模型与真实权限环境下另测，不能由本开发集或任何合成结果代替：**40 道开发题没有对任何真实检索/生成模型跑过**，因此没有真实检索/生成质量分数，也没有费用或延迟数字；留出集（上表留出列）尚不存在；真实检索/生成质量（Recall@10、nDCG@10、引用支持率、真实 provider 拒答与费用/延迟）尚未测量；无权限不泄漏尚未在真实候选、重排、日志、历史与下载链路上验收；三组消融与性能 p95 目标未测。开发集只用于开发期调参和结构自检，不得冒充留出集或作为最终质量结论。
 
+## 已实现：开发集最小结果 producer（runner）
+
+`rag_backend.evaluation.runner` 把上述开发集接到**真实 API** 上，产出恰好覆盖 40 题的 results 文件供既有 `--results` 指标消费；它不建评估平台、不建新数据库、不引入 LLM 裁判，也不改业务 API 或公开 `Citation` 字段。
+
+- **准备状态来自清单，与 gold 分离。** runner 只读 `corpus/manifest.json` 的版本与 active/superseded/deleted 状态来准备语料：开始任何上传前先通过真实 API 确认每个语料 KB 没有未删除文档（有则静态失败，不自动清理既有资料），然后同一文档按清单版本升序上传，每一版都等待成为 `active` 再上传下一版，最后删除 `currentVersion` 为空的文档；它不读题集 gold、不按 gold 注入答案或挑选检索证据。逻辑版本号与 API 的 `document_version.version_no` 不要求相等（例如 `handbook` 的逻辑版本 2/3 对应 API 的第 1/2 版），因此映射不使用版本号猜测。边界：文档列表只含未删除文档，仅含逻辑删除文档的 KB 会被判为空，因此可复现运行应使用**全新专用隔离 KB**。
+- **逐题执行真实会话。** 每题按 `scope.role` 与 `scope.kbIds` 创建会话；多轮题先按真实顺序回放历史中的**用户**轮次（助手轮由真实模型生成），再提问，因此追问改写与失败都计入预算。无权限/无答案题由真实检索给出无证据拒答；创建会话被拒（KB 不可访问）按真实拒答记录，其它 API 错误、超时与未 READY 明确失败，不吞并。准备账号在上传模式下按 `GET /me` 的角色逐一核对：每个语料 KB 至少 EDITOR、含删除文档的 KB 必须 OWNER；题集实际使用的角色（当前仅 `staff`）的可访问 KB 方向也按清单核对。
+- **引用 UUID 映射回逻辑标识。** 回答返回的引用 UUID 经只读 SQL `citation -> document_version` 得到版本 UUID，再由本次运行登记的 `version UUID -> (逻辑 KB, 逻辑文档, 逻辑版本)` 映射回逻辑标识；不按标题或版本号猜测，也不扩大响应字段。
+- **默认 dry-run 与保守硬上限。** 默认在联网前先做静态配置校验（环境描述必须覆盖所有语料 KB、所有题目角色与准备角色），不通过就失败，不假成功；dry-run 只打印计划与保守预留，不联网、不写库、不调用模型、不写结果文件。真实运行必须显式 `--allow-real-llm` 并给出正的 `--max-model-requests`；服务端一次提问可因证据来源变化重试一次生成，故每次提问按最多两次回答请求预留，已有历史再加一次改写请求，在调用前扣除且失败不返还。该预留是**成本上界，不是实际计费次数**；当前 40 题开发集的最坏情况预留为 86 次。结果只有恰好覆盖题集全部 id 时才写出，任何缺失或错误（含预算不足、登录失败）都带题目 id 进入诊断并退出非零，不产出可被 `--results` 接受的半成品。
+- **环境契约与同栈核对。** runner 需要一份显式环境描述（逻辑 KB -> 真实 UUID、各角色合成账号、上传模式的准备账号）或一份显式资产映射（无上传，不要求准备账号凭据）。API 目标默认只接受回环地址（非回环需显式 `--allow-non-loopback-api`）；只读数据库 DSN 由环境变量提供，数据库名不以 `_test` 结尾时必须显式重申；写库前必须取得直接证据：`GET /me` 返回的 KB UUID/角色必须与描述一致，且同一批语料 KB UUID 必须存在于只读数据库中（同 host 不作为证明），否则拒绝上传。它不自动部署用户环境。本地 Compose 的 http 回环入口需显式 `SESSION_COOKIE_SECURE=0`（仓库 Compose 已如此），否则登录 Cookie 不会被浏览器/客户端带回。这是题集之外必须由用户提供的信息：开发集只定义逻辑 KB/文档/版本与角色->KB 可读关系，不含真实 UUID、账号凭据或各 KB 的写权限。
+
+代码入口（默认 dry-run，不联网、不调用模型；`--descriptor` 指向显式环境描述）：
+
+```text
+uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.json
+```
+
+真实运行需另行取得用户授权后显式开启，并把只读数据库 DSN 放入环境变量 `EVAL_DATABASE_URL`：
+
+```text
+uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.json --api-base-url http://127.0.0.1:58080 --results-out path/to/results.json --diagnostics-out path/to/diagnostics.json --allow-real-llm --max-model-requests 120
+```
+
+本轮实测只覆盖离线编排与合成 HTTP：`uv run pytest tests/unit/test_evaluation_runner.py -q` 为 25 passed，`uv run ruff check backend/src/rag_backend/evaluation tests/unit/test_evaluation_runner.py` 与 `uv run mypy` 通过。**本 runner 尚未在真实隔离六服务或真实 provider 上运行过**：没有真实 40 题结果文件，没有真实质量、费用或延迟数字，也没有真实权限不泄漏验收；上述 86 与 `--max-model-requests` 是保守预留上界，不是实际计费次数；上述命令是入口而非已跑通的真实评估结论。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。
