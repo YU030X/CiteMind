@@ -1,0 +1,41 @@
+{
+  "date": "2026-09-28",
+  "headCommit": "480f3d8",
+  "scope": "Phase 1 开发评估 40 题 + 同栈权限验收 19 项（隔离栈 myrag-p1eval，已清理）",
+  "budget": {
+    "authorizedUpperBound": 86,
+    "runnerReserved": 86,
+    "estimationFormula": "38 题无历史 x 2 + 2 题各含 1 轮用户历史 x (2+3) = 86",
+    "reservedIsUpperBoundNotBilling": true,
+    "actualProviderAttempts": 46,
+    "unused": 40,
+    "failedAttempts": 0
+  },
+  "actualAttemptsBreakdown": {
+    "evaluationRun": 44,
+    "evaluationRunDetail": { "qa_answer": 42, "qa_rewrite": 2 },
+    "permissionAcceptance": 2,
+    "total": 46
+  },
+  "providerUsage": {
+    "provider": "deepseek",
+    "model": "deepseek-flash",
+    "rows": 46,
+    "statusSucceeded": 46,
+    "usageSourceProviderReported": 46,
+    "attempt": 1,
+    "errorCodeNull": 46,
+    "promptTokens": 15110,
+    "completionTokens": 1920,
+    "promptCacheHitTokens": 640,
+    "promptCacheMissTokens": 14470,
+    "latencyMs": { "min": 524, "max": 1854, "mean": 886.4, "p50": 871.5 },
+    "cost": {
+      "priceSnapshot": null,
+      "priceSource": null,
+      "priceCurrency": null,
+      "costAmount": null,
+      "note": "无可靠价目快照，费用未知；不以 token 数替代费用"
+    }
+  }
+}

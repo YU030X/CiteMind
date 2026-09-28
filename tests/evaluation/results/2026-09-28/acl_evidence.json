@@ -1,0 +1,238 @@
+{
+  "marker": "P1EVALACLMARK7f3c9d21",
+  "checks": [
+    {
+      "check": "P1 staff /me 仅 handbook，且看不到 restricted",
+      "ok": true,
+      "observed": {
+        "f4377029-abb5-4e9c-bfbc-63af2fdd783c": "READER"
+      },
+      "note": ""
+    },
+    {
+      "check": "P1 hr /me 含 handbook + restricted 均为 READER",
+      "ok": true,
+      "observed": {
+        "f4377029-abb5-4e9c-bfbc-63af2fdd783c": "READER",
+        "21fd597a-daf1-4a6c-a306-3cbab043ac96": "READER"
+      },
+      "note": ""
+    },
+    {
+      "check": "P2 staff GET restricted 文档列表 = 404（不泄露存在性）",
+      "ok": true,
+      "observed": {
+        "status": 404,
+        "code": "KNOWLEDGE_BASE_NOT_FOUND"
+      },
+      "note": ""
+    },
+    {
+      "check": "P3 staff 检索 restricted 范围 = 404",
+      "ok": true,
+      "observed": {
+        "status": 404,
+        "code": "KNOWLEDGE_BASE_NOT_FOUND"
+      },
+      "note": ""
+    },
+    {
+      "check": "P4 staff 可访问 KB 检索候选全部来自 handbook（0 条 restricted 候选）",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "candidateCount": 20,
+        "kbIds": [
+          "f4377029-abb5-4e9c-bfbc-63af2fdd783c"
+        ],
+        "restrictedCandidates": 0
+      },
+      "note": ""
+    },
+    {
+      "check": "P5 hr 检索 restricted 范围 200 且有候选",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "candidateCount": 3,
+        "kbIds": [
+          "21fd597a-daf1-4a6c-a306-3cbab043ac96"
+        ],
+        "documentIds": [
+          "6cf70646-ec42-44a7-871f-d8030d451b77"
+        ]
+      },
+      "note": ""
+    },
+    {
+      "check": "P6 hr 在 restricted 范围获得真实引答",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "answer": "职级P6的年度薪酬带宽为35万元至48万元。[1]",
+        "insufficientEvidence": false,
+        "citationCount": 1,
+        "providerAttemptsAdded": 1,
+        "usage": {
+          "localInputTokens": 240,
+          "inputTokenBudget": 4000,
+          "outputTokenBudget": 800,
+          "providerPromptTokens": 240,
+          "providerCompletionTokens": 43
+        }
+      },
+      "note": ""
+    },
+    {
+      "check": "P6 撤权前 hr 可读引用详情 200（restricted 原文定位）",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "displayLabel": "1",
+        "documentTitle": "eval:salary-bands",
+        "locator": {
+          "end_line": 9,
+          "segments": [
+            {
+              "block_ordinal": 1,
+              "block_char_end": 22,
+              "block_char_start": 0
+            },
+            {
+              "block_ordinal": 2,
+              "block_char_end": 22,
+              "block_char_start": 0
+            }
+          ],
+          "start_line": 7,
+          "source_type": "markdown",
+          "source_sha256": "4d33412df78f953ac41a673bda46fbb87c5ddfe5292bd22f193113cd72739d5e",
+          "block_ordinals": [
+            1,
+            2
+          ],
+          "parser_version": "markdown-it-py-4.2.0-v1",
+          "locator_version": 1
+        },
+        "isCurrentVersion": true,
+        "assistantMessagesBefore": 1
+      },
+      "note": ""
+    },
+    {
+      "check": "P6 citation UUID -> version UUID -> 逻辑文档 事实",
+      "ok": true,
+      "observed": {
+        "citationId": "986c9085-3e2f-4f9d-ab61-204879c7e83a",
+        "versionId": "47dbd83f-047d-48ce-a47e-c2f487d285ba",
+        "apiVersionNo": 1,
+        "documentTitle": "eval:salary-bands"
+      },
+      "note": ""
+    },
+    {
+      "check": "P7 成员全量替换遵守 CSRF（缺失/错误均被拒）",
+      "ok": true,
+      "observed": {
+        "missingCsrf": {
+          "status": 403,
+          "code": "CSRF_INVALID"
+        },
+        "wrongCsrf": {
+          "status": 403,
+          "code": "CSRF_INVALID"
+        }
+      },
+      "note": ""
+    },
+    {
+      "check": "P7 带正确 CSRF 的成员替换成功（hr 被撤权）",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "aclRevision": 2
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后 hr /me 不再含 restricted",
+      "ok": true,
+      "observed": {
+        "f4377029-abb5-4e9c-bfbc-63af2fdd783c": "READER"
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后 hr 新建 restricted 会话 = 404",
+      "ok": true,
+      "observed": {
+        "status": 404,
+        "code": "KNOWLEDGE_BASE_NOT_FOUND"
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后 hr 检索 restricted = 404",
+      "ok": true,
+      "observed": {
+        "status": 404,
+        "code": "KNOWLEDGE_BASE_NOT_FOUND"
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后原引用详情 = 404 CITATION_NOT_FOUND",
+      "ok": true,
+      "observed": {
+        "status": 404,
+        "code": "CITATION_NOT_FOUND"
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后该助手历史整体隐藏",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "messageCountBefore": 2,
+        "messageCountAfter": 1,
+        "assistantBefore": 1,
+        "assistantAfter": 0,
+        "answerTextStillExposed": false
+      },
+      "note": ""
+    },
+    {
+      "check": "P8 撤权后 hr 在 handbook 范围检索无 restricted 候选",
+      "ok": true,
+      "observed": {
+        "status": 200,
+        "candidateCount": 20,
+        "restrictedCandidates": 0
+      },
+      "note": ""
+    },
+    {
+      "check": "预算：本轮 provider 尝试总数（llm_usage 行数）",
+      "ok": true,
+      "observed": {
+        "llmUsageRows": 46
+      },
+      "note": "上限 86"
+    },
+    {
+      "check": "日志扫描：自制唯一标记未出现在任何隔离容器日志",
+      "ok": true,
+      "observed": {
+        "myrag-p1eval-api-1": 0,
+        "myrag-p1eval-worker-1": 0,
+        "myrag-p1eval-inference-1": 0,
+        "myrag-p1eval-postgres-1": 0,
+        "myrag-p1eval-redis-1": 0
+      },
+      "note": "只覆盖本隔离栈当前日志，不代表未来链或其它环境的安全结论"
+    }
+  ],
+  "passed": 19,
+  "failed": 0
+}

@@ -1,6 +1,6 @@
 # 评估与验收计划
 
-> 所有数字是待验证的目标，没有已完成的测试结果。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的开发集、自制语料与离线校验已实现（见“已实现：Phase 1 开发评估集与离线校验”）；质量与性能数字仍是待验证目标，尚未测量。
+> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；留出集与质量/性能目标仍是待验证目标，尚未测量。
 
 ## 固定题集
 
@@ -58,7 +58,7 @@ uv run pytest tests/unit/test_evaluation_dataset.py -q
 
 本切片只交付开发集、离线校验与确定性指标计算，**不建评估平台、不建新数据库、不引入 LLM 裁判**；计算器不联网、不读环境文件、不调用任何模型，测试里用合成结果只验证计算分支。本轮实测：`uv run python -m rag_backend.evaluation` 退出 0、`total=40`；`uv run pytest tests/unit/test_evaluation_dataset.py -q` 为 28 passed。
 
-以下验收仍未完成，需在真实模型与真实权限环境下另测，不能由本开发集或任何合成结果代替：**40 道开发题没有对任何真实检索/生成模型跑过**，因此没有真实检索/生成质量分数，也没有费用或延迟数字；留出集（上表留出列）尚不存在；真实检索/生成质量（Recall@10、nDCG@10、引用支持率、真实 provider 拒答与费用/延迟）尚未测量；无权限不泄漏尚未在真实候选、重排、日志、历史与下载链路上验收；三组消融与性能 p95 目标未测。开发集只用于开发期调参和结构自检，不得冒充留出集或作为最终质量结论。
+以下验收仍未完成，需在真实模型与真实权限环境下另测，不能由本开发集或任何合成结果代替：留出集（上表留出列）尚不存在；句子级引用支持率（需人工审核 ≥100 事实句）、`Recall@10`/`nDCG@10`、rerank 与相似度阈值带来的拒答标定、真实 provider 失败/超时与思考模式端到端、费用与预算核算（价目 NULL）、三组消融与性能 p95 目标均未测量；无权限不泄漏本轮只在隔离合成数据上验收了单轮链路，重排、日志、历史与下载等完整链路尚未验收。开发集只用于开发期调参和结构自检，不得冒充留出集或作为最终质量结论。
 
 ## 已实现：开发集最小结果 producer（runner）
 
@@ -82,7 +82,27 @@ uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.j
 uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.json --api-base-url http://127.0.0.1:58080 --results-out path/to/results.json --diagnostics-out path/to/diagnostics.json --allow-real-llm --max-model-requests 120
 ```
 
-本轮实测只覆盖离线编排与合成 HTTP：`uv run pytest tests/unit/test_evaluation_runner.py -q` 为 25 passed，`uv run ruff check backend/src/rag_backend/evaluation tests/unit/test_evaluation_runner.py` 与 `uv run mypy` 通过。**本 runner 尚未在真实隔离六服务或真实 provider 上运行过**：没有真实 40 题结果文件，没有真实质量、费用或延迟数字，也没有真实权限不泄漏验收；上述 86 与 `--max-model-requests` 是保守预留上界，不是实际计费次数；上述命令是入口而非已跑通的真实评估结论。
+本轮离线实测只覆盖离线编排与合成 HTTP：`uv run pytest tests/unit/test_evaluation_runner.py -q` 为 25 passed，`uv run ruff check backend/src/rag_backend/evaluation tests/unit/test_evaluation_runner.py` 与 `uv run mypy` 通过。**本 runner 已在 2026-09-28 于真实隔离栈（真 API + 真 PostgreSQL/Redis/Celery + 真本地 BGE + 真 DeepSeek provider）运行一次**，产出恰好 40 题结果，见下节；上述 86 与 `--max-model-requests` 是保守预留上界，不是实际计费次数。
+
+## 已运行：Phase 1 真实 40 题开发评估（2026-09-28）
+
+本轮在隔离栈 `myrag-p1eval`（真 API + 真 PostgreSQL 17 + pgvector `20260927_0011` + 真 Redis/Celery + 真本地 BGE + 真 DeepSeek provider）对 40 题开发集运行一次 runner，退出码 0、耗时约 81s，写出恰好 40 题结果；精简归档见 `tests/evaluation/results/2026-09-28/`（含 `results.json`、脱敏 `acl_evidence.json`、`usage.json` 与可复算说明）。
+
+| 指标 | 实测值（分子/分母） |
+| --- | --- |
+| `refusalAccuracy` | 1.0（8/8） |
+| `falseRefusalRate` | 0.03125（1/32） |
+| `citationSourceValidity` | 1.0（38/38 最终回答引用） |
+| `goldSourceCoverage` | 0.9375（30/32） |
+| `permissionLeakCount` | 0 |
+
+复算命令（离线，不联网、不读环境文件、不调用模型）：
+
+```text
+uv run python -m rag_backend.evaluation --results tests/evaluation/results/2026-09-28/results.json
+```
+
+事实与边界：`citationSourceValidity` 按引用条数统计，分子与分母都是 `results.json` 的 38 条最终回答引用；数据库 `citation` 表另有 2 条多轮历史轮次引用（共 40 行），**不进该指标分母**，且该指标**不等于句子级引用支持率**。无证据短路已实现（`not plan.evidence_ids` 时直接拒答、不调用模型），本轮 9 道拒答题的检索候选非空，因此仍调用 provider、由模型判定拒答。题集阶段实际 provider 请求 44 次（`qa_answer` 42 + `qa_rewrite` 2），权限验收再 +2，合计 46；tokens `prompt=15110`/`completion=1920`，价目与费用列全 NULL。预算公式为 `38×2 + 2×(2+3) = 86`，是成本上界而非实际计费次数。开发质量待办：`dev-single-023` 跨语言 PDF 误拒、`dev-cross-001` 跨文档覆盖缺口；未改 gold/答案。
 
 ## 消融与计分
 
@@ -103,4 +123,4 @@ uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.j
 
 真实运行验收应覆盖：每格式至少 5 份样本核对文本与来源；上传至引用点击完整链路；10 次相同文件上传不产生重复有效索引；新版构建中强杀 worker 后旧版可查；切换后新问题不含旧 chunk；撤权后新请求、历史、引用和下载不泄露；错误向量维度拒绝写入；空/扫描/加密 PDF、损坏 DOCX 与模型超时有明确状态。
 
-在真实 PostgreSQL、Redis 和独立 Celery worker 上注入事务提交后断网、投递后未标记、worker 强制退出、broker 重启、重复投递及 dispatcher 旧租约迟到回写。验证数据库任务能补投、generation 只发布一次、解析超时真正终止计算进程、长模型调用期间轻量 API 仍响应，数据库连接没有一直被 LLM 等待占用。单测、mock、eager 模式和 Compose 静态校验均不能代替这些验收。dispatcher 相关用例共 18 个（`tests/integration/test_dispatcher_flow.py` 14 个真实数据库 + `tests/integration/test_dispatcher_broker.py` 4 个真 Redis + 独立 Celery worker），独立 tester 在全新隔离 PostgreSQL/Redis + Windows Celery solo 上实跑全仓 `-m integration` **104 passed、0 skipped**，并核对 worker 写下 HANDLER_NOT_READY 标记而 job 仍 QUEUED、重复同 taskId 无副作用、probe 默认队列可用；另由仓库外隔离手工故障探针（不属于上述 104 项 pytest）实测真 Redis 物理 stop/start 后同一 publisher 退避再 SENT、worker 被 kill 后 PG 补偿补投并被幂等收敛；job/outbox 行锁下的时序由真实数据库自动回归验证（旧 `now()` 吞 4 秒宽限，改用 `clock_timestamp()` 后正确拒绝迟到回写）。两条注入用例是**应用层故障**（真 PG SQL rollback + 真 Redis 发送，模拟应用故障），不是物理停库/磁盘故障。**仍未验收**：Linux 容器 prefork 下的业务故障恢复、自然 3600 秒 visibility 重投、多 worker 并发、`DELIVERY_UNCONFIRMED` 手工恢复 SQL、API 日志超过 12 轮；Phase 1 未退出、文档不可检索。
+在真实 PostgreSQL、Redis 和独立 Celery worker 上注入事务提交后断网、投递后未标记、worker 强制退出、broker 重启、重复投递及 dispatcher 旧租约迟到回写。验证数据库任务能补投、generation 只发布一次、解析超时真正终止计算进程、长模型调用期间轻量 API 仍响应，数据库连接没有一直被 LLM 等待占用。单测、mock、eager 模式和 Compose 静态校验均不能代替这些验收。dispatcher 相关用例在该轮实跑时为 18 个（`tests/integration/test_dispatcher_flow.py` 14 个真实数据库 + `tests/integration/test_dispatcher_broker.py` 4 个真 Redis + 独立 Celery worker），独立 tester 在全新隔离 PostgreSQL/Redis + Windows Celery solo 上实跑全仓 `-m integration` **104 passed、0 skipped**，并核对 worker 写下 HANDLER_NOT_READY 标记而 job 仍 QUEUED、重复同 taskId 无副作用、probe 默认队列可用；另由仓库外隔离手工故障探针（不属于上述 104 项 pytest）实测真 Redis 物理 stop/start 后同一 publisher 退避再 SENT、worker 被 kill 后 PG 补偿补投并被幂等收敛；job/outbox 行锁下的时序由真实数据库自动回归验证（旧 `now()` 吞 4 秒宽限，改用 `clock_timestamp()` 后正确拒绝迟到回写）。两条注入用例是**应用层故障**（真 PG SQL rollback + 真 Redis 发送，模拟应用故障），不是物理停库/磁盘故障。**仍未验收**：Linux 容器 prefork 下的业务故障恢复、自然 3600 秒 visibility 重投、多 worker 并发、`DELIVERY_UNCONFIRMED` 手工恢复 SQL、API 日志超过 12 轮。上述 104 passed（18 项）是 `de27eaf` 宽限修复前的历史实跑；`de27eaf` 后的活动租约过期恢复使 `test_dispatcher_flow.py` 增至 20 项（broker 仍 4 项），该物理探针与新自动化组合**不是同轮实跑**，长期复验需重跑。Phase 1 六项退出条件已由包括上述故障证据与 2026-09-28 真实 40 题评估在内的组合达成，但文档级 ACL、重排、完整 provider 失败路径与性能仍未验收。

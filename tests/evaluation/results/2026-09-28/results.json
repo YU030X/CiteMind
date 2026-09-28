@@ -1,0 +1,465 @@
+{
+  "results": [
+    {
+      "questionId": "dev-single-001",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "试用期为2个月，自劳动合同约定的入职日起算。[1]"
+    },
+    {
+      "questionId": "dev-single-002",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "正式员工每个自然年享有12天带薪年假，入职第一年按当年剩余月份折算。[1]"
+    },
+    {
+      "questionId": "dev-single-003",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "公司规定的核心协作时段为10:00至16:00。[1]"
+    },
+    {
+      "questionId": "dev-single-004",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "年假需提前3个工作日在内部系统提交申请，由直属主管审批。[2]"
+    },
+    {
+      "questionId": "dev-single-005",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "工作日加班满2小时可申请调休，调休需在3个月内使用。[1]"
+    },
+    {
+      "questionId": "dev-single-006",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "员工主动离职需提前30日书面通知，并完成账号与设备交接。[1]\n未结清的差旅与报销事项应在离职前处理完毕。[1]"
+    },
+    {
+      "questionId": "dev-single-007",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "未结清的差旅与报销事项应在离职前处理完毕。[2]"
+    },
+    {
+      "questionId": "dev-single-008",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "不可以。员工不得将内部资料上传至任何未经批准的外部服务。[1]"
+    },
+    {
+      "questionId": "dev-single-009",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "所有系统账号密码长度不得少于14位。[1]"
+    },
+    {
+      "questionId": "dev-single-010",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "所有系统账号密码长度不得少于14位，并至少每180天更换一次。[1]"
+    },
+    {
+      "questionId": "dev-single-011",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "办公终端必须启用双因素认证，禁止多人共用账号。[1]"
+    },
+    {
+      "questionId": "dev-single-012",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "公司配发的笔记本电脑必须开启全盘加密，离开工位时须锁屏。[1]"
+    },
+    {
+      "questionId": "dev-single-013",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "发现疑似钓鱼邮件或数据泄露时，应在1小时内通过安全值班邮箱上报。[1]"
+    },
+    {
+      "questionId": "dev-single-014",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "员工因病需要休息时，应在上班开始前通过内部系统提交病假申请。[1]"
+    },
+    {
+      "questionId": "dev-single-015",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "连续病假超过3天的，需在返岗后5个工作日内提交二级及以上医院证明。[1]"
+    },
+    {
+      "questionId": "dev-single-016",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "全年事假累计不得超过15天。[1]"
+    },
+    {
+      "questionId": "dev-single-017",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        }
+      ],
+      "answerText": "跨城出行优先选择高铁二等座。[1]"
+    },
+    {
+      "questionId": "dev-single-018",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        }
+      ],
+      "answerText": "一线城市住宿标准为每晚上限600元。[1]"
+    },
+    {
+      "questionId": "dev-single-019",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        }
+      ],
+      "answerText": "出差期间每人每天餐饮补贴上限100元，凭发票报销。[1]"
+    },
+    {
+      "questionId": "dev-single-020",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        }
+      ],
+      "answerText": "差旅结束后应在10个工作日内提交报销单。[1]"
+    },
+    {
+      "questionId": "dev-single-021",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1
+        }
+      ],
+      "answerText": "食堂周末的开放时间是09:00-14:00。[2]"
+    },
+    {
+      "questionId": "dev-single-022",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1
+        }
+      ],
+      "answerText": "在食堂订餐最晚需要提前到前一天17:00。[1]"
+    },
+    {
+      "questionId": "dev-single-023",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-single-024",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "新员工入职当天需完成岗位安全与信息安全基础培训。[1]"
+    },
+    {
+      "questionId": "dev-cross-001",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "连续病假超过3天的，需在返岗后5个工作日内提交二级及以上医院证明。[1]"
+    },
+    {
+      "questionId": "dev-cross-002",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "年假需提前3个工作日在内部系统提交申请，由直属主管审批。[3]\n病假应在上班开始前通过内部系统提交申请。[2]"
+    },
+    {
+      "questionId": "dev-cross-003",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "员工不得将内部资料上传至任何未经批准的外部服务，因此把内部资料上传到外部云盘是否合规取决于该外部云盘是否经过批准。[3]\n发现疑似钓鱼邮件或数据泄露时，应在1小时内通过安全值班邮箱上报。[1]"
+    },
+    {
+      "questionId": "dev-cross-004",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        }
+      ],
+      "answerText": "向外部单位发送含客户信息的文件前，需经信息安全负责人审批。[1]\n员工不得将内部资料上传至任何未经批准的外部服务。[4]"
+    },
+    {
+      "questionId": "dev-cross-005",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "it-security",
+          "version": 1
+        }
+      ],
+      "answerText": "出差携带公司电脑时，交通选择上，市内交通凭票据实报销，跨城出行优先选择高铁二等座。[3]\n设备安全方面，公司配发的笔记本电脑必须开启全盘加密，离开工位时须锁屏。[1]"
+    },
+    {
+      "questionId": "dev-cross-006",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "cafeteria",
+          "version": 1
+        }
+      ],
+      "answerText": "核心协作时段为10:00至16:00。[1]\n订餐须在前一天17:00前下单，并在当天09:00前可取消。[2]"
+    },
+    {
+      "questionId": "dev-cross-007",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "travel",
+          "version": 1
+        }
+      ],
+      "answerText": "未结清的差旅与报销事项应在离职前处理完毕。[2]\n差旅结束后10个工作日内提交报销单，逾期需部门负责人书面说明。[1]"
+    },
+    {
+      "questionId": "dev-cross-008",
+      "behavior": "answer",
+      "citations": [
+        {
+          "kbId": "kb-handbook",
+          "documentId": "handbook",
+          "version": 3
+        },
+        {
+          "kbId": "kb-handbook",
+          "documentId": "leave-policy",
+          "version": 2
+        }
+      ],
+      "answerText": "加班满2小时可申请调休，调休需在3个月内使用。[2]\n员工因病需要休息时，应在上班开始前通过内部系统提交病假申请；连续病假超过3天的，需在返岗后5个工作日内提交二级及以上医院证明。[1]"
+    },
+    {
+      "questionId": "dev-unanswerable-001",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-unanswerable-002",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-unanswerable-003",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-unanswerable-004",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-no-permission-001",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-no-permission-002",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-no-permission-003",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    },
+    {
+      "questionId": "dev-no-permission-004",
+      "behavior": "refuse",
+      "citations": [],
+      "answerText": "当前知识库中没有足够证据回答这个问题。"
+    }
+  ]
+}
