@@ -3,8 +3,11 @@
 覆盖：完整 HTTP 流程（创建会话、追问、历史、引用详情）、引用服务端映射与
 ``llm_usage`` 落账、无证据直接拒答且不调模型、provider 失败落失败事实并返回 502、
 所有者隔离、KB 撤权与文档删除后历史隐藏/引用 404、版本变化的重检索一次与持续变化的
-静态可重试状态、输入预算映射。生成客户端与查询编码器都是显式假实现，**不**代表真实
-provider 或 inference 连通性。缺少守卫 DSN 时按既有契约跳过，绝不触碰开发库。
+静态可重试状态、输入预算映射。多数用例的生成客户端（``FakeGenerator``）与查询编码器
+都是显式假实现；另有一组聚焦用例用**真实** ``DeepSeekAnswerGenerator`` 在
+``httpx.MockTransport`` 边界注入故障响应，只验证真实客户端的失败解析/分类与
+``llm_usage`` 落账，不触网、不用真实密钥，**不**代表真实 provider、inference 连通性或
+真实云故障。缺少守卫 DSN 时按既有契约跳过，绝不触碰开发库。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
+import httpx
 import pytest
 from alembic import command
 from database_guard import DestructiveTestDatabase
@@ -41,8 +45,13 @@ from rag_backend.auth.tokens import CSRF_HEADER_NAME
 from rag_backend.config import Settings
 from rag_backend.database import get_database_session
 from rag_backend.generation.deepseek_client import (
+    ANSWER_STAGE,
     STATUS_FAILED,
     STATUS_SUCCEEDED,
+    STATUS_TIMEOUT,
+    USAGE_PROVIDER_REPORTED,
+    USAGE_UNKNOWN,
+    DeepSeekAnswerGenerator,
     GenerationOutcome,
 )
 from rag_backend.generation.query_rewrite import REWRITE_STAGE, REWRITE_SYSTEM_PROMPT
@@ -287,7 +296,7 @@ async def qa_client(
     settings: Settings,
     *,
     context: AuthContext,
-    generator: FakeGenerator,
+    generator: FakeGenerator | DeepSeekAnswerGenerator,
     evidence_factory: Any = None,
     analyzer_terms: str = "hello",
     analyzer: Any = None,
@@ -1112,3 +1121,233 @@ async def test_partial_citation_revocation_hides_whole_assistant_message(
         message.content for message in generator.answer_messages[1]
     )
     assert "制度规定。" not in second_prompt
+
+
+# --- 真实受限客户端故障链：真实客户端解析 → 真实 API 编排 → 隔离 PG llm_usage -----------
+#
+# 本组用例把**真实** ``DeepSeekAnswerGenerator``（经注入 transport）接进真实 HTTP API 与
+# 隔离 PostgreSQL，验证失败/截断/超时事实由客户端分类后，按 attempt 准确落到 ``llm_usage``。
+# 生产 endpoint 在客户端内固定为 ``https://api.deepseek.com`` 且不暴露 base_url 配置，因此
+# 在 transport 边界注入故障响应：客户端仍走真实的请求构造、有界读取、UTF-8 解码与失败分类。
+# 真实 socket 对本链没有额外信息量，真实 TCP/超时连接链由隔离探针负责；这里不请求真实 provider。
+
+
+def _real_generator(handler: Any, settings: Settings) -> DeepSeekAnswerGenerator:
+    """真实受限客户端 + mock transport；不联网、不触达真实 provider、不读取真实密钥。"""
+
+    return DeepSeekAnswerGenerator.from_settings(
+        settings, transport=httpx.MockTransport(handler)
+    )
+
+
+def _answer_success_body() -> dict[str, Any]:
+    """合法成功响应体：结构与 usage 都可被真实客户端与 ``parse_answer`` 接受。"""
+
+    return {
+        "choices": [{"finish_reason": "stop", "message": {"content": _answer_json()}}],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 3,
+            "prompt_cache_hit_tokens": 5,
+            "prompt_cache_miss_tokens": 6,
+        },
+    }
+
+
+def _handler_http_500(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, json={"error": "boom"})
+
+
+def _handler_missing_usage(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]},
+    )
+
+
+def _handler_invalid_encoding(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=b"\xff\xfe\xfa")
+
+
+def _handler_truncated(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{"finish_reason": "length", "message": {"content": "半截"}}],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 3,
+                "prompt_cache_hit_tokens": 5,
+                "prompt_cache_miss_tokens": 6,
+            },
+        },
+    )
+
+
+def _handler_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("slow", request=request)
+
+
+# 只用真实实现里能区分开的 5 类代表性故障：非 2xx、缺 usage、非法编码、截断保留 tokens、超时。
+REAL_CLIENT_FAILURE_CASES = (
+    pytest.param(
+        _handler_http_500, STATUS_FAILED, "HTTP_500", None, None, USAGE_UNKNOWN, id="non-2xx"
+    ),
+    pytest.param(
+        _handler_missing_usage,
+        STATUS_FAILED,
+        "MISSING_USAGE",
+        None,
+        None,
+        USAGE_UNKNOWN,
+        id="missing-usage",
+    ),
+    pytest.param(
+        _handler_invalid_encoding,
+        STATUS_FAILED,
+        "INVALID_RESPONSE",
+        None,
+        None,
+        USAGE_UNKNOWN,
+        id="invalid-encoding",
+    ),
+    pytest.param(
+        _handler_truncated,
+        STATUS_FAILED,
+        "TRUNCATED",
+        11,
+        3,
+        USAGE_PROVIDER_REPORTED,
+        id="truncated-length",
+    ),
+    pytest.param(
+        _handler_timeout, STATUS_TIMEOUT, "TIMEOUT", None, None, USAGE_UNKNOWN, id="timeout"
+    ),
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "handler,expected_status,expected_error,expected_prompt,expected_completion,"
+    "expected_usage_source",
+    REAL_CLIENT_FAILURE_CASES,
+)
+async def test_real_client_failure_records_failed_llm_usage(
+    conversation_schema: Engine,
+    role_test_databases: RoleTestDatabases,
+    handler: Any,
+    expected_status: str,
+    expected_error: str,
+    expected_prompt: int | None,
+    expected_completion: int | None,
+    expected_usage_source: str,
+) -> None:
+    """真实客户端分类的失败事实原样落 ``llm_usage``，失败 attempt 不写任何回答。"""
+
+    organization_id = uuid.uuid4()
+    kb_id, user_id, _chunk_id = _seed_searchable(
+        conversation_schema, organization_id=organization_id
+    )
+    settings = make_settings(
+        role_test_databases.api_url, llm_enabled=True, llm_api_key="test-key"
+    )
+    generator = _real_generator(handler, settings)
+    try:
+        async with qa_client(
+            settings,
+            context=_context(user_id, organization_id),
+            generator=generator,
+        ) as client:
+            conversation_id = await _create_conversation(client, kb_id)
+            response = await _ask(client, conversation_id, "hello")
+    finally:
+        generator.close()
+
+    # 所有生成失败都映射为静态 502；客户端只发一次请求，因此恰好一次 attempt 落账。
+    assert response.status_code == 502, response.text
+    assert response.json()["code"] == CODE_GENERATION_FAILED
+    assert _llm_usage_count(conversation_schema) == 1
+    with conversation_schema.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT provider, model, stage, status, error_code, usage_source, attempt, "
+                "prompt_tokens, completion_tokens, prompt_cache_hit_tokens, "
+                "prompt_cache_miss_tokens, latency_ms FROM llm_usage"
+            )
+        ).one()
+    assert row[0] == "deepseek"
+    assert row[1] == "deepseek-flash"
+    assert row[2] == ANSWER_STAGE
+    assert row[3] == expected_status
+    assert row[4] == expected_error
+    assert row[5] == expected_usage_source
+    assert row[6] == 1
+    assert row[7] == expected_prompt
+    assert row[8] == expected_completion
+    assert row[11] >= 0
+    if expected_error == "TRUNCATED":
+        # 截断是失败，但不丢 provider 已报告的真实 cache token 事实。
+        assert row[9] == 5
+        assert row[10] == 6
+    else:
+        assert row[9] is None
+        assert row[10] is None
+    # 失败 attempt 不留下半轮消息或引用。
+    assert _message_role_pairs(conversation_schema) == []
+
+
+@pytest.mark.anyio
+async def test_real_client_rewrite_failure_stops_before_answer(
+    conversation_schema: Engine, role_test_databases: RoleTestDatabases
+) -> None:
+    """真实客户端：第二轮改写失败后整轮静态 502，绝不继续发回答请求。"""
+
+    organization_id = uuid.uuid4()
+    kb_id, user_id, _chunk_id = _seed_searchable(
+        conversation_schema, organization_id=organization_id
+    )
+    seen_systems: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system_prompt = payload["messages"][0]["content"]
+        seen_systems.append(system_prompt)
+        if system_prompt == REWRITE_SYSTEM_PROMPT:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(200, json=_answer_success_body())
+
+    settings = make_settings(
+        role_test_databases.api_url, llm_enabled=True, llm_api_key="test-key"
+    )
+    generator = _real_generator(handler, settings)
+    try:
+        async with qa_client(
+            settings,
+            context=_context(user_id, organization_id),
+            generator=generator,
+        ) as client:
+            conversation_id = await _create_conversation(client, kb_id)
+            first = await _ask(client, conversation_id, "hello 第一问")
+            second = await _ask(client, conversation_id, "hello 第二问")
+    finally:
+        generator.close()
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 502, second.text
+    assert second.json()["code"] == CODE_GENERATION_FAILED
+    # 只改写一次即失败；回答请求只发生在第一轮，改写失败后没有再回答。
+    assert seen_systems.count(REWRITE_SYSTEM_PROMPT) == 1
+    assert len([prompt for prompt in seen_systems if prompt != REWRITE_SYSTEM_PROMPT]) == 1
+    with conversation_schema.connect() as connection:
+        usage = connection.execute(
+            text("SELECT stage, status, error_code FROM llm_usage ORDER BY created_at, stage")
+        ).all()
+    # 第一轮回答成功；第二轮只落改写失败，不落回答 attempt。
+    assert [tuple(row) for row in usage] == [
+        (ANSWER_STAGE, STATUS_SUCCEEDED, None),
+        (REWRITE_STAGE, STATUS_FAILED, "HTTP_500"),
+    ]
+    assert _message_role_pairs(conversation_schema) == [
+        ("user", "hello 第一问"),
+        ("assistant", "制度规定。[1]"),
+    ]
