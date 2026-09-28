@@ -1,6 +1,6 @@
 # 个人 RAG 工作台演示流程
 
-> 本文是一份手工演示脚本，用于在本地六服务环境里按固定顺序走通「两种格式上传 → 问答引用 → 追问 → 更新版本 → 删除 → 不同账号」。**本文撰写时未在真实环境执行过**，下文所有结果都是预期行为而不是实测记录，执行者需自行核对。
+> 本文是一份手工演示脚本，用于在本地六服务环境里按固定顺序走通「两种格式上传 → 问答引用 → 追问 → 更新版本 → 删除 → 不同账号」。**本文已于 2026-09-28 在隔离六服务项目 `myrag-demo-final` 上用真浏览器（Playwright 经网关）执行过一轮**：第 1–5 节的两种格式上传、正文行号/PDF 页码引用、追问、版本更新后的旧引用与删除失效，均在真实本地 BGE、真实 worker/Celery 与真实 DeepSeek provider 下走通（结果与边界见[开发约定](development.md)的 2026-09-28 验收行）；**第 6 节「不同账号」权限对比与思考模式本轮未跑**，仍按预期行为对待。本文最初按未实测脚本撰写，除上述已实测结论外，下方界面细节未逐条截图核对，执行者仍需自行核对。
 >
 > 前端是 `frontend/` 里的正式工作台（Vue 3 + Tailwind CSS v4 + shadcn-vue/reka-ui 组件，视觉与组件源码来自已审核的 `ui-demos/` 视觉稿），只调用已实现的接口：`GET /me`、`POST /auth/login`、`POST /auth/logout`、`GET /knowledge-bases`、`POST /knowledge-bases`、`GET /knowledge-bases/{id}/documents`、`GET /documents/{id}`、`POST /knowledge-bases/{id}/documents`、`POST /documents/{id}/versions`、`DELETE /documents/{id}`、`GET /conversations`、`PATCH /conversations/{id}`、`DELETE /conversations/{id}`、`POST /conversations`、`GET|POST /conversations/{id}/messages`、`GET /citations/{id}`。目标后端缺少其中任一只读端点时，对应页面显示错误横幅，其余流程可继续。
 
@@ -71,6 +71,8 @@
 2. 预期：删除后文档列表、当前会话消息与已打开的引用一起刷新；来自该文档的引用按钮消失，引用 Sheet 关闭。按[入库](ingestion.md)约束，已删除文档的检索与引用立即失效，但已经发出的字节无法追回。
 
 ## 6. 不同账号
+
+> 本轮（2026-09-28）Demo 未执行本节，以下仍为预期行为。
 
 1. 退出登录（侧边栏底部）并用 `demo-staff` 登录。
 2. 预期：只能看到自己是成员的 KB；读者角色看到的“上传文档”按钮为禁用状态，行内菜单的“上传新版本”与“删除文档”也不可用（禁用项会说明所需角色）。

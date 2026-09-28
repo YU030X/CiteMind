@@ -27,7 +27,7 @@
 | [security.md](security.md) | 身份、授权、文件与网页输入、模型外发 |
 | [evaluation.md](evaluation.md) | 题集、指标、故障、性能与端到端验收 |
 | [deployment.md](deployment.md) | 服务、资源配置、观测与恢复 |
-| [personal-demo.md](personal-demo.md) | 个人工作台的手工演示流程（撰写时未实测） |
+| [personal-demo.md](personal-demo.md) | 个人工作台的手工演示流程（2026-09-28 隔离真实验收第 1–5 节；第 6 节权限对比与思考模式未跑） |
 
 ## 写作与检查
 
