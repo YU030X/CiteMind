@@ -2,7 +2,9 @@
 
 它只做题集结构读取、三元组确定性校验与固定 Recall@10/nDCG@10 聚合；不联网、不读环境文件、
 不连接数据库、不调用模型，也不产生任何真实质量结论。输出各变体的宏平均指标与微观测分子/分母、
-逐题失败 id，以及 C 降级回退到 B 的题号。
+逐题失败 id，以及 C 降级回退到 B 的题号。每个变体另输出一行时延/降级观察汇总：这是既有无 flag
+默认输出的有意扩展、不写任何新文件，只汇总产物内已记录的 ``latencyMs`` 与 ``degradedStages``，
+不是 2 vCPU/4 GB 性能验收，也没有任何真实探针数值。
 
 可选地接受 ``--calibration`` 消费一份严格 ``CalibrationArtifact``：开发集只用
 ``scan_refusal_thresholds`` + ``select_dev_threshold`` 选点（禁止传入 ``--refusal-threshold``），
@@ -20,6 +22,8 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -124,6 +128,97 @@ def calibration_summary(
     )
 
 
+@dataclass(frozen=True)
+class LatencySummary:
+    """一组产物的时延观察汇总；单位为毫秒，全部来自产物内已记录值。"""
+
+    question_count: int
+    mean_ms: float
+    p50_ms: float
+    p95_ms: float
+    max_ms: float
+
+
+@dataclass(frozen=True)
+class VariantObservationSummary:
+    """单个变体的时延与降级阶段观察汇总；不代表真实性能或质量结论。"""
+
+    variant: str
+    latency: LatencySummary
+    degraded_stage_counts: tuple[tuple[str, int], ...]
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float:
+    """升序样本的第 ``ceil(percentile * n) - 1`` 项（0-based）；n 必须为正。"""
+
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("时延样本不能为空")
+    index = math.ceil(percentile * len(ordered)) - 1
+    return float(ordered[index])
+
+
+def summarize_latency(latencies_ms: Sequence[float]) -> LatencySummary:
+    """汇总有限非负时延：questionCount/mean/p50/p95/max，单位毫秒。
+
+    ``mean`` 用 ``math.fsum`` 先求和再除以题数；``p50``/``p95`` 用明确的 nearest-rank 定义，
+    不插值、不剔除任何题。汇总只描述产物内观察值，不暗示真实测量。
+    """
+
+    values = [float(value) for value in latencies_ms]
+    if not values:
+        raise ValueError("时延样本不能为空")
+    return LatencySummary(
+        question_count=len(values),
+        mean_ms=math.fsum(values) / len(values),
+        p50_ms=_nearest_rank(values, 0.50),
+        p95_ms=_nearest_rank(values, 0.95),
+        max_ms=max(values),
+    )
+
+
+def summarize_degraded_stages(
+    stages_per_question: Iterable[Sequence[str]],
+) -> tuple[tuple[str, int], ...]:
+    """按 stage 统计包含该 stage 的题数，按 stage 名升序返回；无降级返回空元组。"""
+
+    counts: dict[str, int] = {}
+    for stages in stages_per_question:
+        for stage in set(stages):
+            counts[stage] = counts.get(stage, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
+def summarize_artifact_observations(artifact: AblationArtifact) -> VariantObservationSummary:
+    """汇总单个变体产物的时延与降级；不筛选题目，也不按成功与否排除。"""
+
+    return VariantObservationSummary(
+        variant=artifact.variant,
+        latency=summarize_latency([question.latency_ms for question in artifact.questions]),
+        degraded_stage_counts=summarize_degraded_stages(
+            question.degraded_stages for question in artifact.questions
+        ),
+    )
+
+
+def format_observation_summary(summary: VariantObservationSummary) -> str:
+    """把观察汇总格式化为单行确定性中文摘要；毫秒固定 3 位小数。
+
+    无降级时明确输出 ``degraded=none/0``，有降级时输出 ``stage/题数`` 并按 stage 名升序。
+    """
+
+    latency = summary.latency
+    degraded = (
+        "、".join(f"{stage}/{count}" for stage, count in summary.degraded_stage_counts)
+        or "none/0"
+    )
+    return (
+        f"{summary.variant} 观察汇总：questions={latency.question_count} "
+        f"latencyMs(mean={latency.mean_ms:.3f} p50={latency.p50_ms:.3f} "
+        f"p95={latency.p95_ms:.3f} max={latency.max_ms:.3f}) degraded={degraded}"
+    )
+
+
 def _parse_refusal_threshold(raw: str | None) -> float | None:
     """把 CLI 字符串阈值解析为有限数；缺省返回 ``None``，非法一律抛 ``CalibrationInputError``。"""
 
@@ -172,10 +267,14 @@ def main(argv: list[str] | None = None) -> int:
         artifact_b = AblationArtifact.model_validate_json(args.b.read_text(encoding="utf-8"))
         artifact_c = AblationArtifact.model_validate_json(args.c.read_text(encoding="utf-8"))
         triplet = validate_ablation_triplet(artifact_a, artifact_b, artifact_c)
+        artifacts = {
+            "A_VECTOR": artifact_a,
+            "B_RRF": artifact_b,
+            "C_RERANK": artifact_c,
+        }
         reports = {
-            "A_VECTOR": aggregate_ranking_metrics(build_ranking_questions(dataset, artifact_a)),
-            "B_RRF": aggregate_ranking_metrics(build_ranking_questions(dataset, artifact_b)),
-            "C_RERANK": aggregate_ranking_metrics(build_ranking_questions(dataset, artifact_c)),
+            variant: aggregate_ranking_metrics(build_ranking_questions(dataset, artifact))
+            for variant, artifact in artifacts.items()
         }
         calibration_line = None
         if args.calibration is not None:
@@ -211,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
             f"questions={report.question_count} excluded={len(report.excluded_question_ids)} "
             f"failed={failed}"
         )
+        print(format_observation_summary(summarize_artifact_observations(artifacts[variant])))
     if calibration_line is not None:
         print(calibration_line)
     return 0

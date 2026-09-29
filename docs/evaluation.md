@@ -1,6 +1,6 @@
 # 评估与验收计划
 
-> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，第 2 片已落地纯离线的 Recall@10/nDCG@10 计算、拒答阈值扫描与 A/B/C 消融产物契约，第 3 片已落地依赖注入式只读探针核心，第 4 片已落地真实 PostgreSQL/inference adapter 与可执行 `probe_cli`（默认 dry-run，尚未真实运行），但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，排序/拒答/消融没有任何真实指标数值，质量与性能目标仍未测量。
+> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，第 2 片已落地纯离线的 Recall@10/nDCG@10 计算、拒答阈值扫描与 A/B/C 消融产物契约，第 3 片已落地依赖注入式只读探针核心，第 4 片已落地真实 PostgreSQL/inference adapter 与可执行 `probe_cli`（默认 dry-run，尚未真实运行），并已为 `analysis` 默认输出追加产物内时延/降级纯离线汇总（nearest-rank p50/p95、`math.fsum` 均值、stage 题数，非性能验收），但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，排序/拒答/消融没有任何真实指标数值，质量与性能目标仍未测量。
 
 ## 固定题集
 
@@ -124,7 +124,7 @@ uv run pytest tests/unit/test_ranking_metrics.py tests/unit/test_calibration.py 
 
 ## 已实现：Phase 3 离线拒答标定消费链（纯离线）
 
-`python -m rag_backend.evaluation.analysis` 新增可选 `--calibration`，把第 2 片的纯离线标定扫描接到既有分析入口；不提供时行为与 stdout 输出完全不变，不新增输出文件 schema，只在 stdout 追加一行中文摘要。
+`python -m rag_backend.evaluation.analysis` 新增可选 `--calibration`，把第 2 片的纯离线标定扫描接到既有分析入口；该标定路径不修改既有 ranking 行与退出码，不提供时不输出标定摘要；仍不新增输出文件 schema，提供时只在 stdout 追加一行中文标定摘要。后续时延/降级汇总片会默认追加观察汇总行，见下一节。
 
 - **严格解析与覆盖。** 用既有严格 `CalibrationArtifact` 解析，`datasetKind`/`datasetVersion` 必须与题集一致，`records.questionId` 集合必须恰好覆盖题集全部题目（缺题或多题静态失败）。
 - **开发集只选点。** 传入 `--calibration` 且 `datasetKind=dev` 时禁止传 `--refusal-threshold`；只用 `scan_refusal_thresholds` + `select_dev_threshold` 选点，并输出该点的 `threshold`、`refusalAccuracy`、`falseRefusalRate`、`balancedAccuracy` 及各自分子/分母。没有可观测有限分数（或指标分母为空）导致无选点时静态失败，不伪造阈值。
@@ -138,6 +138,23 @@ uv run python -m rag_backend.evaluation.analysis --dataset holdout.json --a a.js
 ```
 
 本轮未新增真实探针运行，也没有任何真实标定数值；真实留出标定仍属后续片。
+
+## 已实现：Phase 3 消融时延与降级纯离线汇总（默认输出扩展）
+
+`python -m rag_backend.evaluation.analysis` 的既有默认输出在不新增任何 flag、不写任何新文件的前提下，为每个变体追加一行时延/降级观察汇总。它只汇总产物内已记录的 `latencyMs` 与 `degradedStages`，不做任何真实探针运行，也不定义性能达标结论。
+
+- **时延汇总。** 每题 `latencyMs` 已由 `AblationQuestion` 保证有限非负；汇总报告 `questions`（题数）、`mean`、`p50`、`p95`、`max`，单位毫秒。`mean` 用 `math.fsum` 求和后除以题数；`p50`/`p95` 使用明确的 nearest-rank 定义：升序排列后取第 `ceil(p*n)-1` 项（0-based，不插值）。输出用固定 3 位小数的确定性格式（如 `mean=20.000`），不随环境变化。
+- **降级汇总。** `degradedStages` 按 stage 统计“包含该 stage 的题数”（同题重复出现只计一次），按 stage 名升序输出为 `stage/题数`；无任何降级时明确输出 `none/0`。
+- **不筛选、不丢题。** 汇总覆盖产物内全部题目，不按成功与否或是否有 gold 过滤；既有 Recall@10/nDCG@10 聚合与错误处理保持不变。
+- **边界。** 这是 **artifact 内观察值的确定性汇总，不是 2 vCPU/4 GB 性能验收**；真实 A/B/C 探针未运行时没有可汇总的真实数值（当前仓库中也未包含这些产物）。`latencyMs` 的记录口径由探针负责，本汇总不重新测量、不推断。
+
+聚焦单测（同样离线、合成数据）：
+
+```text
+uv run pytest tests/unit/test_evaluation_analysis.py -q
+```
+
+**本轮未测**：任何真实时延/降级数值，也未验证 `latencyMs` 的记录口径与 2 vCPU/4 GB 目标的关系。
 
 ## 已实现：开发集最小结果 producer（runner）
 

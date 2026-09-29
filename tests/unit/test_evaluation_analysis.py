@@ -9,7 +9,16 @@ import json
 from pathlib import Path
 
 import pytest
-from rag_backend.evaluation.analysis import main as analysis_main
+from rag_backend.evaluation.analysis import (
+    LatencySummary,
+    VariantObservationSummary,
+    format_observation_summary,
+    summarize_degraded_stages,
+    summarize_latency,
+)
+from rag_backend.evaluation.analysis import (
+    main as analysis_main,
+)
 
 _LOCATOR = {
     "sourceType": "markdown",
@@ -84,6 +93,35 @@ def _artifact(
                 "candidates": [],
             },
         ],
+    }
+
+
+def _question_payload(
+    question_id: str,
+    latency_ms: float,
+    degraded_stages: list[str],
+    candidates: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "questionId": question_id,
+        "scopeId": "scope-1",
+        "latencyMs": latency_ms,
+        "degradedStages": degraded_stages,
+        "candidates": candidates,
+    }
+
+
+def _artifact_with_questions(
+    variant: str, questions: list[dict[str, object]]
+) -> dict[str, object]:
+    return {
+        "datasetKind": "dev",
+        "datasetVersion": "v1",
+        "variant": variant,
+        "config": {},
+        "modelIdentities": {},
+        "createdAt": "2026-09-29T00:00:00Z",
+        "questions": questions,
     }
 
 
@@ -187,7 +225,141 @@ def test_analysis_cli_prints_metrics(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "三元组校验通过" in out
     assert "A_VECTOR" in out and "C_RERANK" in out
     assert "excluded=1" in out
+    assert "degraded=none/0" in out
     assert "标定" not in out
+
+
+def test_summarize_latency_nearest_rank_odd_and_even() -> None:
+    even = summarize_latency([40.0, 10.0, 30.0, 20.0])
+    assert even == LatencySummary(
+        question_count=4, mean_ms=25.0, p50_ms=20.0, p95_ms=40.0, max_ms=40.0
+    )
+    odd = summarize_latency([30.0, 10.0, 20.0])
+    assert odd == LatencySummary(
+        question_count=3, mean_ms=20.0, p50_ms=20.0, p95_ms=30.0, max_ms=30.0
+    )
+
+
+def test_summarize_latency_mean_uses_fsum() -> None:
+    # 朴素求和在 [1e16, 1.0, -1e16] 上会得到 0.0；math.fsum 保留 1.0。
+    summary = summarize_latency([1e16, 1.0, -1e16])
+    assert summary.mean_ms == 1.0 / 3.0
+
+
+def test_summarize_degraded_stages_counts_questions_and_none() -> None:
+    counts = summarize_degraded_stages(
+        [["rerank_unavailable", "vector_unavailable"], ["rerank_unavailable"], []]
+    )
+    assert counts == (("rerank_unavailable", 2), ("vector_unavailable", 1))
+    assert summarize_degraded_stages([[], []]) == ()
+
+
+def test_format_observation_summary_is_deterministic() -> None:
+    summary = VariantObservationSummary(
+        variant="C_RERANK",
+        latency=LatencySummary(
+            question_count=2, mean_ms=20.0, p50_ms=10.0, p95_ms=30.0, max_ms=30.0
+        ),
+        degraded_stage_counts=(("rerank_unavailable", 1), ("vector_unavailable", 2)),
+    )
+    assert format_observation_summary(summary) == (
+        "C_RERANK 观察汇总：questions=2 "
+        "latencyMs(mean=20.000 p50=10.000 p95=30.000 max=30.000) "
+        "degraded=rerank_unavailable/1、vector_unavailable/2"
+    )
+
+
+def test_analysis_cli_prints_latency_and_degraded_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a = _write(
+        tmp_path / "a.json",
+        _artifact_with_questions(
+            "A_VECTOR",
+            [
+                _question_payload("q1", 10.0, [], [_candidate("c1", 1)]),
+                _question_payload("q2", 30.0, [], []),
+            ],
+        ),
+    )
+    b = _write(
+        tmp_path / "b.json",
+        _artifact_with_questions(
+            "B_RRF",
+            [
+                _question_payload(
+                    "q1", 10.0, [], [_candidate("c1", 1, fusionRank=1, fusionScore=1.0)]
+                ),
+                _question_payload("q2", 30.0, [], []),
+            ],
+        ),
+    )
+    c = _write(
+        tmp_path / "c.json",
+        _artifact_with_questions(
+            "C_RERANK",
+            [
+                _question_payload(
+                    "q1",
+                    10.0,
+                    [],
+                    [
+                        _candidate(
+                            "c1", 1, fusionRank=1, fusionScore=1.0, rerankScore=0.9
+                        )
+                    ],
+                ),
+                _question_payload("q2", 30.0, ["rerank_unavailable"], []),
+            ],
+        ),
+    )
+    code = analysis_main(
+        ["--dataset", str(dataset), "--a", str(a), "--b", str(b), "--c", str(c)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert (
+        "A_VECTOR 观察汇总：questions=2 "
+        "latencyMs(mean=20.000 p50=10.000 p95=30.000 max=30.000) degraded=none/0"
+    ) in out
+    assert (
+        "C_RERANK 观察汇总：questions=2 "
+        "latencyMs(mean=20.000 p50=10.000 p95=30.000 max=30.000) "
+        "degraded=rerank_unavailable/1"
+    ) in out
+
+
+def test_analysis_cli_rejects_negative_latency(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a = _write(
+        tmp_path / "a.json",
+        _artifact_with_questions(
+            "A_VECTOR",
+            [
+                _question_payload("q1", -1.0, [], [_candidate("c1", 1)]),
+                _question_payload("q2", 5.0, [], []),
+            ],
+        ),
+    )
+    b = _write(
+        tmp_path / "b.json",
+        _artifact("B_RRF", [_candidate("c1", 1, fusionRank=1, fusionScore=1.0)]),
+    )
+    c = _write(
+        tmp_path / "c.json",
+        _artifact(
+            "C_RERANK",
+            [_candidate("c1", 1, fusionRank=1, fusionScore=1.0, rerankScore=0.9)],
+        ),
+    )
+    code = analysis_main(
+        ["--dataset", str(dataset), "--a", str(a), "--b", str(b), "--c", str(c)]
+    )
+    assert code == 1
+    assert "离线分析失败" in capsys.readouterr().err
 
 
 def test_analysis_cli_rejects_dataset_metadata_drift(
