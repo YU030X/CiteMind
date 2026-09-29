@@ -40,8 +40,11 @@ LOCATOR_VERSION = 1
 PDF_LOCATOR_VERSION = 2
 # DOCX 块定位版本；段落/表格行与合并单元格位置，不推测 Word 页码。
 DOCX_LOCATOR_VERSION = 3
+# 网页块定位版本；字块 ordinal/字符区间与抓取元数据，不伪造行号或页码。
+WEB_LOCATOR_VERSION = 4
 SOURCE_TYPE_PDF = "pdf"
 SOURCE_TYPE_DOCX = "docx"
+SOURCE_TYPE_WEB = "web"
 
 
 class ChunkingError(Exception):
@@ -465,6 +468,20 @@ def _build_locator(
             "source_type": SOURCE_TYPE_DOCX,
             "parser_version": document.parser_version,
             "source_sha256": document.source_sha256,
+            "block_ordinals": ordinals,
+            "segments": segments,
+        }
+    if document.source_type == SOURCE_TYPE_WEB:
+        return {
+            "locator_version": WEB_LOCATOR_VERSION,
+            "source_type": SOURCE_TYPE_WEB,
+            "parser_version": document.parser_version,
+            "source_sha256": document.source_sha256,
+            "source_url": document.source_url,
+            "final_url": document.final_url,
+            "fetched_at": (
+                document.fetched_at.isoformat() if document.fetched_at is not None else None
+            ),
             "block_ordinals": ordinals,
             "segments": segments,
         }

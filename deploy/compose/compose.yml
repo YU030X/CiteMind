@@ -101,6 +101,8 @@ services:
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.28.10.0/24}
       # 上传原文件落在 api 专用私有命名卷；路径只由服务端 KB ID 与内容 SHA-256 派生。
       DOCUMENT_STORAGE_DIRECTORY: /var/lib/citemind/documents
+      # 受限静态网页抓取的允许主机（逗号分隔精确 host）；默认空即功能禁用，worker 不抓取。
+      WEB_FETCH_ALLOWED_HOSTS: ${WEB_FETCH_ALLOWED_HOSTS:-}
       # Phase 1：由 API 进程 lifespan 承载 outbox dispatcher，向 Redis 的 ingest 队列投递。
       # 非 Compose 默认关闭（Settings.dispatcher_enabled=false），避免测试进程意外连 broker。
       DISPATCHER_ENABLED: "true"

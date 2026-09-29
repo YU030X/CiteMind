@@ -43,6 +43,13 @@ from rag_backend.api.errors import (
     CODE_INGESTION_ERROR,
     CODE_UNSUPPORTED_DOCUMENT_TYPE,
     CODE_UPLOAD_MALFORMED,
+    CODE_WEB_FETCH_FAILED,
+    CODE_WEB_FETCH_TIMEOUT,
+    CODE_WEB_NOT_HTML,
+    CODE_WEB_TOO_LARGE,
+    CODE_WEB_TOO_MANY_REDIRECTS,
+    CODE_WEB_URL_INVALID,
+    CODE_WEB_URL_NOT_ALLOWED,
     ApiError,
 )
 from rag_backend.auth.context import AuthContext
@@ -84,7 +91,20 @@ from rag_backend.ingestion.validation import (
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_WEB,
+    WEB_MEDIA_TYPE,
     resolve_upload_format,
+)
+from rag_backend.ingestion.web_fetch import (
+    CODE_FETCH_FAILED,
+    CODE_FETCH_TIMEOUT,
+    CODE_NOT_ALLOWED,
+    CODE_NOT_HTML,
+    CODE_TOO_LARGE,
+    CODE_TOO_MANY_REDIRECTS,
+    CODE_URL_INVALID,
+    WebFetchError,
+    fetch_web_html,
 )
 from rag_backend.knowledge.document_acl import (
     DocumentAclDocumentNotFound,
@@ -122,6 +142,8 @@ from rag_backend.schemas.documents import (
     DocumentSummary,
     DocumentUploadResponse,
     DocumentVersionSummary,
+    WebDocumentImportRequest,
+    WebDocumentVersionRequest,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
@@ -188,6 +210,25 @@ def _ingestion_error(error: IngestionError) -> ApiError:
     if isinstance(error, ExpectedVersionConflict):
         return ApiError(409, CODE_DOCUMENT_VERSION_CONFLICT, str(error))
     return ApiError(400, CODE_INGESTION_ERROR, "上传请求失败")
+
+
+# 抓取失败码到 HTTP 状态与具名错误码的固定映射；消息复用 web_fetch 的静态文案。
+_WEB_FETCH_ERROR_MAP: dict[str, tuple[int, str]] = {
+    CODE_URL_INVALID: (422, CODE_WEB_URL_INVALID),
+    CODE_NOT_ALLOWED: (403, CODE_WEB_URL_NOT_ALLOWED),
+    CODE_TOO_MANY_REDIRECTS: (422, CODE_WEB_TOO_MANY_REDIRECTS),
+    CODE_NOT_HTML: (422, CODE_WEB_NOT_HTML),
+    CODE_TOO_LARGE: (413, CODE_WEB_TOO_LARGE),
+    CODE_FETCH_FAILED: (502, CODE_WEB_FETCH_FAILED),
+    CODE_FETCH_TIMEOUT: (504, CODE_WEB_FETCH_TIMEOUT),
+}
+
+
+def _web_fetch_error(error: WebFetchError) -> ApiError:
+    """把抓取静态错误码映射为具名 HTTP 错误；消息不含 URL、主机或底层异常。"""
+
+    status_code, code = _WEB_FETCH_ERROR_MAP[error.code]
+    return ApiError(status_code, code, error.static_message)
 
 
 def _parse_expected_version(value: object) -> uuid.UUID:
@@ -356,8 +397,9 @@ async def get_document(
 def _content_media_type(source_type: str) -> tuple[str, str] | None:
     """按来源返回受控 MIME 与安全后缀；未知来源返回 ``None``，由路由静态失败。
 
-    只接受服务端写入的 ``markdown``/``pdf``/``docx``（`document.source_type` 的 CHECK 值）；
-    不把未知值一律当 PDF，避免类型伪装。
+    只接受服务端写入的 ``markdown``/``pdf``/``docx``/``web``（`document.source_type` 的
+    CHECK 值）；不把未知值一律当 PDF，避免类型伪装。网页原文以 ``text/html`` 与 ``.html``
+    安全后缀交付，仍用 ``attachment`` + ``no-store`` + ``nosniff``。
     """
 
     if source_type == SOURCE_TYPE_MARKDOWN:
@@ -366,6 +408,8 @@ def _content_media_type(source_type: str) -> tuple[str, str] | None:
         return PDF_MEDIA_TYPE, ".pdf"
     if source_type == SOURCE_TYPE_DOCX:
         return DOCX_MEDIA_TYPE, ".docx"
+    if source_type == SOURCE_TYPE_WEB:
+        return WEB_MEDIA_TYPE, ".html"
     return None
 
 
@@ -691,6 +735,100 @@ async def upload_document_version(
     finally:
         await form.close()
 
+    return DocumentUploadResponse(
+        document_id=outcome.document_id,
+        version_id=outcome.version_id,
+        job_id=outcome.job_id,
+    )
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/documents/web",
+    response_model=DocumentUploadResponse,
+    status_code=202,
+)
+async def import_web_document(
+    request: Request,
+    payload: WebDocumentImportRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    access: KbAccess = Depends(require_editor),
+    _context: object = Depends(require_csrf),
+    session: AsyncSession = Depends(get_database_session),
+) -> DocumentUploadResponse:
+    """受理受限静态网页首次导入：API 在 ``202`` 前完成抓取并保存原 HTML。
+
+    幂等重放先按规范化 URL + 标题判定，命中时不联网；允许主机为空即功能禁用（fail closed）。
+    """
+
+    settings: Settings = request.app.state.settings
+    enforce_allowed_origin(request, settings)
+    allowed_hosts = settings.web_fetch_allowed_host_set
+    store = DocumentBlobStore(settings.document_storage_directory)
+    try:
+        outcome = await ingestion_service.create_web_document(
+            session,
+            store,
+            kb_id=access.kb_id,
+            organization_id=access.organization_id,
+            title=payload.title,
+            url=payload.url,
+            idempotency_key=idempotency_key,
+            fetcher=lambda target: fetch_web_html(
+                target, allowed_hosts=allowed_hosts
+            ),
+            allowed_hosts=allowed_hosts,
+        )
+    except WebFetchError as error:
+        raise _web_fetch_error(error) from error
+    except IngestionError as error:
+        raise _ingestion_error(error) from error
+    return DocumentUploadResponse(
+        document_id=outcome.document_id,
+        version_id=outcome.version_id,
+        job_id=outcome.job_id,
+    )
+
+
+@router.post(
+    "/documents/{document_id}/versions/web",
+    response_model=DocumentUploadResponse,
+    status_code=202,
+)
+async def import_web_document_version(
+    request: Request,
+    document_id: uuid.UUID,
+    payload: WebDocumentVersionRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    access: DocumentAccess = Depends(require_document_editor),
+    _context: object = Depends(require_csrf),
+    session: AsyncSession = Depends(get_database_session),
+) -> DocumentUploadResponse:
+    """受理受限静态网页文档的新版本；抓取与幂等语义与首次导入一致。"""
+
+    settings: Settings = request.app.state.settings
+    enforce_allowed_origin(request, settings)
+    allowed_hosts = settings.web_fetch_allowed_host_set
+    store = DocumentBlobStore(settings.document_storage_directory)
+    try:
+        outcome = await ingestion_service.create_web_version(
+            session,
+            store,
+            kb_id=access.kb_id,
+            organization_id=access.organization_id,
+            document_id=document_id,
+            title=payload.title,
+            url=payload.url,
+            idempotency_key=idempotency_key,
+            expected_active_version_id=payload.expected_version_id,
+            fetcher=lambda target: fetch_web_html(
+                target, allowed_hosts=allowed_hosts
+            ),
+            allowed_hosts=allowed_hosts,
+        )
+    except WebFetchError as error:
+        raise _web_fetch_error(error) from error
+    except IngestionError as error:
+        raise _ingestion_error(error) from error
     return DocumentUploadResponse(
         document_id=outcome.document_id,
         version_id=outcome.version_id,

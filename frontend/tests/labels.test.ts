@@ -31,3 +31,18 @@ test("describeLocator 对未知版本不猜测", () => {
   const unknown = describeLocator({ locator_version: 99, foo: "bar" });
   assert.equal(unknown.kind, "raw");
 });
+
+test("sourceTypeLabel 与网页抓取诊断展示", () => {
+  assert.equal(sourceTypeLabel("web"), "网页");
+  assert.equal(jobErrorLabel("PIPELINE_CONTENT_EMPTY"), "未提取到正文");
+});
+
+test("describeLocator 解释 locator_version=4 的原文 URL 与块 ordinal", () => {
+  const view = describeLocator({
+    locator_version: 4,
+    source_type: "web",
+    source_url: "https://example.com/a",
+    segments: [{ block_ordinal: 0 }, { block_ordinal: 2 }],
+  });
+  assert.deepEqual(view, { kind: "blocks", text: "https://example.com/a · 第 0、2 块" });
+});

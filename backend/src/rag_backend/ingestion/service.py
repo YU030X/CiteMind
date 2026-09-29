@@ -62,6 +62,7 @@ from rag_backend.ingestion.validation import (
     DOCX_MEDIA_TYPE,
     MARKDOWN_MEDIA_TYPE,
     PDF_MEDIA_TYPE,
+    WEB_MEDIA_TYPE,
     build_dedupe_key,
     build_version_dedupe_key,
     build_version_dedupe_key_prefix,
@@ -72,6 +73,13 @@ from rag_backend.ingestion.validation import (
     validate_docx_content,
     validate_pdf_content,
 )
+from rag_backend.ingestion.web_fetch import (
+    CODE_NOT_ALLOWED,
+    Fetcher,
+    WebFetchError,
+    normalize_web_url,
+)
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.ingestion import IngestJob, OutboxEvent
 from rag_backend.models.knowledge import Document, DocumentVersion, KnowledgeBase
 from rag_backend.models.profile_contract import current_keyword_analyzer_version
@@ -79,6 +87,7 @@ from rag_backend.models.profile_contract import current_keyword_analyzer_version
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_PDF = "pdf"
 SOURCE_TYPE_DOCX = "docx"
+SOURCE_TYPE_WEB = "web"
 DOCUMENT_LIFECYCLE_CREATED = "CREATED"
 DOCUMENT_LIFECYCLE_DELETED = "DELETED"
 VERSION_STATUS_PENDING = "PENDING"
@@ -139,6 +148,7 @@ class _ExistingJob:
     file_hash: str
     document_deleted: bool
     expected_active_version_id: uuid.UUID | None
+    source_url: str | None = None
 
 
 async def create_markdown_document(
@@ -234,6 +244,70 @@ async def create_docx_document(
     )
 
 
+async def create_web_document(
+    session: AsyncSession,
+    store: DocumentBlobStore,
+    *,
+    kb_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    title: str,
+    url: str,
+    idempotency_key: str,
+    fetcher: Fetcher,
+    allowed_hosts: frozenset[str],
+) -> UploadOutcome:
+    """受理静态网页首次导入：先做免联网幂等判定，再抓取、保存原 HTML 并写入四表。
+
+    顺序冻结：规范化 URL、校验允许主机、规范化标题与 key、按去重键查已有请求；命中时
+    只比较规范化 URL 与标题，**不抓取**（同 URL+标题复用原 id，不同则 409）。只有新请求
+    才调用 ``fetcher`` 抓取，抓取失败在写库前抛出静态 ``WebFetchError``。抓取成功后仍走既有
+    profile 预检、blob 发布与四表事务/CAS。
+    """
+
+    normalized = normalize_web_url(url)
+    if normalized.host not in allowed_hosts:
+        raise WebFetchError(CODE_NOT_ALLOWED)
+    normalized_title = normalize_title(title)
+    normalized_key = normalize_idempotency_key(idempotency_key)
+    dedupe_key = build_dedupe_key(organization_id, kb_id, normalized_key)
+
+    existing = await _load_existing_job(session, dedupe_key=dedupe_key, kb_id=kb_id)
+    if existing is not None:
+        outcome = _reuse_or_conflict(
+            existing, title=normalized_title, file_hash=None, source_url=normalized.url
+        )
+        await session.rollback()
+        return outcome
+    await session.rollback()
+
+    await run_in_threadpool(current_keyword_analyzer_version)
+    try:
+        await precheck_default_index_profile(session)
+    finally:
+        await session.rollback()
+
+    # 抓取只在确定是新请求后发生；失败抛静态 WebFetchError，不写 blob、不写库。
+    # 同步 httpx 抓取放进线程池，避免阻塞 API 事件循环。
+    fetched = await run_in_threadpool(fetcher, normalized.url)
+    content = fetched.content
+    file_hash = content_hash(content)
+    file_ref = await run_in_threadpool(store.publish, kb_id, file_hash, content)
+    return await _insert_upload(
+        session,
+        kb_id=kb_id,
+        title=normalized_title,
+        file_ref=file_ref,
+        file_hash=file_hash,
+        dedupe_key=dedupe_key,
+        source_type=SOURCE_TYPE_WEB,
+        media_type=WEB_MEDIA_TYPE,
+        parser_version=WEB_PARSER_VERSION,
+        source_url=normalized.url,
+        final_url=fetched.final_url,
+        fetched_at=datetime.now(UTC),
+    )
+
+
 async def _create_document(
     session: AsyncSession,
     store: DocumentBlobStore,
@@ -306,6 +380,9 @@ async def _insert_upload(
     source_type: str,
     media_type: str,
     parser_version: str,
+    source_url: str | None = None,
+    final_url: str | None = None,
+    fetched_at: datetime | None = None,
 ) -> UploadOutcome:
     """写入 profile 与四张表并提交；唯一去重键并发冲突时回滚后重读。
 
@@ -355,6 +432,9 @@ async def _insert_upload(
                 mime=media_type,
                 parser_version=parser_version,
                 status=VERSION_STATUS_PENDING,
+                source_url=source_url,
+                final_url=final_url,
+                fetched_at=fetched_at,
             )
         )
         await session.flush()
@@ -401,7 +481,9 @@ async def _insert_upload(
         existing = await _load_existing_job(session, dedupe_key=dedupe_key, kb_id=kb_id)
         if existing is None:
             raise
-        return _reuse_or_conflict(existing, title=title, file_hash=file_hash)
+        return _reuse_or_conflict(
+            existing, title=title, file_hash=file_hash, source_url=source_url
+        )
     return UploadOutcome(
         document_id=document_id,
         version_id=version_id,
@@ -425,6 +507,7 @@ async def _load_existing_job(
             Document.title,
             Document.deleted_at,
             DocumentVersion.file_hash,
+            DocumentVersion.source_url,
         )
         .join(DocumentVersion, DocumentVersion.id == IngestJob.version_id)
         .join(Document, Document.id == IngestJob.document_id)
@@ -459,6 +542,7 @@ async def _load_existing_version_job(
             Document.title,
             Document.deleted_at,
             DocumentVersion.file_hash,
+            DocumentVersion.source_url,
         )
         .join(DocumentVersion, DocumentVersion.id == IngestJob.version_id)
         .join(Document, Document.id == IngestJob.document_id)
@@ -491,6 +575,7 @@ def _existing_from_row(row: Any) -> _ExistingJob:
         document_title,
         deleted_at,
         file_hash,
+        source_url,
     ) = row
     parsed = parse_version_dedupe_key(str(dedupe_key))
     expected = parsed[1] if parsed is not None else None
@@ -502,6 +587,7 @@ def _existing_from_row(row: Any) -> _ExistingJob:
         file_hash=file_hash,
         document_deleted=deleted_at is not None,
         expected_active_version_id=expected,
+        source_url=source_url,
     )
 
 
@@ -520,17 +606,31 @@ def _is_dedupe_key_conflict(error: IntegrityError) -> bool:
 
 
 def _reuse_or_conflict(
-    existing: _ExistingJob, *, title: str, file_hash: str
+    existing: _ExistingJob,
+    *,
+    title: str,
+    file_hash: str | None,
+    source_url: str | None = None,
 ) -> UploadOutcome:
-    """首次上传回放：已删除文档不得当有效资源；内容与标题都一致时复用，否则冲突。
+    """首次上传回放：已删除文档不得当有效资源；身份一致时复用，否则冲突。
 
     标题比对基准是不可变 ``_ExistingJob.title``（新行来自 ``ingest_job.request_title``，NULL
     旧行回退到当时的 ``document.title``），不再直接依赖后续会被新版本改写的文档标题。
-    回滚由调用方负责。
+    网页来源的请求身份是规范化 URL 与标题（重放不再联网、拿不到内容摘要），因此
+    ``source_url`` 非空时只比对这两项；其它来源仍比对标题与内容摘要。回滚由调用方负责。
     """
 
     if existing.document_deleted:
         raise DocumentDeleted("该 Idempotency-Key 对应的文档已删除")
+    if source_url is not None:
+        if existing.source_url != source_url or existing.title != title:
+            raise IdempotencyConflict("同一 Idempotency-Key 已用于不同的 URL 或标题")
+        return UploadOutcome(
+            document_id=existing.document_id,
+            version_id=existing.version_id,
+            job_id=existing.job_id,
+            reused=True,
+        )
     if existing.title != title or existing.file_hash != file_hash:
         raise IdempotencyConflict("同一 Idempotency-Key 已用于不同的内容或标题")
     return UploadOutcome(
@@ -545,14 +645,15 @@ def _reuse_version_or_conflict(
     existing: _ExistingJob,
     *,
     title: str,
-    file_hash: str,
+    file_hash: str | None,
     expected_active_version_id: uuid.UUID,
+    source_url: str | None = None,
 ) -> UploadOutcome:
-    """新版本回放：校验文档未删除、expected active、内容与标题都一致时才复用。
+    """新版本回放：校验文档未删除、expected active、身份一致时才复用。
 
     同一 key 用于不同 expected/内容/标题一律 409；已删除文档不得当有效新资源。
     标题与内容摘要分别取受理时写入的不可变快照（``request_title`` 与 ``file_hash``）。
-    回滚由调用方负责。
+    网页来源在重放时不联网，因此只比对规范化 URL 与标题，不比对内容摘要。回滚由调用方负责。
     """
 
     if existing.document_deleted:
@@ -560,6 +661,15 @@ def _reuse_version_or_conflict(
     if existing.expected_active_version_id != expected_active_version_id:
         raise IdempotencyConflict(
             "同一 Idempotency-Key 已用于不同的 expectedVersionId"
+        )
+    if source_url is not None:
+        if existing.source_url != source_url or existing.title != title:
+            raise IdempotencyConflict("同一 Idempotency-Key 已用于不同的 URL 或标题")
+        return UploadOutcome(
+            document_id=existing.document_id,
+            version_id=existing.version_id,
+            job_id=existing.job_id,
+            reused=True,
         )
     if existing.title != title or existing.file_hash != file_hash:
         raise IdempotencyConflict("同一 Idempotency-Key 已用于不同的内容或标题")
@@ -664,6 +774,96 @@ async def create_docx_version(
     )
 
 
+async def create_web_version(
+    session: AsyncSession,
+    store: DocumentBlobStore,
+    *,
+    kb_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    document_id: uuid.UUID,
+    title: str,
+    url: str,
+    idempotency_key: str,
+    expected_active_version_id: uuid.UUID,
+    fetcher: Fetcher,
+    allowed_hosts: frozenset[str],
+) -> UploadOutcome:
+    """受理静态网页文档的新版本；与首次导入同样先做免联网幂等判定再抓取。"""
+
+    normalized = normalize_web_url(url)
+    if normalized.host not in allowed_hosts:
+        raise WebFetchError(CODE_NOT_ALLOWED)
+    normalized_title = normalize_title(title)
+    normalized_key = normalize_idempotency_key(idempotency_key)
+    key_prefix = build_version_dedupe_key_prefix(
+        organization_id, kb_id, document_id, normalized_key
+    )
+    dedupe_key = build_version_dedupe_key(key_prefix, expected_active_version_id)
+
+    existing = await _load_existing_version_job(
+        session, kb_id=kb_id, document_id=document_id, key_prefix=key_prefix
+    )
+    if existing is not None:
+        try:
+            return _reuse_version_or_conflict(
+                existing,
+                title=normalized_title,
+                file_hash=None,
+                expected_active_version_id=expected_active_version_id,
+                source_url=normalized.url,
+            )
+        finally:
+            await session.rollback()
+
+    document = (
+        await session.execute(
+            select(
+                Document.source_type,
+                Document.active_version_id,
+                Document.deleted_at,
+            ).where(Document.id == document_id, Document.kb_id == kb_id)
+        )
+    ).first()
+    await session.rollback()
+    if document is None:
+        raise DocumentNotFound("文档不存在")
+    existing_source_type, active_version_id, deleted_at = document
+    if deleted_at is not None:
+        raise DocumentDeleted("文档已删除")
+    if active_version_id != expected_active_version_id:
+        raise ExpectedVersionConflict("expectedVersionId 与文档当前有效版本不一致")
+    if str(existing_source_type) != SOURCE_TYPE_WEB:
+        raise UnsupportedDocumentType("文档更新不能改变来源格式")
+
+    await run_in_threadpool(current_keyword_analyzer_version)
+    try:
+        await precheck_default_index_profile(session)
+    finally:
+        await session.rollback()
+
+    fetched = await run_in_threadpool(fetcher, normalized.url)
+    content = fetched.content
+    file_hash = content_hash(content)
+    file_ref = await run_in_threadpool(store.publish, kb_id, file_hash, content)
+    return await _insert_version(
+        session,
+        kb_id=kb_id,
+        document_id=document_id,
+        title=normalized_title,
+        file_ref=file_ref,
+        file_hash=file_hash,
+        dedupe_key=dedupe_key,
+        key_prefix=key_prefix,
+        expected_active_version_id=expected_active_version_id,
+        source_type=SOURCE_TYPE_WEB,
+        media_type=WEB_MEDIA_TYPE,
+        parser_version=WEB_PARSER_VERSION,
+        source_url=normalized.url,
+        final_url=fetched.final_url,
+        fetched_at=datetime.now(UTC),
+    )
+
+
 async def _create_version(
     session: AsyncSession,
     store: DocumentBlobStore,
@@ -764,6 +964,9 @@ async def _insert_version(
     source_type: str,
     media_type: str,
     parser_version: str,
+    source_url: str | None = None,
+    final_url: str | None = None,
+    fetched_at: datetime | None = None,
 ) -> UploadOutcome:
     """文档行锁内二次校验并写入 ``document_version``/``ingest_job``/``outbox_event``。
 
@@ -798,6 +1001,7 @@ async def _insert_version(
                 title=title,
                 file_hash=file_hash,
                 expected_active_version_id=expected_active_version_id,
+                source_url=source_url,
             )
             await session.rollback()
             return outcome
@@ -823,6 +1027,9 @@ async def _insert_version(
                 mime=media_type,
                 parser_version=parser_version,
                 status=VERSION_STATUS_PENDING,
+                source_url=source_url,
+                final_url=final_url,
+                fetched_at=fetched_at,
             )
         )
         await session.flush()
@@ -873,6 +1080,7 @@ async def _insert_version(
             title=title,
             file_hash=file_hash,
             expected_active_version_id=expected_active_version_id,
+            source_url=source_url,
         )
     except BaseException:
         await session.rollback()

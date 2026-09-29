@@ -107,11 +107,11 @@ def test_existing_row_prefers_immutable_request_title_and_falls_back() -> None:
     digest = "a" * 64
 
     fresh = _existing_from_row(
-        (job_id, doc_id, ver_id, key, "请求标题", "文档当前标题", None, digest)
+        (job_id, doc_id, ver_id, key, "请求标题", "文档当前标题", None, digest, None)
     )
     assert fresh.title == "请求标题"
 
     legacy = _existing_from_row(
-        (job_id, doc_id, ver_id, key, None, "文档当前标题", None, digest)
+        (job_id, doc_id, ver_id, key, None, "文档当前标题", None, digest, None)
     )
     assert legacy.title == "文档当前标题"

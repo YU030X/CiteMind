@@ -48,9 +48,10 @@ CMD ["uvicorn", "rag_backend.main:app", "--host", "0.0.0.0", "--port", "8000", "
 
 # worker final target：必须是最后一个 stage，未指定 --target 时默认构建它。
 FROM runtime AS worker
-# worker 额外安装 pypdf（加密/页数/结构预检）与 pdfplumber（逐页正文抽取），只在 worker 依赖组。tokenizers 自 generation 切片起属主依赖，
-# api 与 worker 阶段都会安装；DeepSeek 生成预算所需 tokenizer 产物只在 api 阶段烘入（worker
-# 不做问答生成），依赖与镜像计划见 docs/development.md。
+# worker 额外安装 pypdf（加密/页数/结构预检）、pdfplumber（逐页正文抽取）与
+# beautifulsoup4/lxml（受限 HTML 静态正文抽取），都只在 worker 依赖组。tokenizers 自
+# generation 切片起属主依赖，api 与 worker 阶段都会安装；DeepSeek 生成预算所需 tokenizer
+# 产物只在 api 阶段烘入（worker 不做问答生成），依赖与镜像计划见 docs/development.md。
 RUN --mount=type=cache,target=/home/citemind/.cache/uv,uid=10001,gid=10001 uv sync --frozen --no-dev --group worker
 # BGE tokenizer 产物只在 inference 构建期生成，通过 Compose 具名构建上下文 model_assets 复制。
 # 只取计数所需的四个文件，使目录内恰为这四个，不含 config.json 与 model.safetensors。

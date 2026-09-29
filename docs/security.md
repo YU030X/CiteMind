@@ -28,7 +28,7 @@ Markdown/文本 PDF/DOCX 上传（`POST /api/v1/knowledge-bases/{id}/documents`�
 
 计划仍未实现：真实 MIME 嗅探、KB 配额、文件读取代理与预览 HTML 消毒、异步物理清理。文本 PDF 解析已实现但只限制页数（200）、单文件字节（20,000,000）与子进程硬时限（60 秒）。DOCX 收发已实现收窄子集的 ZIP 安全限额：受理期用标准库 ZIP 元数据快速拒绝非 PK/条目数 >512/声明累计解压 >64 MiB/单条 >1 MiB 且压缩比 >100/加密/绝对或 `..` 路径/反斜杠/NUL/重复名/缺必需部件/宏部件，worker 侧再用同一策略逐条有界流式实际读取并累计实际字节、校验 CRC 与拒绝 `<!DOCTYPE`/`<!ENTITY` 声明后再交给 `python-docx`；`python-docx==1.2.0` 自带的 XML 解析器已配置 `resolve_entities=False`，lxml 不联网，代码也不访问文档中的任何外链目标。**但仍未配置 rlimit/cgroup 级内存硬限，因此不声称进程内存隔离**；子进程只提供 60 秒硬时限与返回体上限。空/加密/损坏文档给出明确状态，不静默生成空索引。Markdown 或网页预览输出 HTML 前消毒。
 
-静态网页导入只允许 http/https 和配置的演示域名；每次 DNS 解析及重定向都检查目标地址，限制出站网络、响应大小、超时和重定向次数。不能仅检查字符串前缀，也不允许登录、执行 JavaScript 或递归整站抓取。
+已实现（受限静态网页导入，`POST /api/v1/knowledge-bases/{id}/documents/web` 与 `POST /api/v1/documents/{id}/versions/web`）：只允许 `http`/`https`、无 userinfo/fragment、只默认 80/443；允许主机是服务端配置的精确规范化 host 列表（IDNA 小写去尾点，不做后缀/通配符），默认空即功能禁用（fail closed）。每跳（含最多 3 次重定向）都用标准库解析器解析全部 A/AAAA，任一非公网/回环/私有/link-local/多播/保留/未指定/CGNAT/IPv4-mapped 即拒绝，并拒绝 https→http 降级；抓取用 httpx 同步客户端 `trust_env=False`、零自动重试、不发 Cookie/Authorization、显式 `Accept-Encoding: identity`，只接受 200 与 `text/html`/`application/xhtml+xml`，拒绝任意 `Content-Encoding`，`Content-Length` 早拒且 `iter_raw` 累计硬上限 2 MiB，并设显式 connect/read/write/pool 超时。抓取在 API 返回 202 前完成，原始 HTML 字节存入既有内容寻址 blob，worker 只读 blob 离线解析（不执行 JS、不登录、不递归、不下载资源、不读 Cookie/代理）。**已知边界**：解析校验与用 hostname 的实际连接之间仍有 DNS 竞态窗口，未做 IP pin 或 `getpeername` 复核，因此不声称抗 DNS rebinding；完整 SSRF/网络策略属 Phase 4。抓取失败只返回静态脱敏码（URL_INVALID/NOT_ALLOWED/TOO_MANY_REDIRECTS/NOT_HTML/TOO_LARGE/FETCH_FAILED/FETCH_TIMEOUT），不回显 URL、地址或底层异常。
 
 ## 模型与输出
 

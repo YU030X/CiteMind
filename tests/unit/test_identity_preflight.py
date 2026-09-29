@@ -19,6 +19,7 @@ from rag_backend.ingestion.identity_preflight import (
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_WEB,
     SUPPORTED_SOURCE_TYPES,
     ProfileIdentityDecision,
     StoredIndexProfile,
@@ -30,6 +31,7 @@ from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.service import SOURCE_TYPE_DOCX as SERVICE_SOURCE_TYPE_DOCX
 from rag_backend.ingestion.service import SOURCE_TYPE_MARKDOWN as SERVICE_SOURCE_TYPE
 from rag_backend.ingestion.service import SOURCE_TYPE_PDF as SERVICE_SOURCE_TYPE_PDF
+from rag_backend.ingestion.service import SOURCE_TYPE_WEB as SERVICE_SOURCE_TYPE_WEB
 from rag_backend.models.profile_contract import (
     IndexProfileContract,
     ProfileContractError,
@@ -322,15 +324,17 @@ def test_profile_contract_error_is_a_value_error() -> None:
     assert issubclass(ProfileContractError, ValueError)
 
 
-def test_supported_source_types_cover_markdown_pdf_and_docx() -> None:
+def test_supported_source_types_cover_markdown_pdf_docx_and_web() -> None:
     assert SUPPORTED_SOURCE_TYPES == frozenset(
-        {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX}
+        {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX, SOURCE_TYPE_WEB}
     )
     assert SOURCE_TYPE_MARKDOWN == SERVICE_SOURCE_TYPE
     assert SOURCE_TYPE_PDF == SERVICE_SOURCE_TYPE_PDF
     assert SOURCE_TYPE_DOCX == SERVICE_SOURCE_TYPE_DOCX
+    assert SOURCE_TYPE_WEB == SERVICE_SOURCE_TYPE_WEB
     assert SOURCE_TYPE_PDF == "pdf"
     assert SOURCE_TYPE_DOCX == "docx"
+    assert SOURCE_TYPE_WEB == "web"
 
 
 def test_docx_source_with_docx_parser_is_allowed(expected: IndexProfileContract) -> None:

@@ -45,12 +45,17 @@ from rag_backend.ingestion.pdf_parsing import (
     parse_pdf,
 )
 from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES
+from rag_backend.ingestion.web_parsing import parse_web
 
 # 受控入口模块名；父进程用 ``python -m`` 启动它，并通过 argv 指定来源类型。
 PARSE_SUBPROCESS_MODULE: Final = "rag_backend.ingestion.parse_subprocess"
 SOURCE_TYPE_MARKDOWN: Final = "markdown"
 SOURCE_TYPE_PDF: Final = "pdf"
 SOURCE_TYPE_DOCX: Final = "docx"
+SOURCE_TYPE_WEB: Final = "web"
+SUPPORTED_PARSE_SOURCE_TYPES: Final = frozenset(
+    {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX, SOURCE_TYPE_WEB}
+)
 
 # 解析硬时限与返回体上限；返回体上限覆盖 JSON 转义膨胀（CJK 不转义，控制字符会转义）。
 PARSE_TIMEOUT_SECONDS: Final = 60.0
@@ -182,7 +187,7 @@ def _deserialize(payload: object, *, text: str) -> ParsedDocument:
     raw_blocks = payload.get("blocks")
     if not isinstance(source_sha256, str) or not isinstance(parser_version, str):
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
-    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX):
+    if source_type not in SUPPORTED_PARSE_SOURCE_TYPES:
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
     if not isinstance(raw_blocks, list):
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
@@ -327,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = sys.argv[1:] if argv is None else argv
     source_type = arguments[0] if arguments else SOURCE_TYPE_MARKDOWN
-    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX):
+    if source_type not in SUPPORTED_PARSE_SOURCE_TYPES:
         return EXIT_INVALID_INPUT
     try:
         data = _read_bounded_stdin()
@@ -340,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
             document = _parse_pdf_or_raise(data)
         elif source_type == SOURCE_TYPE_DOCX:
             document = _parse_docx_or_raise(data)
+        elif source_type == SOURCE_TYPE_WEB:
+            document = parse_web(data)
         else:
             document = parse_markdown(data)
     except _ExitWithCode as exit_error:
@@ -435,6 +442,26 @@ def parse_docx_in_subprocess(
     return _parse_in_subprocess(
         content,
         source_type=SOURCE_TYPE_DOCX,
+        timeout_seconds=timeout_seconds,
+        environment=environment,
+    )
+
+
+def parse_web_in_subprocess(
+    content: bytes,
+    *,
+    timeout_seconds: float = PARSE_TIMEOUT_SECONDS,
+    environment: Mapping[str, str] | None = None,
+) -> ParsedDocument:
+    """在独立子进程中抽取静态 HTML 正文；不执行脚本、不抓取外链。
+
+    与其它来源共用同一硬时限、环境白名单与返回体上限；抓取元数据（原 URL/最终 URL/抓取
+    时间）不进入子进程，由 worker 在解析后用 ``dataclasses.replace`` 注入。
+    """
+
+    return _parse_in_subprocess(
+        content,
+        source_type=SOURCE_TYPE_WEB,
         timeout_seconds=timeout_seconds,
         environment=environment,
     )

@@ -13,6 +13,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
 from rag_backend.generation.capabilities import SUPPORTED_MODEL_IDS
+from rag_backend.ingestion.web_fetch import parse_allowed_web_hosts
 
 # 与 deploy/compose/compose.yml 默认暴露的本机端口一致；用户名是运行时 api 角色，
 # 密码是开发占位值，生产环境会被下面的校验拒绝。
@@ -232,6 +233,11 @@ class Settings(BaseSettings):
     # 行为；显式开启前不加载模型资产、不连 inference。开启时必须配置 INFERENCE_TOKEN。
     ingest_processing_enabled: bool = False
 
+    # 受限静态网页抓取的允许主机列表；逗号分隔的精确规范化 host（IDNA 小写、去尾点），
+    # 不做后缀/通配符匹配。默认空字符串即功能禁用（fail closed），任何网页导入都静态失败。
+    # 只有 API 读取它；worker 只解析已保存的 HTML blob，不需要抓取配置。
+    web_fetch_allowed_hosts: str = ""
+
     # 单组织标识；来自服务端配置，客户端请求体与查询参数都不能覆盖它。
     organization_id: uuid.UUID = DEFAULT_ORGANIZATION_ID
     # 会话 Cookie 只携带高熵随机原令牌；数据库只保存其 hash。
@@ -266,6 +272,12 @@ class Settings(BaseSettings):
         """可信代理网段；空元组表示不信任任何代理。"""
 
         return parse_trusted_proxy_networks(self.trusted_proxy_cidrs)
+
+    @property
+    def web_fetch_allowed_host_set(self) -> frozenset[str]:
+        """规范化后的网页抓取允许主机集合；空集合表示功能禁用。"""
+
+        return parse_allowed_web_hosts(self.web_fetch_allowed_hosts)
 
     @model_validator(mode="after")
     def validate_configuration(self) -> "Settings":
@@ -332,6 +344,12 @@ class Settings(BaseSettings):
         if self.ingest_processing_enabled and self.inference_token is None:
             # 真实处理必须能构造受限编码客户端；缺失 token 属启动期可独立判断的无效配置。
             raise ValueError("开启 ingest_processing_enabled 必须配置 INFERENCE_TOKEN")
+
+        try:
+            # 允许主机列表在启动期即可独立判断；非法条目（含通配符/端口/scheme）直接失败。
+            parse_allowed_web_hosts(self.web_fetch_allowed_hosts)
+        except ValueError as error:
+            raise ValueError(f"web_fetch_allowed_hosts 含非法主机名: {error}") from error
 
         origins = parse_allowed_origins(self.allowed_origins)
         trusted_proxies = parse_trusted_proxy_networks(self.trusted_proxy_cidrs)

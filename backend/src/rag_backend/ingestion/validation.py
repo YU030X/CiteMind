@@ -41,6 +41,7 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 255
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_PDF = "pdf"
 SOURCE_TYPE_DOCX = "docx"
+SOURCE_TYPE_WEB = "web"
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 PDF_EXTENSIONS = (".pdf",)
 DOCX_EXTENSIONS = (".docx",)
@@ -50,6 +51,8 @@ PDF_MEDIA_TYPE = "application/pdf"
 DOCX_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
+# 网页原样 HTML 的受控 MIME；只在服务端抓取校验通过后才写入 ``document_version.mime``。
+WEB_MEDIA_TYPE = "text/html"
 
 # 允许出现在文本中的 C0 控制字符；其余 C0 与 DEL 视为伪装成文本的二进制。
 # 这些值在 UTF-8 中只可能以单字节 ASCII 出现，因此可直接在字节层扫描。

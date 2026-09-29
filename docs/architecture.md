@@ -54,3 +54,10 @@ API 以短事务读取候选 DTO，释放连接后等待 inference/LLM。一个�
 > 与 p95 未测；处理中任务的过期活动租约由 dispatcher 后台周期做有界恢复（达上限静态
 > `PIPELINE_RETRY_EXHAUSTED`），不设独立常驻 reaper。详见
 > [文档入库](ingestion.md) 的“已实现：worker 真实入库管线”。
+
+> 受限静态网页（已实现，迁移 `20260929_0015`）：新增 `POST /api/v1/knowledge-bases/{id}/documents/web`
+> 与 `POST /api/v1/documents/{id}/versions/web` 两个 JSON 端点。抓取在 API 返回 202 前完成，原始
+> HTML 存入既有内容寻址 blob，worker 只读 blob 离线解析为 `locator_version=4`；幂等重放在抓取前
+> 先按规范化 URL 与标题判定，命中时不联网。允许主机由 `WEB_FETCH_ALLOWED_HOSTS` 精确配置，默认空
+> 即禁用；抓取逐跳解析全部 A/AAAA 并拒绝非公网目标，但 DNS 校验与实际连接之间仍有竞态窗口，
+> 完整 SSRF/网络策略属 Phase 4。本切片只有单元级证据，真实抓取与真实 PostgreSQL 端到端未验收。

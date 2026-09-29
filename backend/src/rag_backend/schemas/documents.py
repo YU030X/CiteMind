@@ -6,7 +6,22 @@ import uuid
 from datetime import datetime
 
 from rag_backend.knowledge.document_acl import DocumentAclMode
-from rag_backend.schemas.base import CamelModel
+from rag_backend.schemas.base import CamelModel, StrictCamelModel
+
+
+class WebDocumentImportRequest(StrictCamelModel):
+    """网页首次导入请求体；``url`` 与 ``title`` 均为必填字符串。"""
+
+    url: str
+    title: str
+
+
+class WebDocumentVersionRequest(StrictCamelModel):
+    """网页文档新版本请求体；``expectedVersionId`` 用于 CAS 与幂等身份。"""
+
+    url: str
+    title: str
+    expected_version_id: uuid.UUID
 
 
 class DocumentUploadResponse(CamelModel):

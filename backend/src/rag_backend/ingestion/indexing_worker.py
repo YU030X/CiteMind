@@ -47,7 +47,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import Final, Protocol
 
@@ -95,6 +96,7 @@ from rag_backend.ingestion.parse_subprocess import (
     parse_docx_in_subprocess,
     parse_markdown_in_subprocess,
     parse_pdf_in_subprocess,
+    parse_web_in_subprocess,
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION, ParsedDocument
 from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
@@ -103,8 +105,10 @@ from rag_backend.ingestion.validation import (
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_WEB,
     parse_version_dedupe_key,
 )
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.profile_contract import IndexProfileContract
 
 logger = logging.getLogger(__name__)
@@ -212,6 +216,9 @@ class ResolvedIdentity(Protocol):
     def docx_parser_version(self) -> str: ...
 
     @property
+    def web_parser_version(self) -> str: ...
+
+    @property
     def token_counter(self) -> chunking.TokenCounter: ...
 
     @property
@@ -297,6 +304,9 @@ SELECT_JOB_FOR_CLAIM_SQL: Final = text(
         dv.status AS version_status,
         dv.file_ref,
         dv.file_hash,
+        dv.source_url,
+        dv.final_url,
+        dv.fetched_at,
         d.deleted_at,
         d.active_version_id,
         d.lifecycle_status,
@@ -474,6 +484,9 @@ class ClaimedJob:
     source_type: str
     file_ref: str
     file_hash: str
+    source_url: str | None = None
+    final_url: str | None = None
+    fetched_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -567,6 +580,9 @@ def claim_ingest_job(
                 source_type=str(row["source_type"]),
                 file_ref=str(row["file_ref"]),
                 file_hash=str(row["file_hash"]),
+                source_url=row["source_url"],
+                final_url=row["final_url"],
+                fetched_at=row["fetched_at"],
             ),
         )
 
@@ -1413,6 +1429,7 @@ class PipelineDependencies:
     parse_document: ParseDocument = parse_markdown_in_subprocess
     parse_pdf_document: ParseDocument = parse_pdf_in_subprocess
     parse_docx_document: ParseDocument = parse_docx_in_subprocess
+    parse_web_document: ParseDocument = parse_web_in_subprocess
     cache_lookup: CacheLookup = load_cached_embeddings
 
 
@@ -1437,6 +1454,7 @@ def process_ingest_event(
             SOURCE_TYPE_MARKDOWN: MARKDOWN_PARSER_VERSION,
             SOURCE_TYPE_PDF: PDF_PARSER_VERSION,
             SOURCE_TYPE_DOCX: DOCX_PARSER_VERSION,
+            SOURCE_TYPE_WEB: WEB_PARSER_VERSION,
         },
         lease_seconds=lease_seconds,
     )
@@ -1468,6 +1486,8 @@ def process_ingest_event(
             if claimed.source_type == SOURCE_TYPE_PDF
             else identity.docx_parser_version
             if claimed.source_type == SOURCE_TYPE_DOCX
+            else identity.web_parser_version
+            if claimed.source_type == SOURCE_TYPE_WEB
             else identity.parser_version
         )
         try:
@@ -1523,6 +1543,31 @@ def process_ingest_event(
                     dependencies.storage.read_verified_docx(
                         claimed.kb_id, claimed.file_ref, claimed.file_hash
                     )
+                )
+            elif claimed.source_type == SOURCE_TYPE_WEB:
+                # 网页 locator 的三项抓取事实必须完整；异常旧行或手工脏数据不得发布空定位。
+                if (
+                    not claimed.source_url
+                    or not claimed.final_url
+                    or claimed.fetched_at is None
+                ):
+                    return _fail(
+                        session_factory,
+                        heartbeat,
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        error_code=ERROR_PIPELINE_PARSE_FAILED,
+                    )
+                # 抓取元数据不进入解析子进程，解析后用 ``replace`` 注入，保证 locator v4 完整。
+                parsed = replace(
+                    dependencies.parse_web_document(
+                        dependencies.storage.read_verified_web(
+                            claimed.kb_id, claimed.file_ref, claimed.file_hash
+                        )
+                    ),
+                    source_url=claimed.source_url,
+                    final_url=claimed.final_url,
+                    fetched_at=claimed.fetched_at,
                 )
             else:
                 markdown_text = dependencies.storage.read_verified_markdown(

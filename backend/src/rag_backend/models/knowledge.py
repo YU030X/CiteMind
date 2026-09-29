@@ -59,7 +59,7 @@ class Document(CreatedAtMixin, UpdatedAtMixin, Base):
     __tablename__ = "document"
     __table_args__ = (
         CheckConstraint(
-            "source_type IN ('markdown', 'pdf', 'docx')", name="source_type"
+            "source_type IN ('markdown', 'pdf', 'docx', 'web')", name="source_type"
         ),
         CheckConstraint(
             "lifecycle_status IN ('CREATED', 'INDEXING', 'READY', 'FAILED', 'DELETED')",
@@ -136,7 +136,11 @@ class DocumentAcl(CreatedAtMixin, Base):
 
 
 class DocumentVersion(CreatedAtMixin, UpdatedAtMixin, Base):
-    """不可变原文件的版本记录；``(document_id, version_no)`` 唯一。"""
+    """不可变原文件的版本记录；``(document_id, version_no)`` 唯一。
+
+    网页来源额外记录抓取事实：``source_url`` 是服务端规范化后的请求 URL，``final_url`` 是
+    跟随重定向后的最终 URL，``fetched_at`` 是抓取时刻；非网页来源这三列保持 NULL。
+    """
 
     __tablename__ = "document_version"
     __table_args__ = (
@@ -163,3 +167,8 @@ class DocumentVersion(CreatedAtMixin, UpdatedAtMixin, Base):
     mime: Mapped[str] = mapped_column(Text, nullable=False)
     parser_version: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

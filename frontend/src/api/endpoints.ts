@@ -68,6 +68,33 @@ export const api = {
       headers: { "Idempotency-Key": idempotencyKey },
     }),
 
+  /** 受限静态网页首次导入：抓取在服务端 202 前完成，前端只提交 URL 与标题。 */
+  importWebDocument: (
+    kbId: string,
+    url: string,
+    title: string,
+    idempotencyKey: string,
+  ): Promise<DocumentUploadAccepted> =>
+    request<DocumentUploadAccepted>(`/knowledge-bases/${kbId}/documents/web`, {
+      method: "POST",
+      body: JSON.stringify({ url, title }),
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
+
+  /** 受限静态网页文档新版本；expectedVersionId 用于服务端 CAS 与幂等。 */
+  importWebDocumentVersion: (
+    documentId: string,
+    url: string,
+    title: string,
+    expectedVersionId: string,
+    idempotencyKey: string,
+  ): Promise<DocumentUploadAccepted> =>
+    request<DocumentUploadAccepted>(`/documents/${documentId}/versions/web`, {
+      method: "POST",
+      body: JSON.stringify({ url, title, expectedVersionId }),
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
+
   deleteDocument: (documentId: string): Promise<void> =>
     request<void>(`/documents/${documentId}`, { method: "DELETE" }),
 

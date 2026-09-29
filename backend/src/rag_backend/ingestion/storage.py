@@ -164,6 +164,21 @@ class DocumentBlobStore:
             raise BlobCorrupt("blob 内容不是可识别的 DOCX")
         return data
 
+    def read_verified_web(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> bytes:
+        """校验式有限读取网页原 HTML blob：摘要/大小之外拒绝空内容与 NUL 二进制。
+
+        Content-Type 在抓取阶段已校验；这里只做离线 blob 的形状防御，不重新联网。
+        """
+
+        data = self.read_verified_blob(kb_id, file_ref, file_hash)
+        if not data.strip():
+            raise BlobCorrupt("blob 内容不是有效的 HTML")
+        if b"\x00" in data:
+            raise BlobCorrupt("blob 内容不是有效的 HTML")
+        return data
+
     def _read_bounded_regular_file(self, target: Path) -> bytes:
         """以有界读取返回字节；拒绝符号链接/联接点、非常规文件、缺失与超限。"""
 

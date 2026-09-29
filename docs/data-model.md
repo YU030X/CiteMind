@@ -10,8 +10,8 @@
 | --- | --- | --- |
 | `index_profile` | id, embedding_model, model_revision, tokenizer_revision, chunker_version, keyword_analyzer_version, config_hash, dimension, normalize, created_at | `dimension = 512` 的具名 CHECK、`config_hash` 唯一、不可变（无 UPDATE 授权）；它是全局编码契约登记表，登记一个 profile 不代表任何 KB 可检索；api SELECT+INSERT，worker SELECT |
 | `knowledge_base` | id, organization_id, name, active_index_profile_id, kb_revision, acl_revision, created_at, updated_at | `organization_id` 暂不建组织外键；两个 revision 默认 0 且 `>= 0`；`active_index_profile_id` 可空、外键 RESTRICT（语义见下文“index profile 契约与 KB active 可见性”）；api SELECT+INSERT+UPDATE，worker SELECT |
-| `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, acl_mode, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf, docx)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`acl_mode IN (INHERIT, RESTRICTED)`（文档 ACL 切片 `20260928_0012` 补加，`server_default='INHERIT'`；DOCX 切片 `20260929_0013` 扩 `source_type` 允许集合）；`(kb_id, lifecycle_status)` 索引；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
-| `document_version` | id, document_id, version_no, file_ref, file_hash, mime, parser_version, status, created_at, updated_at | `version_no > 0`；`status IN (PENDING, READY, FAILED, NEEDS_OCR)`；`(document_id, version_no)` 唯一；本切片不添加解析警告字段；`parser_version` 无 CHECK，既有行历史值为占位 `markdown-v1`，新上传按 `source_type` 写真实实现版本（Markdown `markdown-it-py-4.2.0-v1`、PDF `pypdf-6.19.0+pdfplumber-0.11.10-v1`；Markdown 新版行为已由独立 tester 在隔离 PostgreSQL 17 + Redis 上验收，`tests/integration/test_document_upload_flow.py` 11 passed/0 skipped），既有行不自动升级、需受控处理；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
+| `document` | id, kb_id, title, source_type, active_version_id, lifecycle_status, acl_mode, deleted_at, created_at, updated_at | `source_type IN (markdown, pdf, docx, web)`；`lifecycle_status IN (CREATED, INDEXING, READY, FAILED, DELETED)`；`acl_mode IN (INHERIT, RESTRICTED)`（文档 ACL 切片 `20260928_0012` 补加，`server_default='INHERIT'`；DOCX 切片 `20260929_0013` 扩 `docx`，网页切片 `20260929_0015` 再扩 `web`）；`(kb_id, lifecycle_status)` 索引；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
+| `document_version` | id, document_id, version_no, file_ref, file_hash, mime, parser_version, status, source_url, final_url, fetched_at, created_at, updated_at | `version_no > 0`；`status IN (PENDING, READY, FAILED, NEEDS_OCR)`；`(document_id, version_no)` 唯一；本切片不添加解析警告字段；`parser_version` 无 CHECK，既有行历史值为占位 `markdown-v1`，新上传按 `source_type` 写真实实现版本（Markdown `markdown-it-py-4.2.0-v1`、PDF `pypdf-6.19.0+pdfplumber-0.11.10-v1`、DOCX `python-docx-1.2.0-v1`、网页 `beautifulsoup4-4.15.0+lxml-6.1.3-v1`），既有行不自动升级、需受控处理；`source_url`/`final_url`/`fetched_at`（网页切片 `20260929_0015` 新增，可空，非网页来源保持 NULL）；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `ingest_job` | id, document_id, version_id, status, attempt, lease_owner, lease_token, lease_until, heartbeat_at, next_run_at, dedupe_key, request_title, error_code, created_at, updated_at | `status IN (QUEUED, PARSING, CHUNKING, EMBEDDING, INDEXING, READY, FAILED, CANCELLED)`；`attempt >= 0`；租约 owner/token/until 三列全空或全非空；`dedupe_key` 唯一；`(status, next_run_at)` 索引；第一切片不含 `generation_id` 与独立 progress，第二切片补加可空 `generation_id`，第五切片（`20260925_0006`）再补加可空 `profile_id`，文档更新/删除切片（`20260926_0008`）再补加可空 `request_title`（受理时刻的标题快照，旧任务为 NULL，可空、无 server default/回填/索引，api/worker 表级授权已覆盖）；api SELECT+INSERT+UPDATE，worker SELECT+UPDATE |
 | `outbox_event` | id, job_id, event_type, status, dispatch_attempt, next_send_at, lease_owner, lease_token, lease_until, sent_at, created_at, updated_at | `status IN (PENDING, SENT, FAILED)`；`dispatch_attempt >= 0`；租约三列全空或全非空；`job_id` 不唯一；不建 payload；`(status, next_send_at)` 索引；api SELECT+INSERT+UPDATE，worker 无权限 |
 
@@ -123,6 +123,18 @@ GRANT UPDATE (title, pinned_at, deleted_at, updated_at) ON TABLE conversation TO
 - `knowledge_base.active_index_profile_id` 是发布态指针，只表示该 KB 已发布索引当前使用的 profile。新 KB 尚无 READY 索引时保持 NULL；仅首次 READY 发布事务（以及后续 KB 级 profile 切换）可以置位或改写。上传事务与全局 profile 登记都不得把它从 NULL 回填为默认 profile。指针为 NULL 的 KB 不可检索。
 
 默认 profile 的幂等登记入口 `rag_backend.ingestion.profile_repository.ensure_default_index_profile(session)` 已实现（工作树未提交，独立 review APPROVED 并修正 3 项 P2）：只依赖 api 角色对 `index_profile` 的 SELECT+INSERT，按 `config_hash` 执行 `INSERT ... ON CONFLICT (config_hash) DO NOTHING RETURNING id`；未插入时在同一事务内按 `config_hash` 重读既有行并逐项比对七个契约字段，字段不一致抛 `IndexProfileConflictError`，冲突后仍读不到行抛 `IndexProfileNotFoundError`。函数不提交/回滚事务（由调用方拥有事务）、不 UPDATE `index_profile` 或 `knowledge_base`，也不回填 `active_index_profile_id`，并用 `session.no_autoflush` 抑制自动 flush。该入口现已接入**新 Markdown 上传写路径**（同一四表事务内调用，已由独立 tester 验收），KB 创建路径仍不调用；默认关闭的真实入库管线在领取任务后改用身份预检与 `worker_index_identity` 工厂、不调用本入口。该 profile 登记切片没有新迁移、没有 seed 独立 profile，dev 库 `knowledge_base.active_index_profile_id` 仍全部为 NULL；跨源 tokenizer 常量的运行期一致性断言已前置到 `worker_index_identity` 工厂，登记成功不代表任何 KB 可检索。
+
+## 已实现：静态网页切片（迁移 20260929_0015）
+
+迁移 `20260929_0015` 紧接 `20260929_0014`，线性单 head：把 `ck_document_source_type` 的允许
+集合从 `markdown`/`pdf`/`docx` 再扩到 `web`，并给 `document_version` 增加可空
+`source_url`/`final_url`/`fetched_at`。不新增表、索引或授权；HTTP 路由只使用既有的 api 角色
+`document`/`document_version`/`ingest_job`/`outbox_event` 权限。降级**不删除数据**：若库中已存在
+`source_type='web'` 的文档，降级直接失败并保留原行，只有无 web 行时才删除三列并恢复旧约束。
+`source_url` 是服务端规范化后的请求 URL（供免联网幂等比对），`final_url` 是跟随重定向后的最终
+URL，`fetched_at` 是抓取时刻；非网页来源三列保持 NULL。网页解析器版本
+`beautifulsoup4-4.15.0+lxml-6.1.3-v1` 随 `document_version.parser_version` 保存，chunk 使用
+`locator_version=4` 的键集合。
 
 ## 已实现：DOCX 切片（迁移 20260929_0013）
 

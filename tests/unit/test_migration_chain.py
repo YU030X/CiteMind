@@ -25,6 +25,7 @@ QUERY_RUN_OPTIONS_REVISION = "20260927_0011"
 DOCUMENT_ACL_REVISION = "20260928_0012"
 DOCUMENT_SOURCE_DOCX_REVISION = "20260929_0013"
 CHUNK_MODEL_INPUT_HASH_REVISION = "20260929_0014"
+DOCUMENT_SOURCE_WEB_REVISION = "20260929_0015"
 
 CORE_TABLES = (
     "index_profile",
@@ -144,9 +145,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [CHUNK_MODEL_INPUT_HASH_REVISION]
+    assert script_directory.get_heads() == [DOCUMENT_SOURCE_WEB_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    document_source_web = script_directory.get_revision(DOCUMENT_SOURCE_WEB_REVISION)
     chunk_model_input_hash = script_directory.get_revision(CHUNK_MODEL_INPUT_HASH_REVISION)
     document_source_docx = script_directory.get_revision(DOCUMENT_SOURCE_DOCX_REVISION)
     document_acl = script_directory.get_revision(DOCUMENT_ACL_REVISION)
@@ -171,7 +173,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     assert document_source_docx.down_revision == DOCUMENT_ACL_REVISION
     assert document_source_docx.nextrev == {CHUNK_MODEL_INPUT_HASH_REVISION}
     assert chunk_model_input_hash.down_revision == DOCUMENT_SOURCE_DOCX_REVISION
-    assert chunk_model_input_hash.nextrev == set()
+    assert chunk_model_input_hash.nextrev == {DOCUMENT_SOURCE_WEB_REVISION}
+    assert document_source_web.down_revision == CHUNK_MODEL_INPUT_HASH_REVISION
+    assert document_source_web.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -651,6 +655,43 @@ def test_offline_downgrade_sql_removes_only_chunk_model_input_hash_index(
     assert "REVOKE " not in output
 
 
+def test_offline_upgrade_sql_extends_source_type_and_adds_web_columns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{CHUNK_MODEL_INPUT_HASH_REVISION}:{DOCUMENT_SOURCE_WEB_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "source_type IN ('markdown', 'pdf', 'docx', 'web')" in output
+    assert "ADD COLUMN source_url TEXT" in output
+    assert "ADD COLUMN final_url TEXT" in output
+    assert "ADD COLUMN fetched_at TIMESTAMP WITH TIME ZONE" in output
+    # 不建表、不改授权、不 seed。
+    assert "CREATE TABLE" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_removes_web_columns_and_restores_check(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{DOCUMENT_SOURCE_WEB_REVISION}:{CHUNK_MODEL_INPUT_HASH_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP COLUMN fetched_at" in output
+    assert "DROP COLUMN final_url" in output
+    assert "DROP COLUMN source_url" in output
+    assert "source_type IN ('markdown', 'pdf', 'docx')" in output
+    assert "DROP TABLE" not in output
+
+
 def test_offline_upgrade_sql_has_no_ann_indexes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -668,10 +709,11 @@ def test_offline_upgrade_sql_names_every_check_constraint_once(
     command.upgrade(alembic_config(), "head", sql=True)
     output = capsys.readouterr().out
 
-    # ``20260929_0013`` 会 drop 并按新允许集合重建 ``ck_document_source_type``，因此它在整个离
-    # 线升级 SQL 中恰好出现两次（0002 建、0013 重建）；其余具名 CHECK 仍恰好一次，不弱化断言。
+    # ``20260929_0013`` 与 ``20260929_0015`` 会先后 drop 并按新允许集合重建
+    # ``ck_document_source_type``，因此它在整个离线升级 SQL 中恰好出现三次（0002 建、
+    # 0013 扩 DOCX、0015 扩 web）；其余具名 CHECK 仍恰好一次，不弱化断言。
     for name in EXPECTED_CHECK_CONSTRAINTS:
-        expected = 2 if name == "ck_document_source_type" else 1
+        expected = 3 if name == "ck_document_source_type" else 1
         assert output.count(f"CONSTRAINT {name} CHECK") == expected, (
             f"{name} 的具名 CHECK 数量不是预期的 {expected}"
         )

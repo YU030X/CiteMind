@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
@@ -94,6 +95,10 @@ class ParsedDocument:
 
     ``source_type`` 与 ``parser_version`` 共同决定来源 locator 的形状：Markdown 使用
     ``locator_version=1`` 的块级行范围，PDF 使用 ``locator_version=2`` 的页定位。
+
+    网页来源额外携带 ``source_url``/``final_url``/``fetched_at``：解析子进程只从原始 HTML
+    字节产出 block，不接触数据库；这些元数据由 worker 在解析后用 ``dataclasses.replace``
+    注入，因此 Markdown/PDF/DOCX 的既有 golden 结果不受影响（默认均为 ``None``）。
     """
 
     source_sha256: str
@@ -101,6 +106,9 @@ class ParsedDocument:
     blocks: tuple[ParsedBlock, ...]
     parser_version: str = MARKDOWN_PARSER_VERSION
     source_type: str = "markdown"
+    source_url: str | None = None
+    final_url: str | None = None
+    fetched_at: datetime | None = None
 
 
 def parse_markdown(content: bytes) -> ParsedDocument:

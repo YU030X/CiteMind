@@ -38,6 +38,7 @@ const SOURCE_TYPE_LABELS: Record<SourceType, string> = {
   markdown: "Markdown",
   pdf: "PDF",
   docx: "DOCX",
+  web: "网页",
 };
 
 /** 后端 `ingest_job.error_code` 的静态诊断码映射；未知码原样展示并标注“诊断码”。 */
@@ -160,7 +161,7 @@ export type LocatorView =
 /**
  * 只按 locator_version 解释已知键集合：
  * v1 是 Markdown 块级 1-based 闭区间行范围，v2 是 PDF 页号，
- * v3 是 DOCX 的段落/表格行位置；其余原样展示，绝不猜。
+ * v3 是 DOCX 的段落/表格行位置；v4 是网页的原文 URL 与块 ordinal；其余原样展示，绝不猜。
  */
 export function describeLocator(locator: Record<string, unknown> | null | undefined): LocatorView {
   if (locator === null || locator === undefined) {
@@ -205,6 +206,28 @@ export function describeLocator(locator: Record<string, unknown> | null | undefi
       }
       return { kind: "raw", text: "DOCX 定位为空" };
     }
+  }
+  if (version === 4) {
+    const parts: string[] = [];
+    if (typeof locator.source_url === "string" && locator.source_url !== "") {
+      parts.push(locator.source_url);
+    }
+    const segments: unknown = locator.segments;
+    if (Array.isArray(segments)) {
+      const ordinals = new Set<number>();
+      for (const segment of segments) {
+        if (typeof segment !== "object" || segment === null) continue;
+        const ordinal = (segment as Record<string, unknown>).block_ordinal;
+        if (typeof ordinal === "number") ordinals.add(ordinal);
+      }
+      if (ordinals.size > 0) {
+        parts.push(`第 ${[...ordinals].join("、")} 块`);
+      }
+    }
+    if (parts.length > 0) {
+      return { kind: "blocks", text: parts.join(" · ") };
+    }
+    return { kind: "raw", text: "网页定位为空" };
   }
   return { kind: "raw", text: JSON.stringify(locator, null, 2) };
 }

@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import {
   EllipsisIcon,
   InfoIcon,
+  LinkIcon,
   RefreshCwIcon,
   SearchIcon,
   UploadIcon,
@@ -227,11 +228,70 @@ async function submitUpload(): Promise<void> {
   }
 }
 
+// --- 导入受限静态网页 ---------------------------------------------------------
+
+const webOpen = ref(false);
+const webUrl = ref("");
+const webTitle = ref("");
+const webPending = ref(false);
+const webError = ref("");
+// 同一次提交的重试复用同一个 Idempotency-Key；URL 或标题变化后必须换新 key。
+let pendingWeb: { key: string; signature: string } | null = null;
+
+function openWebImport(): void {
+  webUrl.value = "";
+  webTitle.value = "";
+  webError.value = "";
+  pendingWeb = null;
+  webOpen.value = true;
+}
+
+async function submitWebImport(): Promise<void> {
+  if (webPending.value) return;
+  const kbId = state.activeKbId;
+  const url = webUrl.value.trim();
+  const title = webTitle.value.trim();
+  if (kbId === "") {
+    webError.value = "请先选择知识库";
+    return;
+  }
+  if (url === "") {
+    webError.value = "请填写网页 URL";
+    return;
+  }
+  if (title === "") {
+    webError.value = "请填写文档标题";
+    return;
+  }
+
+  webPending.value = true;
+  webError.value = "";
+  const signature = [url, title].join("\u0000");
+  if (pendingWeb === null || pendingWeb.signature !== signature) {
+    pendingWeb = { key: crypto.randomUUID(), signature };
+  }
+
+  try {
+    await api.importWebDocument(kbId, url, title, pendingWeb.key);
+    pendingWeb = null;
+    webOpen.value = false;
+    uploadNotice.value = `「${title}」网页导入已受理：202 只表示抓取内容与任务已落库，解析与索引尚未完成。`;
+    await refreshDocuments();
+  } catch (error) {
+    webError.value = `${describeError(error)}。再次点击“导入”会用同一个 Idempotency-Key 重试同一次提交。`;
+  } finally {
+    webPending.value = false;
+  }
+}
+
 // --- 上传新版本 ---------------------------------------------------------------
 
 const versionTarget = ref<DocumentSummary | null>(null);
 const versionOpen = ref(false);
 const versionFile = ref<File | null>(null);
+// 网页文档的新版本走 URL 导入；标题留空时沿用当前文档标题。
+const versionWebUrl = ref("");
+const versionWebTitle = ref("");
 const versionPending = ref(false);
 const versionFormError = ref("");
 const versionConflict = ref("");
@@ -242,6 +302,8 @@ let pendingVersion: { key: string; signature: string } | null = null;
 function openVersionEditor(item: DocumentSummary): void {
   versionTarget.value = item;
   versionFile.value = null;
+  versionWebUrl.value = "";
+  versionWebTitle.value = item.title;
   versionFormError.value = "";
   versionConflict.value = "";
   pendingVersion = null;
@@ -253,6 +315,8 @@ function closeVersionEditor(): void {
   versionOpen.value = false;
   versionTarget.value = null;
   versionFile.value = null;
+  versionWebUrl.value = "";
+  versionWebTitle.value = "";
   versionFormError.value = "";
   pendingVersion = null;
 }
@@ -294,6 +358,52 @@ async function submitVersion(): Promise<void> {
 
   try {
     await api.uploadDocumentVersion(item.id, form, pendingVersion.key);
+    pendingVersion = null;
+    closeVersionEditor();
+    uploadNotice.value = `「${item.title}」新版本已受理：当前可用版本不会立即变化。`;
+    await refreshDocuments();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      // 版本或幂等冲突必须换新的 expectedVersionId 重新提交，旧 key 不再复用。
+      pendingVersion = null;
+      closeVersionEditor();
+      versionConflict.value = `${describeError(error)}（列表已刷新，请确认当前版本后重新提交）`;
+      await refreshDocuments();
+    } else {
+      versionFormError.value = describeError(error);
+    }
+  } finally {
+    versionPending.value = false;
+  }
+}
+
+/** 网页文档的新版本：提交 URL 与标题（留空标题则沿用当前文档标题），复用同一幂等/409 语义。 */
+async function submitWebVersion(): Promise<void> {
+  const item = versionTarget.value;
+  if (item === null || versionPending.value) return;
+  const active = item.activeVersion;
+  if (active === null) {
+    versionFormError.value = "该文档还没有可用版本，不能上传新版本";
+    return;
+  }
+  const url = versionWebUrl.value.trim();
+  const title = versionWebTitle.value.trim() === "" ? item.title : versionWebTitle.value.trim();
+  if (url === "") {
+    versionFormError.value = "请填写网页 URL";
+    return;
+  }
+
+  versionPending.value = true;
+  versionFormError.value = "";
+  versionConflict.value = "";
+
+  const signature = [item.id, active.id, url, title].join("\u0000");
+  if (pendingVersion === null || pendingVersion.signature !== signature) {
+    pendingVersion = { key: crypto.randomUUID(), signature };
+  }
+
+  try {
+    await api.importWebDocumentVersion(item.id, url, title, active.id, pendingVersion.key);
     pendingVersion = null;
     closeVersionEditor();
     uploadNotice.value = `「${item.title}」新版本已受理：当前可用版本不会立即变化。`;
@@ -378,12 +488,22 @@ async function confirmDelete(): Promise<void> {
       <div class="flex flex-col gap-1">
         <h1 class="text-lg font-medium">文档管理</h1>
         <p class="text-sm text-muted-foreground">
-          查看当前知识库的接收与处理状态；当前仅支持 Markdown、PDF 与 DOCX。
+          查看当前知识库的接收与处理状态；当前仅支持 Markdown、PDF、DOCX 与受限静态网页。
         </p>
       </div>
 
       <div class="flex flex-wrap items-center gap-2">
         <KnowledgeBaseSelect />
+        <Button
+          variant="outline"
+          type="button"
+          :disabled="!canEdit"
+          :title="canEdit ? undefined : '当前角色不能导入网页'"
+          @click="openWebImport"
+        >
+          <LinkIcon />
+          导入网页
+        </Button>
         <Button
           type="button"
           class="hover:bg-primary-hover"
@@ -468,6 +588,7 @@ async function confirmDelete(): Promise<void> {
             <SelectItem value="markdown">Markdown</SelectItem>
             <SelectItem value="pdf">PDF</SelectItem>
             <SelectItem value="docx">DOCX</SelectItem>
+            <SelectItem value="web">网页</SelectItem>
           </SelectContent>
         </Select>
 
@@ -664,6 +785,57 @@ async function confirmDelete(): Promise<void> {
       </DialogContent>
     </Dialog>
 
+    <Dialog v-model:open="webOpen">
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>导入网页</DialogTitle>
+          <DialogDescription>
+            服务端会在返回 202 前抓取该静态网页并保存原始 HTML；不执行脚本、不登录、不递归抓取。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div class="flex flex-col gap-4">
+          <div class="flex flex-col gap-2">
+            <Label for="web-url">网页 URL</Label>
+            <Input
+              id="web-url"
+              v-model="webUrl"
+              placeholder="https://example.com/docs/page"
+              :disabled="webPending"
+            />
+          </div>
+
+          <div class="flex flex-col gap-2">
+            <Label for="web-title">标题</Label>
+            <Input
+              id="web-title"
+              v-model="webTitle"
+              maxlength="500"
+              placeholder="例如：员工手册 v3"
+              :disabled="webPending"
+            />
+          </div>
+
+          <Alert v-if="webError !== ''" variant="destructive">
+            <AlertTitle>导入未受理</AlertTitle>
+            <AlertDescription>{{ webError }}</AlertDescription>
+          </Alert>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" type="button" @click="webOpen = false">取消</Button>
+          <Button
+            type="button"
+            class="hover:bg-primary-hover"
+            :disabled="webPending || webUrl.trim() === '' || webTitle.trim() === ''"
+            @click="submitWebImport"
+          >
+            {{ webPending ? "导入中…" : "确认导入" }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
     <Dialog v-model:open="versionOpen">
       <DialogContent>
         <DialogHeader>
@@ -678,6 +850,7 @@ async function confirmDelete(): Promise<void> {
           <p class="truncate text-sm font-medium">{{ versionTarget?.title ?? "" }}</p>
 
           <label
+            v-if="versionTarget?.sourceType !== 'web'"
             class="flex cursor-pointer flex-col items-center gap-2 rounded-md border border-dashed bg-secondary px-4 py-6 text-center"
           >
             <UploadIcon class="size-5 text-muted-foreground" />
@@ -695,6 +868,31 @@ async function confirmDelete(): Promise<void> {
             />
           </label>
 
+          <div v-else class="flex flex-col gap-4">
+            <div class="flex flex-col gap-2">
+              <Label for="version-web-url">网页 URL</Label>
+              <Input
+                id="version-web-url"
+                v-model="versionWebUrl"
+                placeholder="https://example.com/docs/page"
+                :disabled="versionPending"
+              />
+            </div>
+            <div class="flex flex-col gap-2">
+              <Label for="version-web-title">标题</Label>
+              <Input
+                id="version-web-title"
+                v-model="versionWebTitle"
+                maxlength="500"
+                placeholder="留空则沿用当前标题"
+                :disabled="versionPending"
+              />
+            </div>
+            <p class="text-xs text-muted-foreground">
+              服务端会在返回 202 前重新抓取该静态网页；原始 URL 与标题用于幂等判定。
+            </p>
+          </div>
+
           <Alert v-if="versionFormError !== ''" variant="destructive">
             <AlertTitle>版本未受理</AlertTitle>
             <AlertDescription>{{ versionFormError }}</AlertDescription>
@@ -706,8 +904,13 @@ async function confirmDelete(): Promise<void> {
           <Button
             type="button"
             class="hover:bg-primary-hover"
-            :disabled="versionPending || versionFile === null"
-            @click="submitVersion"
+            :disabled="
+              versionPending ||
+              (versionTarget?.sourceType === 'web'
+                ? versionWebUrl.trim() === ''
+                : versionFile === null)
+            "
+            @click="versionTarget?.sourceType === 'web' ? submitWebVersion() : submitVersion()"
           >
             {{ versionPending ? "提交中…" : "提交新版本" }}
           </Button>
