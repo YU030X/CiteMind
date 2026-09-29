@@ -13,7 +13,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
 from rag_backend.generation.capabilities import SUPPORTED_MODEL_IDS
-from rag_backend.ingestion.web_fetch import parse_allowed_web_hosts
+from rag_backend.web_hosts import parse_allowed_web_hosts
 
 # 与 deploy/compose/compose.yml 默认暴露的本机端口一致；用户名是运行时 api 角色，
 # 密码是开发占位值，生产环境会被下面的校验拒绝。
