@@ -10,6 +10,11 @@
 
 开发集（``datasetKind="dev"``）不是留出集或测试集，其结构可离线验证，但真实质量指标必须
 在留出集上按固定分母、真实模型与真实权限环境测量，不能把开发集结果当最终结论。
+
+Phase 3 第 2 片新增纯离线模块：``ranking_metrics``（固定 Recall@10/nDCG@10）、``calibration``
+（拒答阈值扫描）、``ablation``（A/B/C 产物 schema 与三元组校验）与 ``analysis``
+（``python -m rag_backend.evaluation.analysis`` 只读题集与三个产物的离线入口）。它们不联网、
+不调用模型，也不产生真实指标数值。
 """
 
 from rag_backend.evaluation.dataset import (

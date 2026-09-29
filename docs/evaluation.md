@@ -1,6 +1,6 @@
 # 评估与验收计划
 
-> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，质量与性能目标仍未测量。
+> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，第 2 片已落地纯离线的 Recall@10/nDCG@10 计算、拒答阈值扫描与 A/B/C 消融产物契约，但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，排序/拒答/消融没有任何真实指标数值，质量与性能目标仍未测量。
 
 ## 固定题集
 
@@ -82,6 +82,30 @@ uv run python -m rag_backend.evaluation --dataset tests/evaluation/dev-questions
 
 聚焦单测见 `tests/unit/test_evaluation_holdout.py` 与扩展后的 `tests/unit/test_evaluation_dataset.py`、`tests/unit/test_evaluation_runner.py`。**本轮未运行**：任何真实模型/权限环境下的 100 题、`--confirm-holdout` 真实运行，以及冲突与注入指标的真实分母。
 
+## 已实现：Phase 3 第 2 片离线排序、拒答标定与消融契约（纯离线）
+
+本片只落地**离线数学与产物 schema**：新增 `evaluation/ranking_metrics.py`、`evaluation/calibration.py`、`evaluation/ablation.py` 与纯离线 CLI `evaluation/analysis.py`。它不新增生产路由、配置或迁移，不连接数据库/HTTP，不调用模型，**没有真实探针运行，也没有任何 Recall/nDCG/标定数值**；价格快照与成本统计留待后续片。
+
+**排序指标（`Recall@10`/`nDCG@10`）。** 相关性是完全确定性的 locator 相交：候选与 gold span 的 (KB、文档、版本、`parserVersion`、`sourceType`) 一致且 locator 相交才算相关；Markdown 用 1-based 行闭区间相交，PDF 用 1-based 页号相等。每个 gold span 最多贡献一次，重复 chunk 不重复计，cross-document 覆盖按 gold span 计数。采用二值增益：候选若覆盖至少一个尚未被更高 rank 候选覆盖的 gold span 则 `rel_i = 1`，否则为 0；`DCG@10 = Σ rel_i / log2(i+1)`（i 为 1-based rank），`IDCG@10` 用 `min(gold span 数, 10)` 计算。没有 gold 的拒答题不进入排序分母，只留给标定。此定义与上文“区间并集完整覆盖、rel=0/1/2 分级增益”的计划表述不同，本片以相交二值定义为准。
+
+**拒答阈值标定（`calibration`）。** `RefusalProbeRecord(questionId, expectedBehavior, topScore, candidateCount, actualBehavior)` 记录每题观察值；`topScore` 可空，`candidateCount` 必须非负，NaN/Inf、负计数与重复题目 id 一律拒绝。阈值集合由观察到的有限 `topScore` 去重升序并各加两侧确定性边界构成；预测规则是 `topScore < t` 或 `candidateCount == 0` 即拒答。每个阈值报告 `refusalAccuracy`（分母为应拒答题数）、`falseRefusalRate`（分母为应作答题数）、`balancedAccuracy = (refusalAccuracy + (1 - falseRefusalRate)) / 2` 及各自分子分母；空分母返回 `None`。**只用开发集选点**：`select_dev_threshold` 按最高 `balancedAccuracy` 选点且平局取最低阈值，只应传入开发集；留出集只能用 `evaluate_refusal_threshold` 报告预先固定的阈值，不得挑点。
+
+**消融产物契约（`ablation`）。** `AblationArtifact(datasetKind, datasetVersion, variant, config, modelIdentities, createdAt, questions[])`，每题含 `questionId`、授权 `scopeId`、`latencyMs >= 0`、`degradedStages` 与 `candidates`。三种变体为严格 schema：`A_VECTOR` 仅允许 `vectorRank/vectorScore` 且最终 `rank` 必须等于 `vectorRank`；`B_RRF` 必须有 `fusionRank/fusionScore` 且不得有 `rerankScore`，最终 `rank` 等于 `fusionRank`；`C_RERANK` 必须有融合字段、`rerankScore` 可选，当 `degradedStages` 含 `rerank_unavailable` 时不得有重排分且候选最终顺序必须与 B 完全相同。纯函数 `validate_ablation_triplet` 只做确定性检查：三组题目集合一致、dataset 元数据一致、每题授权 scope 标识一致、C 降级题的最终顺序等于 B；不判定候选是否真由模型产生，也不伪造真实数据。
+
+纯离线命令（在仓库根目录单行执行，需自备题集与三份产物 JSON）：
+
+```text
+uv run python -m rag_backend.evaluation.analysis --dataset dev.json --a a.json --b b.json --c c.json
+```
+
+聚焦单测（同样离线，合成数据，不代表真实质量）：
+
+```text
+uv run pytest tests/unit/test_ranking_metrics.py tests/unit/test_calibration.py tests/unit/test_ablation.py tests/unit/test_evaluation_analysis.py -q
+```
+
+**本轮未测**：任何真实 A/B/C 探针、真实拒答阈值扫描、真实 Recall@10/nDCG@10 数值，以及它们与生产检索/问答默认开关、路由、配置的关系。
+
 ## 已实现：开发集最小结果 producer（runner）
 
 `rag_backend.evaluation.runner` 把开发集或留出集接到**真实 API** 上，产出恰好覆盖题集全部 id 的 results 文件供既有 `--results` 指标消费；它不建评估平台、不建新数据库、不引入 LLM 裁判，也不改业务 API 或公开 `Citation` 字段。
@@ -128,7 +152,7 @@ uv run python -m rag_backend.evaluation --results tests/evaluation/results/2026-
 
 ## 消融与计分
 
-在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。
+在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。
 
 - **Recall@10**：对有合法答案的题，前 10 个授权候选在同一来源上的区间并集完整覆盖的 gold spans 数 / 本题全部 spans 数，然后宏平均。多个 chunk 合力覆盖算一次。
 - **nDCG@10**：相关性标 0（未覆盖）、1（部分覆盖）、2（完整覆盖至少一个 gold span）；`DCG@10 = Σ(2^rel_i - 1)/log2(i+1)`。IDCG 由本题全部授权 chunk 的理想排序计算，不只对已召回项排序。
