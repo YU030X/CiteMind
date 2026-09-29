@@ -92,3 +92,61 @@ class EmbedResponse(CamelModel):
     # 仅 ``kind=query`` 返回的具名查询契约版本；文档响应通过 ``exclude_none`` 省略该字段，
     # 保持既有 document 响应结构与旧客户端校验不变。
     query_encoding_contract: str | None = None
+
+
+class RerankCandidate(CamelModel):
+    """rerank 请求中的一条候选；``candidateId`` 由调用方提供，服务端只回传对应分数。"""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid"
+    )
+
+    candidate_id: str
+    text: str
+
+
+class RerankRequest(CamelModel):
+    """内部 rerank 请求：一条 query 与最多 ``RERANK_MAX_CANDIDATES`` 条候选。
+
+    严格禁止额外字段；query 与候选文本不得为空白。候选集合非空且 ``candidateId`` 必须唯一，
+    否则拒绝，避免调用方用重复 id 伪造「集合完全」的响应。
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid"
+    )
+
+    query: str
+    candidates: list[RerankCandidate]
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, query: str) -> str:
+        if not query.strip():
+            raise ValueError("query 不能为空或纯空白")
+        return query
+
+    @field_validator("candidates")
+    @classmethod
+    def validate_candidates(cls, candidates: list[RerankCandidate]) -> list[RerankCandidate]:
+        if not candidates:
+            raise ValueError("candidates 至少包含一条候选")
+        for index, candidate in enumerate(candidates):
+            if not candidate.text.strip():
+                raise ValueError(f"candidates[{index}].text 不能为空或纯空白")
+        ids = [candidate.candidate_id for candidate in candidates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("candidates[].candidateId 必须唯一")
+        return candidates
+
+
+class RerankScore(CamelModel):
+    """一条候选的原始相关性分数；不排序、不归一化。"""
+
+    candidate_id: str
+    score: float
+
+
+class RerankResponse(CamelModel):
+    scores: list[RerankScore]
+    model_revision: str

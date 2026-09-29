@@ -57,8 +57,16 @@ EMBEDDING_MAX_TOKENS = 512
 BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 QUERY_ENCODING_CONTRACT = "bge-zh-query-v1"
 
+# 冻结的 rerank 契约：模型与 revision 不可在运行期更改；模型结构由本地 config 决定。
+# 权重是否完整由构建期产物清单与运行期身份校验共同约束，不在源码里写未经下载核验的 SHA-256。
+FROZEN_RERANK_MODEL = "BAAI/bge-reranker-base"
+FROZEN_RERANK_REVISION = "2cfc18c9415c912f9d8155881c133215df768a70"
+# bge-reranker-base 的位置上限；pair 输入按 max_length 截断，不拒绝超长候选。
+RERANK_MAX_TOKENS = 512
+
 # 容器内的默认本地模型目录；镜像需要提前把冻结 revision 的权重放到这里。
 DEFAULT_EMBEDDING_MODEL_PATH = Path("/models/bge-small-zh-v1.5")
+DEFAULT_RERANK_MODEL_PATH = Path("/models/bge-reranker-base")
 
 # 文本字节预算默认 256 KiB。原始请求体预算默认由文本预算推导：按 JSON 转义常见放大
 # 量级取 3 倍再加固定余量覆盖键名、引号与逗号。该推导不是所有 JSON 转义的最坏界
@@ -122,6 +130,25 @@ class Settings(BaseSettings):
     # torch 的 CPU 线程数；启动时固定，避免每个请求各自抢占线程。
     embedding_torch_threads: int = 2
 
+    # rerank 默认关闭：关闭时不加载权重、/capabilities 报 rerank.ready=false，
+    # /internal/rerank 仍受 Bearer 与请求体上限保护并返回静态 503 RERANK_NOT_READY。
+    rerank_enabled: bool = False
+    rerank_model_path: Path = DEFAULT_RERANK_MODEL_PATH
+    rerank_model_revision: str = FROZEN_RERANK_REVISION
+    # 单次请求的候选上限；query 与单个候选各自还有字符上限，合计受字节预算约束。
+    rerank_max_candidates: int = 10
+    rerank_max_query_chars: int = 4000
+    rerank_max_text_chars: int = 8000
+    rerank_max_total_bytes: int = DEFAULT_MAX_TEXT_BYTES
+    # 原始请求体上限；留空时由候选文本预算推导（与 embedding 同一推导规则）。
+    rerank_max_request_bytes: int | None = None
+    # rerank 的 CPU 并发与排队；单模型 CPU 服务默认 1，队列满时立即返回可重试的 503。
+    rerank_max_concurrency: int = 1
+    rerank_queue_depth: int = 4
+    rerank_queue_wait_seconds: Annotated[
+        float, Field(gt=0.0, allow_inf_nan=False)
+    ] = 5.0
+
     @property
     def request_byte_limit(self) -> int:
         """实际生效的原始请求体字节上限（显式配置优先，否则由文本预算推导）。"""
@@ -130,6 +157,14 @@ class Settings(BaseSettings):
             return self.embedding_max_request_bytes
         return derived_request_byte_limit(self.embedding_max_total_bytes)
 
+    @property
+    def rerank_request_byte_limit(self) -> int:
+        """实际生效的 rerank 原始请求体字节上限（显式配置优先，否则由文本预算推导）。"""
+
+        if self.rerank_max_request_bytes is not None:
+            return self.rerank_max_request_bytes
+        return derived_request_byte_limit(self.rerank_max_total_bytes)
+
     @field_validator("embedding_model_revision")
     @classmethod
     def validate_model_revision(cls, revision: str) -> str:
@@ -137,6 +172,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "EMBEDDING_MODEL_REVISION 只接受冻结 revision "
                 f"{FROZEN_EMBEDDING_REVISION}；更换模型或 revision 必须另建 index profile"
+            )
+        return revision
+
+    @field_validator("rerank_model_revision")
+    @classmethod
+    def validate_rerank_revision(cls, revision: str) -> str:
+        if revision != FROZEN_RERANK_REVISION:
+            raise ValueError(
+                "RERANK_MODEL_REVISION 只接受冻结 revision "
+                f"{FROZEN_RERANK_REVISION}；更换模型或 revision 必须同步更新构建期资产与文档"
             )
         return revision
 
@@ -194,6 +239,34 @@ class Settings(BaseSettings):
             raise ValueError(
                 "EMBEDDING_MAX_REQUEST_BYTES 不得小于 "
                 "EMBEDDING_MAX_TOTAL_BYTES"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_rerank_limits(self) -> "Settings":
+        positive_limits = {
+            "RERANK_MAX_CANDIDATES": self.rerank_max_candidates,
+            "RERANK_MAX_QUERY_CHARS": self.rerank_max_query_chars,
+            "RERANK_MAX_TEXT_CHARS": self.rerank_max_text_chars,
+            "RERANK_MAX_TOTAL_BYTES": self.rerank_max_total_bytes,
+            "RERANK_MAX_CONCURRENCY": self.rerank_max_concurrency,
+        }
+        for name, value in positive_limits.items():
+            if value < 1:
+                raise ValueError(f"{name} 必须 >= 1")
+        # 0 表示“不排队，满了立即拒绝”，与 embedding 队列语义一致。
+        if self.rerank_queue_depth < 0:
+            raise ValueError("RERANK_QUEUE_DEPTH 必须 >= 0")
+        # UTF-8 每个字符至少占 1 字节；字符上限大于字节上限时合法文本永远通不过字节检查。
+        if self.rerank_max_text_chars > self.rerank_max_total_bytes:
+            raise ValueError("RERANK_MAX_TEXT_CHARS 不得超过 RERANK_MAX_TOTAL_BYTES")
+        if self.rerank_max_query_chars > self.rerank_max_total_bytes:
+            raise ValueError("RERANK_MAX_QUERY_CHARS 不得超过 RERANK_MAX_TOTAL_BYTES")
+        if self.rerank_max_request_bytes is not None and (
+            self.rerank_max_request_bytes < self.rerank_max_total_bytes
+        ):
+            raise ValueError(
+                "RERANK_MAX_REQUEST_BYTES 不得小于 RERANK_MAX_TOTAL_BYTES"
             )
         return self
 

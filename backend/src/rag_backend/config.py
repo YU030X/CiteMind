@@ -47,6 +47,8 @@ DEFAULT_CLIENT_IP_HEADER = "X-Real-IP"
 # 内部 inference 的受限基址与默认超时；客户端只接受该 host 或回环测试地址。
 DEFAULT_INFERENCE_BASE_URL = "http://inference:9000"
 DEFAULT_INFERENCE_TIMEOUT_SECONDS = 60.0
+# rerank 是可选增强：默认关闭；开启时单次请求超时更短，失败整体降级为原 RRF 顺序。
+DEFAULT_RERANK_TIMEOUT_SECONDS = 3.0
 
 # 旧版所有项目自有变量都带 CITEMIND_ 前缀；重命名为裸名后，任何残留旧键都必须在启动时
 # 显式失败，避免静默读到旧值或误以为新配置已生效。这里只检查键名，不读取也不回显值。
@@ -229,6 +231,10 @@ class Settings(BaseSettings):
     inference_base_url: str = DEFAULT_INFERENCE_BASE_URL
     inference_timeout_seconds: float = DEFAULT_INFERENCE_TIMEOUT_SECONDS
     inference_token: SecretStr | None = None
+    # 可降级 reranker：默认关闭。关闭时检索完全不构造/调用重排客户端，也不标记降级；
+    # 开启时必须配置 INFERENCE_TOKEN（启动期可独立判断）。
+    rerank_enabled: bool = False
+    rerank_timeout_seconds: float = DEFAULT_RERANK_TIMEOUT_SECONDS
     # 是否在 worker 里执行真实入库（解析/切分/编码/发布）。默认 False，保持既有安全接收壳
     # 行为；显式开启前不加载模型资产、不连 inference。开启时必须配置 INFERENCE_TOKEN。
     ingest_processing_enabled: bool = False
@@ -344,6 +350,14 @@ class Settings(BaseSettings):
         if self.ingest_processing_enabled and self.inference_token is None:
             # 真实处理必须能构造受限编码客户端；缺失 token 属启动期可独立判断的无效配置。
             raise ValueError("开启 ingest_processing_enabled 必须配置 INFERENCE_TOKEN")
+        if (
+            not math.isfinite(self.rerank_timeout_seconds)
+            or self.rerank_timeout_seconds <= 0
+        ):
+            raise ValueError("rerank_timeout_seconds 必须是有限正数")
+        if self.rerank_enabled and self.inference_token is None:
+            # rerank 客户端同样必须能携带 Bearer token；缺失属启动期可独立判断的无效配置。
+            raise ValueError("开启 rerank_enabled 必须配置 INFERENCE_TOKEN")
 
         try:
             # 允许主机列表在启动期即可独立判断；非法条目（含通配符/端口/scheme）直接失败。

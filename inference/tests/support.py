@@ -15,6 +15,8 @@ from citemind_inference.config import (
     EMBEDDING_DIMENSION,
     EMBEDDING_MAX_TOKENS,
     FROZEN_EMBEDDING_REVISION,
+    FROZEN_RERANK_REVISION,
+    RERANK_MAX_TOKENS,
     Settings,
 )
 
@@ -146,4 +148,55 @@ class StubEmbedder:
                 return vectors[:-1]
             case "scaled":
                 return [[value * 2.0 for value in vector] for vector in vectors]
+        raise ValueError(f"未知的故障注入模式：{self._corrupt}")
+
+
+RERANK_CORRUPTIONS = ("nan", "inf", "count")
+
+
+class StubReranker:
+    """确定性 reranker：不加载权重，按文本长度或显式分数返回，可注入故障。"""
+
+    def __init__(
+        self,
+        *,
+        model_revision: str = FROZEN_RERANK_REVISION,
+        max_tokens: int = RERANK_MAX_TOKENS,
+        scores: Sequence[float] | None = None,
+        corrupt: str | None = None,
+    ) -> None:
+        if corrupt is not None and corrupt not in RERANK_CORRUPTIONS:
+            raise ValueError(f"未知的故障注入模式：{corrupt}")
+        self._model_revision = model_revision
+        self._max_tokens = max_tokens
+        self._scores = list(scores) if scores is not None else None
+        self._corrupt = corrupt
+        self.calls: list[tuple[str, list[str]]] = []
+
+    @property
+    def model_revision(self) -> str:
+        return self._model_revision
+
+    @property
+    def max_tokens(self) -> int:
+        return self._max_tokens
+
+    def score(self, query: str, texts: Sequence[str]) -> list[float]:
+        self.calls.append((query, list(texts)))
+        scores = (
+            list(self._scores)
+            if self._scores is not None
+            else [float(len(text)) for text in texts]
+        )
+        match self._corrupt:
+            case None:
+                return scores
+            case "nan":
+                scores[0] = float("nan")
+                return scores
+            case "inf":
+                scores[0] = float("inf")
+                return scores
+            case "count":
+                return scores[:-1]
         raise ValueError(f"未知的故障注入模式：{self._corrupt}")

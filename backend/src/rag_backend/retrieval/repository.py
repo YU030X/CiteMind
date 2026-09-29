@@ -285,6 +285,14 @@ class RetrievalRepository(Protocol):
         query_terms: str,
     ) -> list[RankedChunk]: ...
 
+    async def load_evidence_chunks(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+    ) -> list[EvidenceChunkRow]: ...
+
 
 class EvidenceRepository(Protocol):
     """证据读取与来源复核接口；与检索共用同一权威授权链。"""

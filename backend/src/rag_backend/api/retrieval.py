@@ -39,9 +39,11 @@ from rag_backend.retrieval.keyword_analyzer import (
 )
 from rag_backend.retrieval.query_embedding_client import QueryEmbeddingClient
 from rag_backend.retrieval.repository import SqlRetrievalRepository
+from rag_backend.retrieval.rerank_client import RerankClient
 from rag_backend.retrieval.service import (
     KeywordAnalyzerLike,
     QueryEmbedder,
+    Reranker,
     search_authorized_chunks,
 )
 from rag_backend.schemas.retrieval import (
@@ -70,6 +72,27 @@ def get_query_embedder(request: Request) -> Iterator[QueryEmbedder]:
     settings: Settings = request.app.state.settings
     try:
         client = QueryEmbeddingClient.from_settings(settings)
+    except ValueError as error:
+        raise ApiError(503, CODE_RETRIEVAL_UNAVAILABLE, RETRIEVAL_UNAVAILABLE_MESSAGE) from error
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+def get_rerank_client(request: Request) -> Iterator[Reranker | None]:
+    """按请求构造受限重排客户端；未启用时返回 ``None``，不构造也不发请求。
+
+    重排是可选增强：客户端自身把所有运行期失败收敛为可降级异常。只有配置层错误（启用但
+    缺少 token / 基址非法）在依赖构造期静态 503。
+    """
+
+    settings: Settings = request.app.state.settings
+    if not settings.rerank_enabled:
+        yield None
+        return
+    try:
+        client = RerankClient.from_settings(settings)
     except ValueError as error:
         raise ApiError(503, CODE_RETRIEVAL_UNAVAILABLE, RETRIEVAL_UNAVAILABLE_MESSAGE) from error
     try:
@@ -119,6 +142,7 @@ async def search_retrieval(
     session: AsyncSession = Depends(get_database_session),
     embedder: QueryEmbedder = Depends(get_query_embedder),
     analyzer: KeywordAnalyzerLike = Depends(get_query_analyzer),
+    reranker: Reranker | None = Depends(get_rerank_client),
 ) -> RetrievalSearchResponse:
     """对请求内的授权 KB 运行向量与关键词双路检索并返回 RRF 融合候选。"""
 
@@ -132,6 +156,7 @@ async def search_retrieval(
             query=payload.query,
             embedder=embedder,
             analyzer=analyzer,
+            reranker=reranker,
         )
     except RetrievalError as error:
         raise retrieval_error_to_api(error) from error
@@ -157,6 +182,7 @@ async def search_retrieval(
 __all__ = [
     "get_query_analyzer",
     "get_query_embedder",
+    "get_rerank_client",
     "retrieval_error_to_api",
     "router",
 ]

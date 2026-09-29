@@ -22,8 +22,15 @@ from rag_backend.retrieval.query_embedding_client import (
     QueryEmbeddingBusyError,
     QueryEmbeddingNotReadyError,
 )
-from rag_backend.retrieval.repository import KbScopeRow
+from rag_backend.retrieval.repository import EvidenceChunkRow, KbScopeRow
+from rag_backend.retrieval.rerank_client import (
+    RerankInput,
+    RerankScore,
+    RerankUnavailableError,
+)
 from rag_backend.retrieval.service import (
+    RERANK_TOP_K,
+    RetrievalResult,
     resolve_retrieval_scope,
     search_authorized_chunks,
 )
@@ -75,6 +82,7 @@ class FakeRepository:
         vector_error: Exception | None = None,
         release_error: Exception | None = None,
         release_error_call: int = 1,
+        texts: dict[uuid.UUID, str] | None = None,
     ) -> None:
         self.rows = rows
         self.vector = vector if vector is not None else []
@@ -83,6 +91,7 @@ class FakeRepository:
         self.vector_error = vector_error
         self.release_error = release_error
         self.release_error_call = release_error_call
+        self.texts = texts
         self.released = 0
         self.vector_profile_id: uuid.UUID | None = None
         self.keyword_terms: str | None = None
@@ -130,6 +139,29 @@ class FakeRepository:
         self.events.append("keyword")
         self.keyword_terms = query_terms
         return self.keyword
+
+    async def load_evidence_chunks(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+    ) -> list[EvidenceChunkRow]:
+        self.events.append("load_texts")
+        return [
+            EvidenceChunkRow(
+                chunk_id=chunk_id,
+                document_id=uuid.uuid4(),
+                kb_id=uuid.uuid4(),
+                version_id=uuid.uuid4(),
+                version_no=1,
+                document_title="doc",
+                text=self.texts[chunk_id],
+                source_locator={},
+            )
+            for chunk_id in chunk_ids
+            if self.texts is not None and chunk_id in self.texts
+        ]
 
 
 class FakeEmbedder:
@@ -186,6 +218,38 @@ class FakeAnalyzer:
         if self.error is not None:
             raise self.error
         return self.terms
+
+
+class FakeReranker:
+    """确定性重排替身：记录调用、可显式给分或注入可降级故障。"""
+
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        scores: Sequence[RerankScore] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.events = events
+        self.scores = list(scores) if scores is not None else None
+        self.error = error
+        self.calls: list[tuple[str, list[RerankInput]]] = []
+        self.closed = False
+
+    def rerank(self, query: str, candidates: Sequence[RerankInput]) -> list[RerankScore]:
+        self.events.append("rerank")
+        self.calls.append((query, list(candidates)))
+        if self.error is not None:
+            raise self.error
+        if self.scores is not None:
+            return list(self.scores)
+        return [
+            RerankScore(candidate_id=candidate.candidate_id, score=float(len(candidate.text)))
+            for candidate in candidates
+        ]
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture
@@ -592,3 +656,132 @@ def test_schema_query_length_matches_encoder_limit() -> None:
         RetrievalSearchRequest.model_validate(
             {"query": "x" * (MAX_QUERY_CHARS + 1), "kbIds": [str(uuid.uuid4())]}
         )
+
+
+# --- 可降级重排 -------------------------------------------------------------
+
+
+def rerank_fixture() -> tuple[
+    uuid.UUID, list[RankedChunk], dict[uuid.UUID, str]
+]:
+    kb_id = uuid.uuid4()
+    candidates = [ranked(1.0 - index * 0.01) for index in range(RERANK_TOP_K + 2)]
+    texts = {candidate.chunk_id: f"text-{index}" for index, candidate in enumerate(candidates)}
+    return kb_id, candidates, texts
+
+
+async def run_search(
+    repository: FakeRepository,
+    kb_id: uuid.UUID,
+    embedder: FakeEmbedder,
+    analyzer: FakeAnalyzer,
+    *,
+    reranker: FakeReranker | None,
+) -> RetrievalResult:
+    return await search_authorized_chunks(
+        repository,
+        user_id=USER_ID,
+        organization_id=ORGANIZATION_ID,
+        kb_ids=[kb_id],
+        query="hello",
+        embedder=embedder,
+        analyzer=analyzer,
+        reranker=reranker,
+    )
+
+
+@pytest.mark.anyio
+async def test_rerank_reorders_top_k_and_keeps_rest_after_fusion() -> None:
+    kb_id, candidates, texts = rerank_fixture()
+    baseline_repository = FakeRepository([scope_row(kb_id)], vector=candidates)
+    baseline = await run_search(
+        baseline_repository, kb_id, FakeEmbedder([]), FakeAnalyzer([]), reranker=None
+    )
+    baseline_by_id = {
+        candidate.chunk_id: (candidate.fusion_rank, candidate.fusion_score)
+        for candidate in baseline.candidates
+    }
+
+    events: list[str] = []
+    repository = FakeRepository([scope_row(kb_id)], vector=candidates, events=events, texts=texts)
+    # 分数随融合顺序递增：最后一个候选分数最高，让 top-10 完全倒序，便于断言确定性重排。
+    top_ids = [candidate.chunk_id for candidate in candidates[:RERANK_TOP_K]]
+    scores = [
+        RerankScore(candidate_id=str(chunk_id), score=float(index + 1))
+        for index, chunk_id in enumerate(top_ids)
+    ]
+    reranker = FakeReranker(events, scores=scores)
+
+    result = await run_search(
+        repository, kb_id, FakeEmbedder(events), FakeAnalyzer(events), reranker=reranker
+    )
+
+    expected_top_ids = list(reversed(top_ids))
+    reordered_top_ids = [candidate.chunk_id for candidate in result.candidates[:RERANK_TOP_K]]
+    assert reordered_top_ids == expected_top_ids
+    assert [candidate.chunk_id for candidate in result.candidates[RERANK_TOP_K:]] == [
+        candidate.chunk_id for candidate in candidates[RERANK_TOP_K:]
+    ]
+    assert result.degraded_stages == ()
+    # 既有 fusion_rank/fusion_score 一律不改：每个 chunk 仍带基线值。
+    for candidate in result.candidates:
+        assert (candidate.fusion_rank, candidate.fusion_score) == baseline_by_id[candidate.chunk_id]
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0][1]) == RERANK_TOP_K
+
+
+@pytest.mark.anyio
+async def test_rerank_failure_degrades_and_keeps_rrf_order() -> None:
+    kb_id, candidates, texts = rerank_fixture()
+    events: list[str] = []
+    repository = FakeRepository([scope_row(kb_id)], vector=candidates, events=events, texts=texts)
+    reranker = FakeReranker(events, error=RerankUnavailableError("upstream down"))
+
+    result = await run_search(
+        repository, kb_id, FakeEmbedder(events), FakeAnalyzer(events), reranker=reranker
+    )
+
+    assert [candidate.chunk_id for candidate in result.candidates] == [
+        candidate.chunk_id for candidate in candidates
+    ]
+    assert result.degraded_stages == ("rerank_unavailable",)
+    # 模型调用发生在最后一次 release 之后。
+    last_release = max(index for index, event in enumerate(events) if event == "release")
+    assert events.index("rerank") > last_release
+
+
+@pytest.mark.anyio
+async def test_rerank_disabled_never_loads_text_or_marks_degrade() -> None:
+    kb_id, candidates, texts = rerank_fixture()
+    events: list[str] = []
+    repository = FakeRepository([scope_row(kb_id)], vector=candidates, events=events, texts=texts)
+
+    result = await run_search(
+        repository, kb_id, FakeEmbedder(events), FakeAnalyzer(events), reranker=None
+    )
+
+    assert result.degraded_stages == ()
+    assert "load_texts" not in events
+    assert "rerank" not in events
+
+
+@pytest.mark.anyio
+async def test_rerank_missing_candidate_text_degrades_without_model_call() -> None:
+    kb_id, candidates, _texts = rerank_fixture()
+    events: list[str] = []
+    # 只给部分候选正文，模拟读取正文前候选失效。
+    partial = {candidate.chunk_id: "text" for candidate in candidates[:3]}
+    repository = FakeRepository(
+        [scope_row(kb_id)], vector=candidates, events=events, texts=partial
+    )
+    reranker = FakeReranker(events)
+
+    result = await run_search(
+        repository, kb_id, FakeEmbedder(events), FakeAnalyzer(events), reranker=reranker
+    )
+
+    assert [candidate.chunk_id for candidate in result.candidates] == [
+        candidate.chunk_id for candidate in candidates
+    ]
+    assert result.degraded_stages == ("rerank_unavailable",)
+    assert reranker.calls == []

@@ -19,7 +19,10 @@ ENV UV_LINK_MODE=copy \
     TOKENIZERS_PARALLELISM=false \
     EMBEDDING_TORCH_THREADS=2 \
     EMBEDDING_MODEL_PATH=/models/bge-small-zh-v1.5 \
-    EMBEDDING_MODEL_REVISION=7999e1d3359715c523056ef9478215996d62a620
+    EMBEDDING_MODEL_REVISION=7999e1d3359715c523056ef9478215996d62a620 \
+    RERANK_ENABLED=0 \
+    RERANK_MODEL_PATH=/models/bge-reranker-base \
+    RERANK_MODEL_REVISION=2cfc18c9415c912f9d8155881c133215df768a70
 
 WORKDIR /app
 
@@ -31,8 +34,14 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-ins
 COPY scripts/prepare_model.py ./scripts/prepare_model.py
 RUN python scripts/prepare_model.py
 
+# reranker 默认不从网络下载；只有显式传入 RERANK_MODEL_ENABLED=1 才在构建期获取权重并生成
+# rerank-model-manifest.json。默认关闭时镜像不含 reranker 权重，进程以 RERANK_ENABLED=0 运行。
+ARG RERANK_MODEL_ENABLED=0
+RUN if [ "$RERANK_MODEL_ENABLED" = "1" ]; then python scripts/prepare_model.py --model rerank; fi
+
 # 随镜像分发模型许可与来源说明；放在模型目录之外，/models/bge-small-zh-v1.5/ 仍恰为 6 个模型产物。
 COPY third_party/bge-small-zh-v1.5-LICENSE.txt /models/bge-small-zh-v1.5-LICENSE.txt
+COPY third_party/bge-reranker-base-LICENSE.txt /models/bge-reranker-base-LICENSE.txt
 
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev

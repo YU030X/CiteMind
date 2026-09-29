@@ -33,6 +33,7 @@ from citemind_inference.config import (
     get_settings,
 )
 from citemind_inference.embeddings import Embedder, EmbedderFactory
+from citemind_inference.reranker import Reranker, RerankerFactory
 from citemind_inference.schemas import (
     CapabilitiesResponse,
     EmbeddingCapability,
@@ -42,12 +43,16 @@ from citemind_inference.schemas import (
     HealthResponse,
     ReadyResponse,
     RerankCapability,
+    RerankRequest,
+    RerankResponse,
+    RerankScore,
 )
 
 SERVICE_NAME: Literal["inference"] = "inference"
 
-# 需要限制请求体字节数的路径；只有内部编码接口接收正文。
-GUARDED_BODY_PATHS = ("/internal/embed",)
+# 需要限制请求体字节数的路径；只有内部编码/重排接口接收正文。两个路由各自独立上限。
+EMBED_BODY_PATH = "/internal/embed"
+RERANK_BODY_PATH = "/internal/rerank"
 # 关闭时等待运行中编码任务的有界时间；torch 线程无法中断，超时后不再等待。
 SHUTDOWN_DRAIN_SECONDS = 30.0
 # float32 归一化的舍入量级远小于该值，明显偏离 1 的范数会被拦下。
@@ -55,7 +60,8 @@ OUTPUT_NORM_TOLERANCE = 1e-3
 
 EMBEDDING_NOT_READY_CODE = "EMBEDDING_NOT_READY"
 EMBEDDING_NOT_READY_REASON = "embedding 模型尚未加载"
-RERANK_NOT_READY_REASON = "rerank 路由尚未实现"
+RERANK_NOT_READY_CODE = "RERANK_NOT_READY"
+RERANK_NOT_READY_REASON = "rerank 模型尚未加载"
 
 UNAUTHORIZED_CODE = "UNAUTHORIZED"
 INVALID_REQUEST_CODE = "INVALID_REQUEST"
@@ -64,6 +70,10 @@ INPUT_TOO_LONG_CODE = "EMBEDDING_INPUT_TOO_LONG"
 BUSY_CODE = "EMBEDDING_BUSY"
 QUEUE_TIMEOUT_CODE = "EMBEDDING_QUEUE_TIMEOUT"
 OUTPUT_INVALID_CODE = "EMBEDDING_OUTPUT_INVALID"
+RERANK_PAYLOAD_TOO_LARGE_CODE = "RERANK_PAYLOAD_TOO_LARGE"
+RERANK_BUSY_CODE = "RERANK_BUSY"
+RERANK_QUEUE_TIMEOUT_CODE = "RERANK_QUEUE_TIMEOUT"
+RERANK_OUTPUT_INVALID_CODE = "RERANK_OUTPUT_INVALID"
 
 
 class InferenceError(Exception):
@@ -254,15 +264,66 @@ async def encode_batch(
     return await asyncio.to_thread(cpu_encode_batch, embedder, settings, texts, gate, loop)
 
 
+def cpu_rerank_batch(
+    reranker: Reranker,
+    query: str,
+    texts: list[str],
+    gate: CpuGate,
+    loop: asyncio.AbstractEventLoop,
+) -> list[float]:
+    """torch 前向打分；整段在一个许可内，并由本线程归还许可。"""
+
+    try:
+        return reranker.score(query, texts)
+    finally:
+        release_gate_threadsafe(gate, loop)
+
+
+async def score_batch(
+    reranker: Reranker,
+    query: str,
+    texts: list[str],
+    gate: CpuGate,
+) -> list[float]:
+    """在许可内跑一次 rerank；取消只停止等待，工作线程会自行完成并归还许可。"""
+
+    loop = asyncio.get_running_loop()
+    return await asyncio.to_thread(cpu_rerank_batch, reranker, query, texts, gate, loop)
+
+
+def validate_rerank_scores(scores: Sequence[float], *, expected_count: int) -> list[float]:
+    """模型输出必须条数一致且全部有限；NaN/Inf 会在 JSON 里变成 null，必须提前拦下。"""
+
+    if len(scores) != expected_count:
+        raise InferenceError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            RERANK_OUTPUT_INVALID_CODE,
+            f"reranker 返回 {len(scores)} 条分数，期望 {expected_count} 条",
+        )
+    resolved: list[float] = []
+    for index, value in enumerate(scores):
+        score = float(value)
+        if not math.isfinite(score):
+            raise InferenceError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                RERANK_OUTPUT_INVALID_CODE,
+                f"scores[{index}] 含 NaN 或 Inf，无法作为分数返回",
+            )
+        resolved.append(score)
+    return resolved
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     embedder_factory: EmbedderFactory | None = None,
+    reranker_factory: RerankerFactory | None = None,
 ) -> FastAPI:
     """构建应用。
 
     ``embedder_factory`` 为 ``None`` 时不加载任何模型，进程仍会启动，但 embedding 能力
-    如实报告为未就绪。真实入口 ``main.app`` 显式传入 ``load_embedder``。
+    如实报告为未就绪。真实入口 ``main.app`` 显式传入 ``load_embedder``。``reranker_factory``
+    只在 ``RERANK_ENABLED=1`` 时被调用；默认关闭时不加载权重。
     """
 
     resolved_settings = settings or get_settings()
@@ -279,12 +340,26 @@ def create_app(
         )
         registry = EmbeddingTaskRegistry()
         app.state.embedding_tasks = registry
+        # rerank 默认关闭：关闭时完全不校验模型目录、不加载权重，也不创建许可/登记表。
+        rerank_registry = EmbeddingTaskRegistry()
+        app.state.rerank_tasks = rerank_registry
+        app.state.rerank_gate = CpuGate(
+            concurrency=resolved_settings.rerank_max_concurrency,
+            queue_depth=resolved_settings.rerank_queue_depth,
+        )
+        app.state.reranker = None
+        if resolved_settings.rerank_enabled:
+            if reranker_factory is None:
+                raise RuntimeError("RERANK_ENABLED=1 但未提供 reranker 工厂，无法加载模型")
+            app.state.reranker = reranker_factory(resolved_settings)
         try:
             yield
         finally:
             app.state.embedder = None
-            # 有界等待运行中的编码任务，并让登记表取走未观察的异常。
+            app.state.reranker = None
+            # 有界等待运行中的编码/打分任务，并让登记表取走未观察的异常。
             await registry.drain(SHUTDOWN_DRAIN_SECONDS)
+            await rerank_registry.drain(SHUTDOWN_DRAIN_SECONDS)
 
     app = FastAPI(
         title="CiteMind Inference",
@@ -293,8 +368,15 @@ def create_app(
     )
     app.add_middleware(
         BodySizeLimitMiddleware,
-        paths=GUARDED_BODY_PATHS,
+        paths=(EMBED_BODY_PATH,),
         max_bytes=resolved_settings.request_byte_limit,
+    )
+    # 两个路由的字节上限各自独立；任一实例只对匹配路径生效。
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        paths=(RERANK_BODY_PATH,),
+        max_bytes=resolved_settings.rerank_request_byte_limit,
+        code=RERANK_PAYLOAD_TOO_LARGE_CODE,
     )
     app.state.settings = resolved_settings
     app.state.embedder = None
@@ -388,7 +470,14 @@ def create_app(
             )
         return CapabilitiesResponse(
             embedding=embedding,
-            rerank=RerankCapability(ready=False, reason=RERANK_NOT_READY_REASON),
+            rerank=RerankCapability(
+                ready=request.app.state.reranker is not None,
+                reason=(
+                    None
+                    if request.app.state.reranker is not None
+                    else RERANK_NOT_READY_REASON
+                ),
+            ),
         )
 
     @app.post(
@@ -496,6 +585,92 @@ def create_app(
             query_encoding_contract=(
                 QUERY_ENCODING_CONTRACT if payload.kind == "query" else None
             ),
+        )
+
+    @app.post(
+        "/internal/rerank",
+        dependencies=[Depends(require_inference_token)],
+        response_model=RerankResponse,
+        responses={
+            status.HTTP_413_CONTENT_TOO_LARGE: {"model": ErrorResponse},
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+            status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
+        },
+        tags=["internal"],
+    )
+    async def rerank(request: Request, payload: RerankRequest) -> RerankResponse:
+        settings: Settings = request.app.state.settings
+        reranker: Reranker | None = request.app.state.reranker
+        if reranker is None:
+            # 静态 503：绝不返回任何分数，也不暴露模型路径或状态。
+            raise InferenceError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                RERANK_NOT_READY_CODE,
+                RERANK_NOT_READY_REASON,
+            )
+
+        candidates = payload.candidates
+        if len(candidates) > settings.rerank_max_candidates:
+            raise InferenceError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                RERANK_PAYLOAD_TOO_LARGE_CODE,
+                f"请求包含 {len(candidates)} 条候选，"
+                f"超过单次上限 {settings.rerank_max_candidates}",
+            )
+        if len(payload.query) > settings.rerank_max_query_chars:
+            raise InferenceError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                RERANK_PAYLOAD_TOO_LARGE_CODE,
+                f"query 长度为 {len(payload.query)} 字符，"
+                f"超过上限 {settings.rerank_max_query_chars}",
+            )
+        total_bytes = len(payload.query.encode("utf-8"))
+        for index, candidate in enumerate(candidates):
+            if len(candidate.text) > settings.rerank_max_text_chars:
+                raise InferenceError(
+                    status.HTTP_413_CONTENT_TOO_LARGE,
+                    RERANK_PAYLOAD_TOO_LARGE_CODE,
+                    f"candidates[{index}].text 长度为 {len(candidate.text)} 字符，"
+                    f"超过上限 {settings.rerank_max_text_chars}",
+                )
+            total_bytes += len(candidate.text.encode("utf-8"))
+        if total_bytes > settings.rerank_max_total_bytes:
+            raise InferenceError(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                RERANK_PAYLOAD_TOO_LARGE_CODE,
+                f"请求文本合计 {total_bytes} 字节，"
+                f"超过上限 {settings.rerank_max_total_bytes}",
+            )
+
+        gate: CpuGate = request.app.state.rerank_gate
+        try:
+            await gate.acquire(settings.rerank_queue_wait_seconds)
+        except EmbeddingBusyError as error:
+            raise InferenceError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                RERANK_BUSY_CODE,
+                "rerank 并发与等待队列已满，请稍后重试",
+                headers={"Retry-After": "1"},
+            ) from error
+        except EmbeddingQueueTimeoutError as error:
+            raise InferenceError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                RERANK_QUEUE_TIMEOUT_CODE,
+                "rerank 队列等待超时，请稍后重试",
+                headers={"Retry-After": "1"},
+            ) from error
+
+        registry: EmbeddingTaskRegistry = request.app.state.rerank_tasks
+        texts = [candidate.text for candidate in candidates]
+        task = registry.start(score_batch(reranker, payload.query, texts, gate))
+        scores = await asyncio.shield(task)
+        resolved = validate_rerank_scores(scores, expected_count=len(candidates))
+        return RerankResponse(
+            scores=[
+                RerankScore(candidate_id=candidate.candidate_id, score=score)
+                for candidate, score in zip(candidates, resolved, strict=True)
+            ],
+            model_revision=reranker.model_revision,
         )
 
     return app

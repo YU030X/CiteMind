@@ -12,6 +12,7 @@
 | Note | 主题 |
 | --- | --- |
 | [bge-zh-query-v1](implemented/bge-zh-query-v1.md) | BGE 中文查询 instruction 前缀与 `bge-zh-query-v1` 命名契约 |
+| [bge-reranker-base-degradable-rerank](implemented/bge-reranker-base-degradable-rerank.md) | bge-reranker-base 可降级重排、清单式离线身份与默认关闭 |
 | [document-acl-read-narrowing](implemented/document-acl-read-narrowing.md) | 文档 ACL 只收紧读取、首次 DELETE 授权与下载鉴权时序 |
 | [docx-minimal-subset](implemented/docx-minimal-subset.md) | DOCX 允许子集、`locator_version=3` 与 ZIP 安全限额 |
 | [pdf-dual-engine-text-layer](implemented/pdf-dual-engine-text-layer.md) | PDF pypdf 预检 + pdfplumber 抽取的双引擎分工与诚实解析器版本 |

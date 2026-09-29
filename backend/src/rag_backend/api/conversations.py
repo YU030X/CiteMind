@@ -28,6 +28,7 @@ from rag_backend.api.errors import (
 from rag_backend.api.retrieval import (
     get_query_analyzer,
     get_query_embedder,
+    get_rerank_client,
     retrieval_error_to_api,
 )
 from rag_backend.auth.context import AuthContext
@@ -88,6 +89,7 @@ from rag_backend.retrieval.repository import (
 from rag_backend.retrieval.service import (
     KeywordAnalyzerLike,
     QueryEmbedder,
+    Reranker,
     RetrievalResult,
     search_authorized_chunks,
 )
@@ -380,6 +382,7 @@ async def ask_question(
     evidence: EvidenceRepository = Depends(get_evidence_repository),
     embedder: QueryEmbedder = Depends(get_query_embedder),
     analyzer: KeywordAnalyzerLike = Depends(get_query_analyzer),
+    reranker: Reranker | None = Depends(get_rerank_client),
     estimator: PromptTokenEstimator = Depends(get_prompt_estimator),
     generator: AnswerGenerator = Depends(get_answer_generator),
     session: AsyncSession = Depends(get_database_session),
@@ -410,6 +413,7 @@ async def ask_question(
             query=query,
             embedder=embedder,
             analyzer=analyzer,
+            reranker=reranker,
         )
 
     try:

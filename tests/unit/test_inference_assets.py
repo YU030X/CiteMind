@@ -151,8 +151,13 @@ def test_inference_model_script_pins_frozen_model_and_revision() -> None:
     assert f'REVISION = "{FROZEN_EMBEDDING_REVISION}"' in content
     assert MODEL_DIR_IN_IMAGE in content, "构建期模型目录必须与运行期默认路径一致"
     # revision 必须实际用于拼 URL：只在文件里写一遍字符串不构成固定。
-    assert "/revision/{REVISION}" in content
-    assert "/{MODEL}/resolve/{REVISION}/{name}" in content
+    assert "/revision/{spec.revision}" in content
+    assert "/{spec.model}/resolve/{spec.revision}/{name}" in content
+    # reranker 的模型与 revision 同样必须钉死；它与 embedding 共用参数化的 URL 构造。
+    assert 'RERANK_MODEL = "BAAI/bge-reranker-base"' in content
+    assert (
+        'RERANK_REVISION = "2cfc18c9415c912f9d8155881c133215df768a70"' in content
+    )
 
 
 def test_inference_model_script_requires_only_config_tokenizer_and_safetensors() -> None:

@@ -170,10 +170,10 @@ def _content_length(scope: Scope) -> int | None:
     return None
 
 
-async def _send_too_large(send: Send, max_bytes: int) -> None:
+async def _send_too_large(send: Send, max_bytes: int, code: str) -> None:
     payload = json.dumps(
         {
-            "code": REQUEST_TOO_LARGE_CODE,
+            "code": code,
             "message": f"请求体超过上限 {max_bytes} 字节",
         },
         ensure_ascii=False,
@@ -205,10 +205,12 @@ class BodySizeLimitMiddleware:
         *,
         paths: tuple[str, ...],
         max_bytes: int,
+        code: str = REQUEST_TOO_LARGE_CODE,
     ) -> None:
         self._app = app
         self._paths = paths
         self._max_bytes = max_bytes
+        self._code = code
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http" or scope.get("path") not in self._paths:
@@ -217,7 +219,7 @@ class BodySizeLimitMiddleware:
 
         declared = _content_length(scope)
         if declared is not None and declared > self._max_bytes:
-            await _send_too_large(send, self._max_bytes)
+            await _send_too_large(send, self._max_bytes, self._code)
             return
 
         received = bytearray()
@@ -230,7 +232,7 @@ class BodySizeLimitMiddleware:
                 continue
             received.extend(message.get("body", b""))
             if len(received) > self._max_bytes:
-                await _send_too_large(send, self._max_bytes)
+                await _send_too_large(send, self._max_bytes, self._code)
                 return
             if not message.get("more_body", False):
                 break

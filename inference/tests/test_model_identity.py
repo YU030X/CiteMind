@@ -195,3 +195,17 @@ def test_prepare_model_constants_match_package_identity() -> None:
     for name, (size, sha256) in MODEL_ARTIFACT_DIGESTS.items():
         assert script_files[name]["size"] == size, name
         assert script_files[name]["sha256"] == sha256, name
+
+
+def test_prepare_script_rerank_constants_match_runtime_identity() -> None:
+    from citemind_inference.rerank_identity import (
+        RERANK_MANIFEST_NAME,
+        RERANK_MODEL_NAME,
+        RERANK_MODEL_REVISION,
+    )
+
+    assert script_assignment("RERANK_MODEL") == RERANK_MODEL_NAME
+    assert script_assignment("RERANK_REVISION") == RERANK_MODEL_REVISION
+    assert script_assignment("RERANK_MANIFEST") == RERANK_MANIFEST_NAME
+    # 构建期脚本不得写死未经下载核验的 reranker 摘要；摘要只由清单在构建期生成。
+    assert "RERANK_EXPECTED_FILES" not in PREPARE_MODEL_SCRIPT.read_text(encoding="utf-8")

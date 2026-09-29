@@ -378,9 +378,11 @@ class FakeRetrieval:
         candidates: Sequence[Sequence[FusedCandidate]],
         *,
         kb_ids: Sequence[uuid.UUID] = (KB_ID,),
+        degraded_stages: Sequence[str] = (),
     ) -> None:
         self.candidates = [list(item) for item in candidates]
         self.kb_ids = tuple(kb_ids)
+        self.degraded_stages = tuple(degraded_stages)
         self.calls = 0
         self.queries: list[str] = []
 
@@ -391,7 +393,9 @@ class FakeRetrieval:
         self.calls += 1
         self.queries.append(query)
         return RetrievalResult(
-            kb_ids=self.kb_ids, candidates=tuple(self.candidates[index])
+            kb_ids=self.kb_ids,
+            candidates=tuple(self.candidates[index]),
+            degraded_stages=self.degraded_stages,
         )
 
 
@@ -1097,6 +1101,16 @@ async def test_normal_top_k_exclusion_is_not_degraded() -> None:
     assert result.insufficient_evidence is False
     assert result.degraded_stages == ()
     assert repository.query_runs[0].degraded_stages == ()
+
+
+@pytest.mark.anyio
+async def test_rerank_degradation_is_merged_into_result_and_query_run() -> None:
+    retrieval = FakeRetrieval([[_candidate()]], degraded_stages=("rerank_unavailable",))
+
+    result, repository, _, _ = await _run(retrieval=retrieval)
+
+    assert result.degraded_stages == ("rerank_unavailable",)
+    assert repository.query_runs[0].degraded_stages == ("rerank_unavailable",)
     assert repository.query_runs[0].evidence_count == 1
 
 

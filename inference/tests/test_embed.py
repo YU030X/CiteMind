@@ -363,10 +363,18 @@ def test_embed_without_loaded_model_returns_503() -> None:
     }
 
 
-def test_rerank_route_is_not_implemented(client: TestClient, test_token: str) -> None:
+def test_rerank_route_is_statically_unavailable_when_disabled(
+    client: TestClient, test_token: str
+) -> None:
     response = client.post(
         "/internal/rerank",
         headers={"Authorization": f"Bearer {test_token}"},
+        json={"query": "问题", "candidates": [{"candidateId": "c1", "text": "候选正文"}]},
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 503
+    body = response.json()
+    assert body == {"code": "RERANK_NOT_READY", "message": "rerank 模型尚未加载"}
+    # 关闭时绝不返回任何分数。
+    assert "score" not in response.text
+    assert "candidateId" not in response.text

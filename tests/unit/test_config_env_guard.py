@@ -179,3 +179,26 @@ def test_pytest_showlocals_failure_report_does_not_leak_dsn(tmp_path: Path) -> N
     assert "settings" in report, "--showlocals 未打印 settings，断言前提不成立"
     assert REPR_DB_SENTINEL not in report
     assert REPR_REDIS_SENTINEL not in report
+
+
+# ---------------------------------------------------------------- rerank
+
+
+def test_rerank_enabled_requires_inference_token() -> None:
+    with pytest.raises(ValueError, match="rerank_enabled"):
+        make_settings(environment="test", rerank_enabled=True)
+
+
+def test_rerank_enabled_with_token_is_accepted_and_defaults_to_three_seconds() -> None:
+    resolved = make_settings(
+        environment="test", rerank_enabled=True, inference_token="unit-rerank-token"
+    )
+
+    assert resolved.rerank_enabled is True
+    assert resolved.rerank_timeout_seconds == 3.0
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])
+def test_rerank_timeout_must_be_finite_and_positive(timeout: float) -> None:
+    with pytest.raises(ValueError):
+        make_settings(environment="test", rerank_timeout_seconds=timeout)

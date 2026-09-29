@@ -4,7 +4,7 @@
 # inference 用 inference/ 独立上下文构建；frontend-gateway 用 deploy/compose/frontend.Dockerfile
 # 构建（Node 构建 + 非 root nginx）。自建服务不写 image:，镜像由本仓库 Dockerfile 固定。
 # 第三方镜像用 digest 固定；宿主端口默认只绑定 127.0.0.1，可用变量覆盖。
-# inference 已能离线编码 kind=document 文本（query 与 rerank 未实现）；worker 写入事务与
+# inference 已能离线编码 kind=document 文本（query 已实现，rerank 已实现但默认关闭且未做真模型验收）；worker 写入事务与
 # dispatcher/业务 API 仍未实现。云 LLM 用量账本 llm_usage 由迁移 20260923_0004 落地；
 # 一次性真实探针 rag_backend.llm_probe 默认关闭、不随容器启动，已由用户执行一次真实
 # DeepSeek 成功调用并与 llm_usage 落账回读；Phase 0 工程底座退出条件据此达成。
@@ -119,6 +119,10 @@ services:
       LLM_ENABLED: ${LLM_ENABLED:-0}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      # 可降级 reranker 默认关闭：关闭时检索完全不调用重排、也不标记降级；开启时必须已配置
+      # INFERENCE_TOKEN，且 inference 镜像在构建期已烘入 bge-reranker-base 权重。
+      RERANK_ENABLED: ${RERANK_ENABLED:-0}
+      RERANK_TIMEOUT_SECONDS: ${RERANK_TIMEOUT_SECONDS:-3}
     volumes:
       # api 专用命名卷：镜像内该目录已归属 uid 10001，新建卷会继承该所有权。
       # api 是唯一写入者；worker 只读同卷；inference 不可见。
@@ -154,6 +158,10 @@ services:
       # 模型烘入镜像，不挂宿主模型卷、不在启动时下载。
       EMBEDDING_MODEL_PATH: /models/bge-small-zh-v1.5
       EMBEDDING_MODEL_REVISION: 7999e1d3359715c523056ef9478215996d62a620
+      # reranker 默认关闭；镜像必须在构建期传 RERANK_MODEL_ENABLED=1 才有权重。
+      RERANK_ENABLED: ${RERANK_ENABLED:-0}
+      RERANK_MODEL_PATH: /models/bge-reranker-base
+      RERANK_MODEL_REVISION: 2cfc18c9415c912f9d8155881c133215df768a70
       EMBEDDING_TORCH_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
       OMP_NUM_THREADS: ${EMBEDDING_TORCH_THREADS:-2}
       MKL_NUM_THREADS: ${EMBEDDING_TORCH_THREADS:-2}

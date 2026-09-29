@@ -476,7 +476,9 @@ async def answer_question(
             budget=budget,
             thinking=thinking,
         )
-        degraded_stages = _degraded_stages(plan, retried=retried)
+        degraded_stages = _merge_degraded(
+            _degraded_stages(plan, retried=retried), retrieval.degraded_stages
+        )
 
         # 检索期间历史被撤权时，派生独立问题同样失效：拒答分支也会持久化问题，
         # 因此这里复用刚加载的最新历史再核一次，不额外读库。
@@ -985,7 +987,8 @@ def _degraded_stages(plan: ChatContextPlan, *, retried: bool) -> tuple[str, ...]
 
     只把真实异常计为降级：低信任正文含本地渲染器拒绝的结构 token（``unsupported_text``）
     以及来源变化触发的重检索（``source_retry``）。正常的 top-k/同文档限量/预算裁剪与最近窗口
-    排除都是预期行为，不得机械地全部当成故障。
+    排除都是预期行为，不得机械地全部当成故障。检索侧的可降级重排失败由
+    :func:`_merge_degraded` 合并进来。
     """
 
     stages: list[str] = []
@@ -993,6 +996,19 @@ def _degraded_stages(plan: ChatContextPlan, *, retried: bool) -> tuple[str, ...]
         stages.append(STAGE_UNSUPPORTED_TEXT)
     if retried:
         stages.append(STAGE_SOURCE_RETRY)
+    return tuple(stages)
+
+
+def _merge_degraded(*groups: Sequence[str]) -> tuple[str, ...]:
+    """按固定顺序去重合并降级阶段，避免重复阶段写入 ``query_run.degraded_stages``。"""
+
+    stages: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for stage in group:
+            if stage not in seen:
+                seen.add(stage)
+                stages.append(stage)
     return tuple(stages)
 
 
