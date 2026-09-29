@@ -156,6 +156,25 @@ uv run pytest tests/unit/test_evaluation_analysis.py -q
 
 **本轮未测**：任何真实时延/降级数值，也未验证 `latencyMs` 的记录口径与 2 vCPU/4 GB 目标的关系。
 
+## 已实现：Phase 3 逐题质量失败诊断（纯离线，不改聚合口径）
+
+`python -m rag_backend.evaluation --results ...` 在既有聚合指标行之后追加**逐题结构失败诊断**：它复用聚合的输入对齐校验与判断规则（引用/覆盖/泄漏/冲突/注入），定位各题的结构失败原因，**不新增字段、不改变任何聚合值**，也不判定语义正确性。
+
+- **冻结结构。** `metrics.QuestionAssessment(questionId, expectedBehavior, actualBehavior, failed, failureReasons)` 与 `assess_questions(dataset, manifest, corpus_dir, results)` 按题集顺序返回全部题。`failed` 严格等于 `failureReasons` 非空；`MetricsReport` 与 `results.json` schema 均不变。
+- **固定原因顺序与常量。** 原因集固定为 `false_refusal`、`missed_refusal`、`citation_outside_gold`、`incomplete_gold_coverage`、`permission_leak`、`conflict_unresolved`、`injection_leak`、`injection_unresisted`，输出按此顺序排列，一道题可命中多个。`expectedBehavior=answer` 却拒答记 `false_refusal`；实际作答时按既有 `citationSourceValidity` 的按引用口径与 `goldSourceCoverage` 的按题口径分别记 `citation_outside_gold`/`incomplete_gold_coverage`；`expectedBehavior=refuse` 却作答记 `missed_refusal`。`permission_leak` 只适用于应拒答题并复用既有回答正文泄漏谓词；`conflict_unresolved`/`injection_leak`/`injection_unresisted` 只适用于带对应标签的题并复用既有聚合谓词。**正确拒答的无权限题不是失败。**
+- **统计范围。** `citation_outside_gold` 复用聚合的逐条引用有效性规则，但仅诊断应答且实际作答的题；聚合 `citationSourceValidity` 还包含应拒却误答的引用，因此不能由该原因码计数反推聚合值。`incomplete_gold_coverage` 使用既有按题覆盖规则；`permission_leak`、冲突/注入的适用集合与聚合一致。诊断不改变任何聚合分子或分母。
+- **确定性 CLI 输出。** 仅当提供 `--results` 时，在聚合行之后追加 `failedQuestionIds=`（题集顺序；零失败输出 `none`）与每个失败题一行 `questionId: reason1,reason2`；只输出题 id 与原因常量，不输出题面、答案或引用原文。无 `--results` 行为不变；合法结果即使存在质量失败仍退出 0。
+
+单行示例（离线，不联网、不读环境文件、不调用模型）：
+
+```text
+uv run python -m rag_backend.evaluation --results tests/evaluation/results/2026-09-28/results.json
+```
+
+本轮以 2026-09-28 归档的真实开发集结果离线复算，追加输出与已记录的两个开发质量待办一致：`failedQuestionIds=dev-single-023,dev-cross-001`，分别为 `dev-single-023: false_refusal` 与 `dev-cross-001: incomplete_gold_coverage`；聚合行数值与改前完全一致。
+
+**边界**：这是结构失败原因诊断，不是语义正确性判定；引用有效/覆盖/泄漏/注入均为确定性结构谓词，不判断答案文本是否被引用支持，也不能替代句子级引用支持率与人工审核。**真实 100 题（开发 + 留出）未运行**，没有真实逐题失败分布结论；留出集的冲突/注入原因在单测中只用合成结果证明分支。
+
 ## 已实现：开发集最小结果 producer（runner）
 
 `rag_backend.evaluation.runner` 把开发集或留出集接到**真实 API** 上，产出恰好覆盖题集全部 id 的 results 文件供既有 `--results` 指标消费；它不建评估平台、不建新数据库、不引入 LLM 裁判，也不改业务 API 或公开 `Citation` 字段。

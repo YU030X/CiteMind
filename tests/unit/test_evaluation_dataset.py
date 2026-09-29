@@ -28,6 +28,7 @@ from rag_backend.evaluation.metrics import (
     MetricsInputError,
     QuestionResult,
     ResultCitation,
+    assess_questions,
     compute_metrics,
 )
 
@@ -410,6 +411,112 @@ def test_metrics_reject_incomplete_results() -> None:
         )
 
 
+def test_assess_questions_reports_no_failure_on_perfect_results() -> None:
+    dataset, manifest, corpus_dir = _bundle()
+    assessments = assess_questions(dataset, manifest, corpus_dir, _perfect_results(dataset))
+
+    assert [assessment.question_id for assessment in assessments] == [
+        question.id for question in dataset.questions
+    ]
+    assert all(assessment.failed is False for assessment in assessments)
+    assert all(assessment.failure_reasons == () for assessment in assessments)
+
+
+def test_assess_questions_reports_structural_failure_reasons() -> None:
+    dataset, manifest, corpus_dir = _bundle()
+    degraded: list[QuestionResult] = []
+    for result in _perfect_results(dataset).results:
+        if result.question_id == "dev-single-001":
+            degraded.append(
+                result.model_copy(
+                    update={
+                        "citations": [
+                            ResultCitation(kb_id="kb-handbook", document_id="handbook", version=2)
+                        ]
+                    }
+                )
+            )
+        elif result.question_id == "dev-single-003":
+            degraded.append(result.model_copy(update={"behavior": "refuse", "citations": []}))
+        else:
+            degraded.append(result)
+
+    assessments = {
+        assessment.question_id: assessment
+        for assessment in assess_questions(
+            dataset, manifest, corpus_dir, EvaluationResults(results=degraded)
+        )
+    }
+
+    assert assessments["dev-single-001"].failed is True
+    assert assessments["dev-single-001"].failure_reasons == (
+        "citation_outside_gold",
+        "incomplete_gold_coverage",
+    )
+    assert assessments["dev-single-003"].failure_reasons == ("false_refusal",)
+    assert assessments["dev-no-permission-001"].failure_reasons == ()
+    assert assessments["dev-cross-001"].failure_reasons == ()
+
+
+def test_assess_questions_keeps_aggregate_metrics_unchanged() -> None:
+    dataset, manifest, corpus_dir = _bundle()
+    degraded: list[QuestionResult] = []
+    for result in _perfect_results(dataset).results:
+        if result.question_id == "dev-unanswerable-003":
+            degraded.append(
+                result.model_copy(
+                    update={
+                        "behavior": "answer",
+                        "answer_text": "旧办法按当年基本工资的2倍发放年终奖。",
+                    }
+                )
+            )
+        elif result.question_id == "dev-single-003":
+            degraded.append(result.model_copy(update={"behavior": "refuse", "citations": []}))
+        else:
+            degraded.append(result)
+
+    results = EvaluationResults(results=degraded)
+    assessments = {
+        assessment.question_id: assessment
+        for assessment in assess_questions(dataset, manifest, corpus_dir, results)
+    }
+    assert assessments["dev-unanswerable-003"].failure_reasons == (
+        "missed_refusal",
+        "permission_leak",
+    )
+    assert assessments["dev-unanswerable-003"].expected_behavior == "refuse"
+    assert assessments["dev-unanswerable-003"].actual_behavior == "answer"
+
+    metrics = compute_metrics(dataset, manifest, corpus_dir, results)
+    assert metrics.answered == 32
+    assert metrics.refused == 8
+    assert metrics.expected_answer == 32
+    assert metrics.expected_refuse == 8
+    assert metrics.refusal_accuracy == pytest.approx(7 / 8)
+    assert metrics.false_refusal_rate == pytest.approx(1 / 32)
+    assert metrics.citation_source_validity == 1.0
+    assert metrics.gold_source_coverage == pytest.approx(31 / 32)
+    assert metrics.permission_leak_count == 1
+
+
+def test_assess_questions_rejects_misaligned_results() -> None:
+    dataset, manifest, corpus_dir = _bundle()
+    results = _perfect_results(dataset)
+    missing = EvaluationResults(results=results.results[:-1])
+    extra = EvaluationResults(
+        results=[
+            *results.results,
+            QuestionResult(question_id="dev-unknown-999", behavior="refuse"),
+        ]
+    )
+    duplicated = EvaluationResults(results=[*results.results, results.results[0]])
+
+    for misaligned in (missing, extra, duplicated):
+        with pytest.raises(MetricsInputError):
+            assess_questions(dataset, manifest, corpus_dir, misaligned)
+
+
 # ---------------------------------------------------------------------------
 # 离线入口
 # ---------------------------------------------------------------------------
@@ -427,6 +534,62 @@ def test_cli_reports_metrics_with_results_file(tmp_path: Path) -> None:
     )
 
     assert main(["--dataset", str(_DATASET_PATH), "--results", str(results_path)]) == 0
+
+
+def test_cli_reports_failed_question_ids_with_reasons(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset, _, _ = _bundle()
+    degraded: list[QuestionResult] = []
+    for result in _perfect_results(dataset).results:
+        if result.question_id == "dev-single-001":
+            degraded.append(
+                result.model_copy(
+                    update={
+                        "citations": [
+                            ResultCitation(kb_id="kb-handbook", document_id="handbook", version=2)
+                        ]
+                    }
+                )
+            )
+        elif result.question_id == "dev-unanswerable-003":
+            degraded.append(
+                result.model_copy(
+                    update={
+                        "behavior": "answer",
+                        "answer_text": "旧办法按当年基本工资的2倍发放年终奖。",
+                    }
+                )
+            )
+        else:
+            degraded.append(result)
+    results_path = tmp_path / "results.json"
+    results_path.write_text(
+        EvaluationResults(results=degraded).model_dump_json(by_alias=True), encoding="utf-8"
+    )
+
+    assert main(["--dataset", str(_DATASET_PATH), "--results", str(results_path)]) == 0
+    output = capsys.readouterr().out
+
+    assert "failedQuestionIds=dev-single-001,dev-unanswerable-003" in output
+    assert "dev-single-001: citation_outside_gold,incomplete_gold_coverage" in output
+    assert "dev-unanswerable-003: missed_refusal,permission_leak" in output
+
+
+def test_cli_reports_none_when_no_question_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset, _, _ = _bundle()
+    results_path = tmp_path / "results.json"
+    results_path.write_text(
+        _perfect_results(dataset).model_dump_json(by_alias=True), encoding="utf-8"
+    )
+
+    assert main(["--dataset", str(_DATASET_PATH), "--results", str(results_path)]) == 0
+    output = capsys.readouterr().out
+
+    assert "failedQuestionIds=none" in output
+    assert "dev-" not in output.split("failedQuestionIds=", 1)[1]
 
 
 def test_cli_fails_on_missing_dataset(tmp_path: Path) -> None:

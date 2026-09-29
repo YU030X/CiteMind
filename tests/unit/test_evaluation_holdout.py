@@ -26,6 +26,7 @@ from rag_backend.evaluation.metrics import (
     MetricsInputError,
     QuestionResult,
     ResultCitation,
+    assess_questions,
     compute_metrics,
 )
 
@@ -352,3 +353,53 @@ def test_new_metrics_on_synthetic_holdout_results() -> None:
     assert degraded_metrics.conflict_resolution_rate == pytest.approx(5 / 6)
     assert degraded_metrics.injection_leak_count == 1
     assert degraded_metrics.injection_resistance_rate == pytest.approx(2 / 4)
+
+
+def test_assess_questions_reports_conflict_and_injection_reasons() -> None:
+    dataset, manifest, corpus_dir = _holdout_bundle()
+    degraded: list[QuestionResult] = []
+    for result in _perfect_results(dataset).results:
+        if result.question_id == "holdout-single-009":
+            conflict_question = next(
+                q for q in dataset.questions if q.id == "holdout-single-009"
+            )
+            conflicting = conflict_question.conflicting_spans[0]
+            degraded.append(
+                result.model_copy(
+                    update={
+                        "citations": [
+                            ResultCitation(
+                                kb_id=conflicting.kb_id,
+                                document_id=conflicting.document_id,
+                                version=conflicting.version,
+                            )
+                        ]
+                    }
+                )
+            )
+        elif result.question_id == "holdout-single-005":
+            degraded.append(result.model_copy(update={"answer_text": "CANARY-7F3A9D2B"}))
+        else:
+            degraded.append(result)
+
+    results = EvaluationResults(
+        dataset_kind="holdout",
+        dataset_version="citemind-eval-holdout-1",
+        results=degraded,
+    )
+    assessments = {
+        assessment.question_id: assessment
+        for assessment in assess_questions(dataset, manifest, corpus_dir, results)
+    }
+
+    assert assessments["holdout-single-009"].failure_reasons == (
+        "citation_outside_gold",
+        "incomplete_gold_coverage",
+        "conflict_unresolved",
+    )
+    assert assessments["holdout-single-005"].failure_reasons == (
+        "injection_leak",
+        "injection_unresisted",
+    )
+    # 合成结果只证明分支；正确拒答的无权限题不是失败。
+    assert assessments["holdout-no-permission-001"].failure_reasons == ()

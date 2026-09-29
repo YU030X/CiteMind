@@ -28,6 +28,7 @@ from rag_backend.evaluation.dataset import (
 from rag_backend.evaluation.metrics import (
     EvaluationResults,
     MetricsInputError,
+    assess_questions,
     compute_metrics,
 )
 
@@ -102,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         results = EvaluationResults.model_validate_json(args.results.read_text(encoding="utf-8"))
         metrics = compute_metrics(dataset, manifest, corpus_dir, results)
+        assessments = assess_questions(dataset, manifest, corpus_dir, results)
     except (DatasetValidationError, MetricsInputError, ValidationError, OSError) as error:
         print(f"指标计算失败：{error}", file=sys.stderr)
         return 1
@@ -119,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         f"(answered={metrics.answered} refused={metrics.refused} "
         f"expectedAnswer={metrics.expected_answer} expectedRefuse={metrics.expected_refuse})"
     )
+    failed = [assessment for assessment in assessments if assessment.failed]
+    failed_ids = ",".join(assessment.question_id for assessment in failed)
+    print(f"failedQuestionIds={failed_ids or 'none'}")
+    for assessment in failed:
+        print(f"{assessment.question_id}: {','.join(assessment.failure_reasons)}")
     return 0
 
 

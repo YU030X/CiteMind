@@ -27,4 +27,5 @@
 | [phase3-readonly-probe-cli-and-adapters](implemented/phase3-readonly-probe-cli-and-adapters.md) | Phase 3 第 4 片只读探针真实 adapter、DSN/身份/profile 护栏与 dry-run CLI、原子落盘 |
 | [phase3-offline-calibration-consumption](implemented/phase3-offline-calibration-consumption.md) | Phase 3 离线拒答标定消费链：`analysis` 可选 `--calibration`、dev 选点与 holdout 固定点边界 |
 | [phase3-offline-ablation-latency-degradation-summary](implemented/phase3-offline-ablation-latency-degradation-summary.md) | Phase 3 消融产物时延/降级默认汇总：nearest-rank p50/p95、`math.fsum` 均值与 stage 题数边界 |
+| [phase3-per-question-failure-diagnosis](implemented/phase3-per-question-failure-diagnosis.md) | Phase 3 逐题质量失败诊断：固定原因顺序、复用聚合谓词与不改聚合口径边界 |
 | [web-static-fetch](implemented/web-static-fetch.md) | 受限静态网页抓取、`locator_version=4` 与 DNS 竞态边界 |
