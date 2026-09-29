@@ -23,6 +23,7 @@ from rag_backend.api.documents import (
     UPLOAD_TOO_LARGE_MESSAGE,
     _ingestion_error,
     enforce_upload_body_limit,
+    require_document_editor,
     require_editor,
     router,
 )
@@ -73,7 +74,7 @@ from rag_backend.ingestion.validation import (
     validate_markdown_filename,
 )
 from rag_backend.knowledge.roles import KbRole
-from rag_backend.knowledge.service import KbAccess
+from rag_backend.knowledge.service import DocumentAccess, KbAccess
 from rag_backend.models.ingestion import IngestJob
 from rag_backend.models.knowledge import DocumentVersion
 from rag_backend.retrieval.keyword_analyzer import KeywordAnalyzerError
@@ -973,6 +974,7 @@ async def test_published_blob_survives_db_failure_without_unlink(
 
 UPLOAD_ORIGIN = "http://127.0.0.1"
 UPLOAD_KB_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+UPLOAD_DOCUMENT_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
 UPLOAD_BOUNDARY = "----unitupload"
 
 
@@ -1007,6 +1009,29 @@ def build_upload_app() -> Any:
         yield None
 
     app.dependency_overrides[require_editor] = fake_editor
+    app.dependency_overrides[require_csrf] = fake_csrf
+    app.dependency_overrides[get_database_session] = fake_session
+    return app
+
+
+def build_version_app() -> Any:
+    app = create_app(upload_settings())
+
+    async def fake_editor() -> DocumentAccess:
+        return DocumentAccess(
+            document_id=UPLOAD_DOCUMENT_ID,
+            kb_id=UPLOAD_KB_ID,
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            role=KbRole.EDITOR,
+        )
+
+    async def fake_csrf() -> None:
+        return None
+
+    async def fake_session() -> AsyncIterator[None]:
+        yield None
+
+    app.dependency_overrides[require_document_editor] = fake_editor
     app.dependency_overrides[require_csrf] = fake_csrf
     app.dependency_overrides[get_database_session] = fake_session
     return app
@@ -1198,6 +1223,96 @@ async def test_upload_pdf_dispatches_to_pdf_service(
 
     assert response.status_code == 202
     assert calls == ["pdf"]
+
+
+@pytest.mark.anyio
+async def test_upload_docx_dispatches_to_docx_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.docx 后缀分派到 create_docx_document，而不是 Markdown/PDF 路径。"""
+
+    from docx_samples import positive_simple_table
+
+    calls: list[str] = []
+
+    async def fake_docx(*args: object, **kwargs: object) -> object:
+        calls.append("docx")
+        return ingestion_service.UploadOutcome(
+            document_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            job_id=uuid.uuid4(),
+            reused=False,
+        )
+
+    async def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("DOCX 上传不得走 Markdown/PDF 分支")
+
+    monkeypatch.setattr(ingestion_service, "create_docx_document", fake_docx)
+    monkeypatch.setattr(ingestion_service, "create_markdown_document", forbidden)
+    monkeypatch.setattr(ingestion_service, "create_pdf_document", forbidden)
+
+    app = build_upload_app()
+    body = multipart_body(
+        multipart_part("title", data="指南".encode()),
+        multipart_part("file", filename="guide.docx", data=positive_simple_table()),
+    )
+    response = await post_upload(
+        app,
+        content_type=f"multipart/form-data; boundary={UPLOAD_BOUNDARY}",
+        body=body,
+    )
+
+    assert response.status_code == 202, response.text
+    assert calls == ["docx"]
+
+
+@pytest.mark.anyio
+async def test_docx_version_dispatches_to_docx_version_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.docx 新版本分派到 create_docx_version，而不是 Markdown/PDF 分支。"""
+
+    from docx_samples import positive_simple_table
+
+    calls: list[str] = []
+
+    async def fake_docx_version(*args: object, **kwargs: object) -> object:
+        calls.append("docx_version")
+        return ingestion_service.UploadOutcome(
+            document_id=uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            job_id=uuid.uuid4(),
+            reused=False,
+        )
+
+    async def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("DOCX 新版本不得走 Markdown/PDF 分支")
+
+    monkeypatch.setattr(ingestion_service, "create_docx_version", fake_docx_version)
+    monkeypatch.setattr(ingestion_service, "create_markdown_version", forbidden)
+    monkeypatch.setattr(ingestion_service, "create_pdf_version", forbidden)
+
+    app = build_version_app()
+    body = multipart_body(
+        multipart_part("title", data="指南".encode()),
+        multipart_part("expectedVersionId", data=str(UPLOAD_DOCUMENT_ID).encode()),
+        multipart_part("file", filename="guide.docx", data=positive_simple_table()),
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url=UPLOAD_ORIGIN
+    ) as client:
+        response = await client.post(
+            f"/api/v1/documents/{UPLOAD_DOCUMENT_ID}/versions",
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={UPLOAD_BOUNDARY}",
+                "Origin": UPLOAD_ORIGIN,
+                "Idempotency-Key": "unit-version-key",
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert calls == ["docx_version"]
 
 
 @pytest.mark.anyio

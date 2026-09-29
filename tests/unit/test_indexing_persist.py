@@ -55,6 +55,7 @@ class FakeIdentity:
     profile = PROFILE
     parser_version = "markdown-it-py-4.2.0-v1"
     pdf_parser_version = "pypdf-6.19.0-v1"
+    docx_parser_version = "python-docx-1.2.0-v1"
     token_counter = FakeCounter()
     keyword_analyzer = FakeAnalyzer()
 

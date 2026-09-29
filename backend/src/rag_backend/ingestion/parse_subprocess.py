@@ -30,7 +30,14 @@ import sys
 from collections.abc import Mapping
 from typing import Final
 
-from rag_backend.ingestion.parsing import ParsedBlock, ParsedDocument, parse_markdown
+from rag_backend.ingestion.docx_parsing import (
+    DocxInvalidError,
+    DocxParsingError,
+    DocxTooLargeError,
+    DocxUnsupportedError,
+    parse_docx,
+)
+from rag_backend.ingestion.parsing import DocxCellSpan, ParsedBlock, ParsedDocument, parse_markdown
 from rag_backend.ingestion.pdf_parsing import (
     PdfEncryptedError,
     PdfParsingError,
@@ -43,6 +50,7 @@ from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES
 PARSE_SUBPROCESS_MODULE: Final = "rag_backend.ingestion.parse_subprocess"
 SOURCE_TYPE_MARKDOWN: Final = "markdown"
 SOURCE_TYPE_PDF: Final = "pdf"
+SOURCE_TYPE_DOCX: Final = "docx"
 
 # 解析硬时限与返回体上限；返回体上限覆盖 JSON 转义膨胀（CJK 不转义，控制字符会转义）。
 PARSE_TIMEOUT_SECONDS: Final = 60.0
@@ -57,6 +65,9 @@ EXIT_INTERNAL_ERROR: Final = 1
 EXIT_PDF_ENCRYPTED: Final = 5
 EXIT_PDF_TOO_MANY_PAGES: Final = 6
 EXIT_PDF_INVALID: Final = 7
+# DOCX 具名退出码：收窄子集外的结构与无效/超限包分开，父进程映射为可区分静态失败。
+EXIT_DOCX_UNSUPPORTED: Final = 8
+EXIT_DOCX_INVALID: Final = 9
 
 # 子进程环境白名单：只保留解释器与临时目录所需键，剥离任何业务凭据。
 _SAFE_ENV_KEYS: Final = (
@@ -104,6 +115,18 @@ class PdfInvalidSubprocessError(PdfSubprocessError):
     """子进程判定 PDF 结构损坏或无法解析。"""
 
 
+class DocxSubprocessError(ParseSubprocessError):
+    """父进程对 DOCX 子进程具名退出码的静态映射基类。"""
+
+
+class DocxUnsupportedSubprocessError(DocxSubprocessError):
+    """子进程判定 DOCX 属于刻意不收窄支持的结构（嵌套表、宏、实体等）。"""
+
+
+class DocxInvalidSubprocessError(DocxSubprocessError):
+    """子进程判定 DOCX 无效、超限或 CRC/XML 损坏。"""
+
+
 def sanitized_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
     """按白名单构造子进程环境，剥离业务凭据与 DSN。"""
 
@@ -130,6 +153,18 @@ def _serialize(document: ParsedDocument) -> dict[str, object]:
                 "level": block.level,
                 "code_info": block.code_info,
                 "page": block.page,
+                "paragraph_index": block.paragraph_index,
+                "table_index": block.table_index,
+                "row_index": block.row_index,
+                "cells": [
+                    {
+                        "grid_column": cell.grid_column,
+                        "grid_span": cell.grid_span,
+                        "char_start": cell.char_start,
+                        "char_end": cell.char_end,
+                    }
+                    for cell in block.cells
+                ],
             }
             for block in document.blocks
         ],
@@ -147,7 +182,7 @@ def _deserialize(payload: object, *, text: str) -> ParsedDocument:
     raw_blocks = payload.get("blocks")
     if not isinstance(source_sha256, str) or not isinstance(parser_version, str):
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
-    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF):
+    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX):
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
     if not isinstance(raw_blocks, list):
         raise ParseSubprocessFailed("解析子进程返回结构不合法")
@@ -167,11 +202,21 @@ def _deserialize(payload: object, *, text: str) -> ParsedDocument:
             start_line = raw.get("start_line")
             end_line = raw.get("end_line")
             page = raw.get("page")
+            paragraph_index = raw.get("paragraph_index")
+            table_index = raw.get("table_index")
+            row_index = raw.get("row_index")
             if level is not None and not isinstance(level, int):
                 raise ParseSubprocessFailed("解析子进程返回结构不合法")
             if code_info is not None and not isinstance(code_info, str):
                 raise ParseSubprocessFailed("解析子进程返回结构不合法")
-            for value in (start_line, end_line, page):
+            for value in (
+                start_line,
+                end_line,
+                page,
+                paragraph_index,
+                table_index,
+                row_index,
+            ):
                 if value is not None and not isinstance(value, int):
                     raise ParseSubprocessFailed("解析子进程返回结构不合法")
             blocks.append(
@@ -186,6 +231,10 @@ def _deserialize(payload: object, *, text: str) -> ParsedDocument:
                     level=level,
                     code_info=code_info,
                     page=page,
+                    paragraph_index=paragraph_index,
+                    table_index=table_index,
+                    row_index=row_index,
+                    cells=_cells_from_raw(raw.get("cells", [])),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -200,10 +249,52 @@ def _deserialize(payload: object, *, text: str) -> ParsedDocument:
     )
 
 
+def _cells_from_raw(raw_cells: object) -> tuple[DocxCellSpan, ...]:
+    """严格校验子进程回传的 DOCX 单元格位置；不合法直接静态失败。"""
+
+    if not isinstance(raw_cells, list):
+        raise ParseSubprocessFailed("解析子进程返回结构不合法")
+    cells: list[DocxCellSpan] = []
+    for raw in raw_cells:
+        if not isinstance(raw, dict):
+            raise ParseSubprocessFailed("解析子进程返回结构不合法")
+        try:
+            grid_column = int(raw["grid_column"])
+            grid_span = int(raw["grid_span"])
+            char_start = int(raw["char_start"])
+            char_end = int(raw["char_end"])
+        except (KeyError, TypeError, ValueError):
+            raise ParseSubprocessFailed("解析子进程返回结构不合法") from None
+        if grid_column < 1 or grid_span < 1 or char_start < 0 or char_end < char_start:
+            raise ParseSubprocessFailed("解析子进程返回结构不合法")
+        cells.append(
+            DocxCellSpan(
+                grid_column=grid_column,
+                grid_span=grid_span,
+                char_start=char_start,
+                char_end=char_end,
+            )
+        )
+    return tuple(cells)
+
+
 def _read_bounded_stdin() -> bytes:
     """从 stdin 最多读取 ``MAX_DOCUMENT_BYTES + 1`` 字节。"""
 
     return sys.stdin.buffer.read(MAX_DOCUMENT_BYTES + 1)
+
+
+def _parse_docx_or_raise(data: bytes) -> ParsedDocument:
+    """调用 DOCX 解析并把具名错误转成子进程退出码。"""
+
+    try:
+        return parse_docx(data)
+    except DocxUnsupportedError:
+        raise _ExitWithCode(EXIT_DOCX_UNSUPPORTED) from None
+    except (DocxTooLargeError, DocxInvalidError):
+        raise _ExitWithCode(EXIT_DOCX_INVALID) from None
+    except DocxParsingError:
+        raise _ExitWithCode(EXIT_DOCX_INVALID) from None
 
 
 def _parse_pdf_or_raise(data: bytes) -> ParsedDocument:
@@ -236,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = sys.argv[1:] if argv is None else argv
     source_type = arguments[0] if arguments else SOURCE_TYPE_MARKDOWN
-    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF):
+    if source_type not in (SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX):
         return EXIT_INVALID_INPUT
     try:
         data = _read_bounded_stdin()
@@ -247,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if source_type == SOURCE_TYPE_PDF:
             document = _parse_pdf_or_raise(data)
+        elif source_type == SOURCE_TYPE_DOCX:
+            document = _parse_docx_or_raise(data)
         else:
             document = parse_markdown(data)
     except _ExitWithCode as exit_error:
@@ -327,6 +420,26 @@ def parse_pdf_in_subprocess(
     )
 
 
+def parse_docx_in_subprocess(
+    content: bytes,
+    *,
+    timeout_seconds: float = PARSE_TIMEOUT_SECONDS,
+    environment: Mapping[str, str] | None = None,
+) -> ParsedDocument:
+    """在独立子进程中按段落/表格行解析 DOCX；嵌套表/宏/实体/损坏映射为具名静态失败。
+
+    与 Markdown/PDF 共用同一硬时限、环境白名单与返回体上限；``text`` 不回传，父进程用空串
+    重建，chunk 只依赖 ``blocks`` 与 ``source_sha256``。
+    """
+
+    return _parse_in_subprocess(
+        content,
+        source_type=SOURCE_TYPE_DOCX,
+        timeout_seconds=timeout_seconds,
+        environment=environment,
+    )
+
+
 def _parse_in_subprocess(
     content: bytes,
     *,
@@ -384,6 +497,10 @@ def _map_nonzero_exit(returncode: int) -> ParseSubprocessError:
         return PdfTooManyPagesSubprocessError("PDF 页数超过上限")
     if returncode == EXIT_PDF_INVALID:
         return PdfInvalidSubprocessError("PDF 结构损坏")
+    if returncode == EXIT_DOCX_UNSUPPORTED:
+        return DocxUnsupportedSubprocessError("DOCX 属于不收窄支持的结构")
+    if returncode == EXIT_DOCX_INVALID:
+        return DocxInvalidSubprocessError("DOCX 无效或损坏")
     return ParseSubprocessFailed("解析子进程以非零状态退出")
 
 

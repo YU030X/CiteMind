@@ -59,7 +59,7 @@ class Document(CreatedAtMixin, UpdatedAtMixin, Base):
     __tablename__ = "document"
     __table_args__ = (
         CheckConstraint(
-            "source_type IN ('markdown', 'pdf')", name="source_type"
+            "source_type IN ('markdown', 'pdf', 'docx')", name="source_type"
         ),
         CheckConstraint(
             "lifecycle_status IN ('CREATED', 'INDEXING', 'READY', 'FAILED', 'DELETED')",

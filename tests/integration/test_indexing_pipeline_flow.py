@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 import threading
 import uuid
 from collections.abc import Iterator
@@ -26,6 +27,7 @@ from database_roles_guard import (
 )
 from rag_backend.database import SyncSessionFactory, create_sync_session_factory
 from rag_backend.ingestion import indexing_worker as iw
+from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
 from rag_backend.ingestion.embedding_client import (
     EmbeddingBusyError,
     EmbeddingPermanentError,
@@ -37,9 +39,12 @@ from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy import Engine, create_engine, text
 from test_core_migration import alembic_config, alembic_revision, business_tables
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
+from docx_samples import nested_table_docx, positive_samples  # noqa: E402
+
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260925_0007"
+SCHEMA_REVISION = "20260929_0013"
 
 PROFILE = IndexProfileContract(
     embedding_model="test/model",
@@ -88,6 +93,7 @@ class FakeIdentity:
     profile: IndexProfileContract
     parser_version: str
     pdf_parser_version: str
+    docx_parser_version: str
     token_counter: FakeCounter
     keyword_analyzer: FakeAnalyzer
 
@@ -159,6 +165,9 @@ def clean_business_rows(pipeline_schema: Engine) -> Iterator[None]:
     with pipeline_schema.begin() as connection:
         connection.execute(text(TRUNCATE_SQL))
     yield
+    # 测试后也清空：migration 0013 的 downgrade 会在存在 docx 行时拒绝，必须先清数据再降级。
+    with pipeline_schema.begin() as connection:
+        connection.execute(text(TRUNCATE_SQL))
 
 
 @pytest.fixture(scope="module")
@@ -230,7 +239,10 @@ def seed_job(
     job_id = uuid.uuid4()
     file_hash = hashlib.sha256(content).hexdigest()
     file_ref = storage.blob_ref(kb_id, file_hash)
-    mime = "application/pdf" if source_type == "pdf" else "text/markdown"
+    mime = {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }.get(source_type, "text/markdown")
     if write_blob:
         storage.publish(kb_id, file_hash, content)
 
@@ -324,6 +336,7 @@ def make_dependencies(
         profile=PROFILE,
         parser_version=MARKDOWN_PARSER_VERSION,
         pdf_parser_version="pypdf-6.19.0-v1",
+        docx_parser_version="python-docx-1.2.0-v1",
         token_counter=FakeCounter(),
         keyword_analyzer=FakeAnalyzer(),
     )
@@ -1001,3 +1014,75 @@ def test_pdf_zero_text_marks_version_needs_ocr(
     assert version_status == "NEEDS_OCR"
     assert count_rows(pipeline_schema, "index_generation", "version_id", seeded.version_id) == 0
     assert read_document(pipeline_schema, seeded.document_id)["lifecycle_status"] == "FAILED"
+
+
+def test_docx_pipeline_publishes_ready_for_all_positive_samples(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    """真实解析子进程（假编码器）把 5 份自制 DOCX 正样本发布为 READY，并落 v3 locator。"""
+
+    for name, raw in positive_samples().items():
+        seeded = seed_job(
+            pipeline_schema,
+            storage,
+            parser_version=DOCX_PARSER_VERSION,
+            source_type="docx",
+            content=raw,
+        )
+        dependencies = make_dependencies(worker_sessions, storage)
+
+        status = iw.process_ingest_event(
+            dependencies, job_id=seeded.job_id, event_id=str(uuid.uuid4())
+        )
+
+        assert status == iw.PROCESS_STATUS_READY, name
+        assert read_job(pipeline_schema, seeded.job_id)["status"] == "READY"
+        document = read_document(pipeline_schema, seeded.document_id)
+        assert document["active_version_id"] == seeded.version_id
+        with pipeline_schema.connect() as connection:
+            locators = [
+                row[0]
+                for row in connection.execute(
+                    text(
+                        "SELECT source_locator FROM chunk WHERE document_id = :id "
+                        "ORDER BY chunk_index"
+                    ),
+                    {"id": seeded.document_id},
+                )
+            ]
+        assert locators, name
+        for locator in locators:
+            assert locator["locator_version"] == 3, name
+            assert locator["source_type"] == "docx", name
+            assert "start_line" not in locator
+            assert "pages" not in locator
+            assert locator["segments"]
+
+
+def test_docx_pipeline_nested_table_fails_unsupported(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    """嵌套表是收窄子集外的结构：静态失败，不索引残缺内容。"""
+
+    seeded = seed_job(
+        pipeline_schema,
+        storage,
+        parser_version=DOCX_PARSER_VERSION,
+        source_type="docx",
+        content=nested_table_docx(),
+    )
+    dependencies = make_dependencies(worker_sessions, storage)
+
+    status = iw.process_ingest_event(
+        dependencies, job_id=seeded.job_id, event_id=str(uuid.uuid4())
+    )
+
+    assert status == iw.PROCESS_STATUS_FAILED
+    job = read_job(pipeline_schema, seeded.job_id)
+    assert job["status"] == "FAILED"
+    assert job["error_code"] == iw.ERROR_PIPELINE_DOCX_UNSUPPORTED
+    assert count_rows(pipeline_schema, "index_generation", "version_id", seeded.version_id) == 0

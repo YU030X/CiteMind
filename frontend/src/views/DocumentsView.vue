@@ -179,7 +179,7 @@ function onUploadFileChange(event: Event): void {
   uploadFile.value = file;
   uploadError.value = "";
   if (file !== null && uploadTitle.value.trim() === "") {
-    uploadTitle.value = file.name.replace(/\.(md|markdown|pdf)$/i, "");
+    uploadTitle.value = file.name.replace(/\.(md|markdown|pdf|docx)$/i, "");
   }
 }
 
@@ -193,7 +193,7 @@ async function submitUpload(): Promise<void> {
     return;
   }
   if (file === null) {
-    uploadError.value = "请选择 .md、.markdown 或 .pdf 文件";
+    uploadError.value = "请选择 .md、.markdown、.pdf 或 .docx 文件";
     return;
   }
   if (title === "") {
@@ -273,7 +273,7 @@ async function submitVersion(): Promise<void> {
     return;
   }
   if (file === null) {
-    versionFormError.value = "请选择新版本的 .md、.markdown 或 .pdf 文件";
+    versionFormError.value = "请选择新版本的 .md、.markdown、.pdf 或 .docx 文件";
     return;
   }
 
@@ -378,7 +378,7 @@ async function confirmDelete(): Promise<void> {
       <div class="flex flex-col gap-1">
         <h1 class="text-lg font-medium">文档管理</h1>
         <p class="text-sm text-muted-foreground">
-          查看当前知识库的接收与处理状态；当前仅支持 Markdown 与 PDF。
+          查看当前知识库的接收与处理状态；当前仅支持 Markdown、PDF 与 DOCX。
         </p>
       </div>
 
@@ -467,6 +467,7 @@ async function confirmDelete(): Promise<void> {
             <SelectItem value="all">全部类型</SelectItem>
             <SelectItem value="markdown">Markdown</SelectItem>
             <SelectItem value="pdf">PDF</SelectItem>
+            <SelectItem value="docx">DOCX</SelectItem>
           </SelectContent>
         </Select>
 
@@ -620,13 +621,13 @@ async function confirmDelete(): Promise<void> {
               {{ uploadFile === null ? "选择文件" : uploadFile.name }}
             </span>
             <span class="text-xs text-muted-foreground">
-              仅支持 Markdown（.md / .markdown，UTF-8 文本）与 PDF（.pdf，≤ 20 MB）
+              仅支持 Markdown（.md / .markdown）、PDF（.pdf）与 DOCX（.docx），≤ 20 MB
             </span>
             <input
               :key="uploadInputKey"
               type="file"
               class="sr-only"
-              accept=".md,.markdown,.pdf"
+              accept=".md,.markdown,.pdf,.docx"
               :disabled="uploadPending"
               @change="onUploadFileChange"
             />
@@ -682,13 +683,13 @@ async function confirmDelete(): Promise<void> {
             <UploadIcon class="size-5 text-muted-foreground" />
             <span class="text-sm">{{ versionFile === null ? "选择新版本文件" : versionFile.name }}</span>
             <span class="text-xs text-muted-foreground">
-              仅支持 Markdown（.md / .markdown）与 PDF（.pdf，≤ 20 MB）
+              仅支持 Markdown（.md / .markdown）、PDF（.pdf）与 DOCX（.docx），≤ 20 MB
             </span>
             <input
               :key="versionInputKey"
               type="file"
               class="sr-only"
-              accept=".md,.markdown,.pdf"
+              accept=".md,.markdown,.pdf,.docx"
               :disabled="versionPending"
               @change="onVersionFileChange"
             />

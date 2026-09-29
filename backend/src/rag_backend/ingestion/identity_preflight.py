@@ -5,7 +5,8 @@
 ``document.source_type``、``document_version.parser_version`` 与 ``index_profile`` 行，
 把结果作为普通数据传入；本模块返回互斥的静态判定枚举。``expected`` 契约由 worker
 启动时构造并校验一次后注入，``expected_parser_version`` 由调用方按 ``source_type`` 选定
-当前实现版本（``markdown`` 用 ``MARKDOWN_PARSER_VERSION``，``pdf`` 用 ``PDF_PARSER_VERSION``），
+当前实现版本（``markdown`` 用 ``MARKDOWN_PARSER_VERSION``，``pdf`` 用 ``PDF_PARSER_VERSION``，
+``docx`` 用 ``DOCX_PARSER_VERSION``），
 因此本模块不导入解析、模型或数据库依赖，导入期只引入标准库。
 
 判定优先级（前者命中即返回，保证互斥）：
@@ -36,8 +37,9 @@ if TYPE_CHECKING:
 # 当前受支持的来源类型；字面量与 ``rag_backend.ingestion.service`` 的同名常量由单测交叉约束。
 SOURCE_TYPE_MARKDOWN: Final = "markdown"
 SOURCE_TYPE_PDF: Final = "pdf"
+SOURCE_TYPE_DOCX: Final = "docx"
 SUPPORTED_SOURCE_TYPES: Final[frozenset[str]] = frozenset(
-    {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF}
+    {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX}
 )
 
 

@@ -9,6 +9,7 @@ Idempotency-Key 复用/冲突/跨 KB 隔离、不同 key 同内容复用 KB 私�
 
 import asyncio
 import hashlib
+import sys
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -36,11 +37,15 @@ from test_core_migration import (
     business_tables,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
+from docx_samples import positive_simple_table  # noqa: E402
+
 pytestmark = pytest.mark.integration
 
 # 上传事务的 ORM 写入 ``ingest_job.profile_id``（0006）、受理时刻的 ``request_title``
-# （0008），并依赖 ``document.acl_mode`` 的 server default（0012）；因此上传片建在当前 head。
-SCHEMA_REVISION = "20260928_0012"
+# （0008），并依赖 ``document.acl_mode`` 的 server default（0012）；DOCX 上传还需 ``source_type``
+# 允许 ``docx``（0013），因此上传片建在当前 head。
+SCHEMA_REVISION = "20260929_0013"
 
 # 默认 index profile 契约与其规范 JSON 的 SHA-256；与 profile 契约/登记聚焦测试一致。
 GOLDEN_CONFIG_HASH = "4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa"
@@ -96,6 +101,10 @@ def open_upload_schema(
     finally:
         try:
             if owns_schema:
+                # migration 0013 的 downgrade 在存在 docx 行时会拒绝（不删数据）；测试库先清空
+                # document 及其依赖，再降级到 base。这里只作用于被独占的空库守卫。
+                with engine.begin() as connection:
+                    connection.execute(text("TRUNCATE document CASCADE"))
                 # best-effort：即使升级/前置之后的步骤失败，也必须尝试降回 base。
                 command.downgrade(config, "base")
                 assert_empty_schema(engine)
@@ -835,8 +844,8 @@ async def test_invalid_content_and_type_create_nothing(
             client,
             kb_id,
             idempotency_key=unique_key(),
-            filename="notes.docx",
-            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename="notes.rtf",
+            content_type="application/rtf",
             csrf=csrf,
         )
         wrong_pdf = await upload(
@@ -1105,6 +1114,79 @@ async def test_editor_upload_pdf_writes_pdf_facts(
     assert version["mime"] == "application/pdf"
     assert version["parser_version"] == PDF_PARSER_VERSION
     assert (blob_directory / f"{kb_id}/{digest}").read_bytes() == raw
+
+
+@pytest.mark.anyio
+async def test_editor_upload_docx_writes_docx_facts(
+    upload_schema: Engine, upload_settings: Settings, blob_directory: Path
+) -> None:
+    """``.docx`` 后缀上传登记 ``source_type=docx``、DOCX MIME 与真实 DOCX 解析器版本。"""
+
+    from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
+
+    raw = positive_simple_table()
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        response = await upload(
+            client,
+            kb_id,
+            idempotency_key=unique_key(),
+            title="DOCX 指南",
+            content=raw,
+            filename="guide.docx",
+            content_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            csrf=csrf,
+        )
+
+    assert response.status_code == 202, response.text
+    document_id = uuid.UUID(response.json()["documentId"])
+    version_id = uuid.UUID(response.json()["versionId"])
+    assert document_row(upload_schema, document_id)["source_type"] == "docx"
+    digest = hashlib.sha256(raw).hexdigest()
+    version = version_row(upload_schema, version_id)
+    assert version["mime"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert version["parser_version"] == DOCX_PARSER_VERSION
+    assert (blob_directory / f"{kb_id}/{digest}").read_bytes() == raw
+
+
+@pytest.mark.anyio
+async def test_editor_upload_docx_with_bad_zip_is_rejected(
+    upload_schema: Engine, upload_settings: Settings
+) -> None:
+    """``.docx`` 后缀但不是可识别 ZIP 包：422，不落库。"""
+
+    username = unique_username()
+    user_id = seed_user(upload_schema, username=username)
+    kb_id = seed_kb(upload_schema, name=unique_name())
+    seed_member(upload_schema, kb_id=kb_id, user_id=user_id, role="EDITOR")
+    before = count_rows(upload_schema, "document")
+
+    async with api_client(upload_settings) as client:
+        csrf = await login_csrf(client, username)
+        response = await upload(
+            client,
+            kb_id,
+            idempotency_key=unique_key(),
+            content=b"PK\x03\x04broken",
+            filename="guide.docx",
+            content_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            csrf=csrf,
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "DOCUMENT_NOT_DOCX"
+    assert count_rows(upload_schema, "document") == before
 
 
 @pytest.mark.anyio

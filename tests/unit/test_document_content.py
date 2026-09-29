@@ -189,6 +189,30 @@ async def test_explicit_version_downloads_pdf_attachment(
 
 
 @pytest.mark.anyio
+async def test_docx_download_uses_docx_media_type(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = FakeContentRepository(
+        [_target(source_type="docx"), _target(source_type="docx")]
+    )
+    store = FakeStore(content=b"PK\x03\x04docx")
+    app, _ = _app(
+        monkeypatch, repository=repository, store=store, storage_directory=str(tmp_path)
+    )
+
+    async with _client(app) as client:
+        response = await client.get(f"/api/v1/documents/{DOC_ID}/content")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="document-{DOC_ID}.docx"'
+    )
+
+
+@pytest.mark.anyio
 async def test_unauthorized_or_deleted_returns_404(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -266,7 +290,7 @@ async def test_default_version_revocation_after_read_returns_404(
 async def test_unknown_source_type_returns_static_500(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repository = FakeContentRepository([_target(source_type="docx"), _target(source_type="docx")])
+    repository = FakeContentRepository([_target(source_type="html"), _target(source_type="html")])
     store = FakeStore(content=b"raw")
     app, _ = _app(
         monkeypatch, repository=repository, store=store, storage_directory=str(tmp_path)

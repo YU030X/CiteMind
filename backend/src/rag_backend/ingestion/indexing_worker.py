@@ -59,6 +59,7 @@ from rag_backend.ingestion.chunking import (
     build_model_input,
     chunk_markdown,
 )
+from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
 from rag_backend.ingestion.embedding_client import (
     EmbeddingBusyError,
     EmbeddingClientError,
@@ -76,11 +77,14 @@ from rag_backend.ingestion.identity_preflight import (
     decide_profile_identity,
 )
 from rag_backend.ingestion.parse_subprocess import (
+    DocxInvalidSubprocessError,
+    DocxUnsupportedSubprocessError,
     ParseSubprocessError,
     ParseSubprocessTimeout,
     PdfEncryptedSubprocessError,
     PdfInvalidSubprocessError,
     PdfTooManyPagesSubprocessError,
+    parse_docx_in_subprocess,
     parse_markdown_in_subprocess,
     parse_pdf_in_subprocess,
 )
@@ -88,6 +92,7 @@ from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION, ParsedDocumen
 from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore, InvalidBlobReference
 from rag_backend.ingestion.validation import (
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     parse_version_dedupe_key,
@@ -151,6 +156,9 @@ ERROR_PIPELINE_PARSE_FAILED: Final = "PIPELINE_PARSE_FAILED"
 ERROR_PIPELINE_PDF_ENCRYPTED: Final = "PIPELINE_PDF_ENCRYPTED"
 ERROR_PIPELINE_PDF_TOO_MANY_PAGES: Final = "PIPELINE_PDF_TOO_MANY_PAGES"
 ERROR_PIPELINE_PDF_INVALID: Final = "PIPELINE_PDF_INVALID"
+# DOCX 具名静态失败：嵌套表/宏/实体声明等收窄外结构可区分地静态失败。
+ERROR_PIPELINE_DOCX_UNSUPPORTED: Final = "PIPELINE_DOCX_UNSUPPORTED"
+ERROR_PIPELINE_DOCX_INVALID: Final = "PIPELINE_DOCX_INVALID"
 ERROR_PIPELINE_NEEDS_OCR: Final = "PIPELINE_NEEDS_OCR"
 # 已领取任务后发生数据库错误，未能完成：尝试落这个静态诊断码。
 ERROR_PIPELINE_DB_ERROR: Final = "PIPELINE_DB_ERROR"
@@ -191,6 +199,9 @@ class ResolvedIdentity(Protocol):
 
     @property
     def pdf_parser_version(self) -> str: ...
+
+    @property
+    def docx_parser_version(self) -> str: ...
 
     @property
     def token_counter(self) -> chunking.TokenCounter: ...
@@ -1367,8 +1378,8 @@ def load_ingest_identity() -> ResolvedIdentity:
 class PipelineDependencies:
     """一次管线执行所需的可注入依赖；生产入口负责构造真实实现。
 
-    ``parse_document`` 是 Markdown 解析入口，``parse_pdf_document`` 是 PDF 解析入口；管线
-    按 ``document.source_type`` 分派，两者都默认走受控子进程。
+    ``parse_document`` 是 Markdown 解析入口，``parse_pdf_document``/``parse_docx_document``
+    分别是 PDF/DOCX 解析入口；管线按 ``document.source_type`` 分派，都默认走受控子进程。
     """
 
     session_factory: SyncSessionFactory
@@ -1377,6 +1388,7 @@ class PipelineDependencies:
     embedder_factory: EmbedderFactory
     parse_document: ParseDocument = parse_markdown_in_subprocess
     parse_pdf_document: ParseDocument = parse_pdf_in_subprocess
+    parse_docx_document: ParseDocument = parse_docx_in_subprocess
 
 
 def process_ingest_event(
@@ -1399,6 +1411,7 @@ def process_ingest_event(
         expected_parser_versions={
             SOURCE_TYPE_MARKDOWN: MARKDOWN_PARSER_VERSION,
             SOURCE_TYPE_PDF: PDF_PARSER_VERSION,
+            SOURCE_TYPE_DOCX: DOCX_PARSER_VERSION,
         },
         lease_seconds=lease_seconds,
     )
@@ -1428,6 +1441,8 @@ def process_ingest_event(
         expected_parser_version = (
             identity.pdf_parser_version
             if claimed.source_type == SOURCE_TYPE_PDF
+            else identity.docx_parser_version
+            if claimed.source_type == SOURCE_TYPE_DOCX
             else identity.parser_version
         )
         try:
@@ -1478,6 +1493,12 @@ def process_ingest_event(
                         claimed.kb_id, claimed.file_ref, claimed.file_hash
                     )
                 )
+            elif claimed.source_type == SOURCE_TYPE_DOCX:
+                parsed = dependencies.parse_docx_document(
+                    dependencies.storage.read_verified_docx(
+                        claimed.kb_id, claimed.file_ref, claimed.file_hash
+                    )
+                )
             else:
                 markdown_text = dependencies.storage.read_verified_markdown(
                     claimed.kb_id, claimed.file_ref, claimed.file_hash
@@ -1522,6 +1543,22 @@ def process_ingest_event(
                 job_id=job_id,
                 lease_token=lease_token,
                 error_code=ERROR_PIPELINE_PDF_INVALID,
+            )
+        except DocxUnsupportedSubprocessError:
+            return _fail(
+                session_factory,
+                heartbeat,
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=ERROR_PIPELINE_DOCX_UNSUPPORTED,
+            )
+        except DocxInvalidSubprocessError:
+            return _fail(
+                session_factory,
+                heartbeat,
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=ERROR_PIPELINE_DOCX_INVALID,
             )
         except ParseSubprocessError:
             return _fail(
@@ -1776,6 +1813,8 @@ __all__ = [
     "ERROR_PIPELINE_BLOB_INVALID",
     "ERROR_PIPELINE_CONTENT_EMPTY",
     "ERROR_PIPELINE_DB_ERROR",
+    "ERROR_PIPELINE_DOCX_INVALID",
+    "ERROR_PIPELINE_DOCX_UNSUPPORTED",
     "ERROR_PIPELINE_EMBEDDING_FAILED",
     "ERROR_PIPELINE_IDENTITY_UNAVAILABLE",
     "ERROR_PIPELINE_NEEDS_OCR",

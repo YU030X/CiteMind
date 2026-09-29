@@ -272,6 +272,7 @@ def identity_for_job(engine: Engine, job_id: uuid.UUID) -> FakeIdentity:
         profile=contract,
         parser_version=MARKDOWN_PARSER_VERSION,
         pdf_parser_version="pypdf-6.19.0-v1",
+        docx_parser_version="python-docx-1.2.0-v1",
         token_counter=FakeCounter(),
         keyword_analyzer=PipelineAnalyzer(),
     )

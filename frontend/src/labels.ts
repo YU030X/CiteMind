@@ -37,6 +37,7 @@ const JOB_LABELS: Record<JobStatus, string> = {
 const SOURCE_TYPE_LABELS: Record<SourceType, string> = {
   markdown: "Markdown",
   pdf: "PDF",
+  docx: "DOCX",
 };
 
 /** 后端 `ingest_job.error_code` 的静态诊断码映射；未知码原样展示并标注“诊断码”。 */
@@ -64,6 +65,8 @@ const JOB_ERROR_LABELS: Record<string, string> = {
   PIPELINE_PDF_ENCRYPTED: "PDF 已加密",
   PIPELINE_PDF_TOO_MANY_PAGES: "PDF 页数超过上限",
   PIPELINE_PDF_INVALID: "PDF 文件损坏",
+  PIPELINE_DOCX_UNSUPPORTED: "DOCX 含不支持的结构（如嵌套表格）",
+  PIPELINE_DOCX_INVALID: "DOCX 文件损坏或超出安全上限",
   PIPELINE_NEEDS_OCR: "没有可提取文本层，需要 OCR",
   PIPELINE_DB_ERROR: "入库数据库错误",
   PIPELINE_RETRY_EXHAUSTED: "处理中断已耗尽重试",
@@ -151,11 +154,13 @@ export function formatTime(value: string | null): string {
 export type LocatorView =
   | { kind: "lines"; text: string }
   | { kind: "pages"; text: string }
+  | { kind: "blocks"; text: string }
   | { kind: "raw"; text: string };
 
 /**
  * 只按 locator_version 解释已知键集合：
- * v1 是 Markdown 块级 1-based 闭区间行范围，v2 是 PDF 页号；其余原样展示，绝不猜。
+ * v1 是 Markdown 块级 1-based 闭区间行范围，v2 是 PDF 页号，
+ * v3 是 DOCX 的段落/表格行位置；其余原样展示，绝不猜。
  */
 export function describeLocator(locator: Record<string, unknown> | null | undefined): LocatorView {
   if (locator === null || locator === undefined) {
@@ -177,6 +182,28 @@ export function describeLocator(locator: Record<string, unknown> | null | undefi
         return { kind: "pages", text: `第 ${numbers.join("、")} 页` };
       }
       return { kind: "raw", text: "PDF 页定位为空" };
+    }
+  }
+  if (version === 3) {
+    const segments: unknown = locator.segments;
+    if (Array.isArray(segments)) {
+      const parts = new Set<string>();
+      for (const segment of segments) {
+        if (typeof segment !== "object" || segment === null) continue;
+        const record = segment as Record<string, unknown>;
+        if (typeof record.paragraph_index === "number") {
+          parts.add(`第 ${record.paragraph_index} 段`);
+        } else if (
+          typeof record.table_index === "number" &&
+          typeof record.row_index === "number"
+        ) {
+          parts.add(`第 ${record.table_index} 个表格第 ${record.row_index} 行`);
+        }
+      }
+      if (parts.size > 0) {
+        return { kind: "blocks", text: [...parts].join("；") };
+      }
+      return { kind: "raw", text: "DOCX 定位为空" };
     }
   }
   return { kind: "raw", text: JSON.stringify(locator, null, 2) };

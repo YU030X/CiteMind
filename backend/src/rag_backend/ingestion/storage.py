@@ -19,6 +19,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from rag_backend.ingestion.docx_parsing import DOCX_MAGIC
 from rag_backend.ingestion.errors import (
     BlobCorrupt,
     BlobNotFound,
@@ -151,6 +152,16 @@ class DocumentBlobStore:
         data = self.read_verified_blob(kb_id, file_ref, file_hash)
         if not data.startswith(PDF_MAGIC):
             raise BlobCorrupt("blob 内容不是可识别的 PDF")
+        return data
+
+    def read_verified_docx(
+        self, kb_id: uuid.UUID, file_ref: str, file_hash: str
+    ) -> bytes:
+        """校验式有限读取 DOCX blob：在二进制校验之外要求 ``PK`` ZIP 魔数头。"""
+
+        data = self.read_verified_blob(kb_id, file_ref, file_hash)
+        if not data.startswith(DOCX_MAGIC):
+            raise BlobCorrupt("blob 内容不是可识别的 DOCX")
         return data
 
     def _read_bounded_regular_file(self, target: Path) -> bytes:

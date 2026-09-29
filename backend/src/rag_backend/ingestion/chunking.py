@@ -38,7 +38,10 @@ DEFAULT_MAX_TOKENS = 512
 LOCATOR_VERSION = 1
 # PDF 页定位版本；与 Markdown 的块级行范围 locator 区分，绝不混用键集合。
 PDF_LOCATOR_VERSION = 2
+# DOCX 块定位版本；段落/表格行与合并单元格位置，不推测 Word 页码。
+DOCX_LOCATOR_VERSION = 3
 SOURCE_TYPE_PDF = "pdf"
+SOURCE_TYPE_DOCX = "docx"
 
 
 class ChunkingError(Exception):
@@ -439,6 +442,29 @@ def _build_locator(
             "parser_version": document.parser_version,
             "source_sha256": document.source_sha256,
             "pages": pages,
+            "block_ordinals": ordinals,
+            "segments": segments,
+        }
+    if document.source_type == SOURCE_TYPE_DOCX:
+        for segment, piece in zip(segments, pieces):
+            block = blocks_by_ordinal[piece.ordinal]
+            segment["paragraph_index"] = block.paragraph_index
+            segment["table_index"] = block.table_index
+            segment["row_index"] = block.row_index
+            segment["cells"] = [
+                {
+                    "grid_column": cell.grid_column,
+                    "grid_span": cell.grid_span,
+                    "char_start": cell.char_start,
+                    "char_end": cell.char_end,
+                }
+                for cell in block.cells
+            ]
+        return {
+            "locator_version": DOCX_LOCATOR_VERSION,
+            "source_type": SOURCE_TYPE_DOCX,
+            "parser_version": document.parser_version,
+            "source_sha256": document.source_sha256,
             "block_ordinals": ordinals,
             "segments": segments,
         }

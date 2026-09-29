@@ -14,7 +14,9 @@ import uuid
 from typing import Any
 
 import pytest
+from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
 from rag_backend.ingestion.identity_preflight import (
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SUPPORTED_SOURCE_TYPES,
@@ -25,6 +27,7 @@ from rag_backend.ingestion.identity_preflight import (
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
+from rag_backend.ingestion.service import SOURCE_TYPE_DOCX as SERVICE_SOURCE_TYPE_DOCX
 from rag_backend.ingestion.service import SOURCE_TYPE_MARKDOWN as SERVICE_SOURCE_TYPE
 from rag_backend.ingestion.service import SOURCE_TYPE_PDF as SERVICE_SOURCE_TYPE_PDF
 from rag_backend.models.profile_contract import (
@@ -35,7 +38,7 @@ from rag_backend.models.profile_contract import (
 
 PARSER_VERSION = MARKDOWN_PARSER_VERSION
 LEGACY_PARSER_VERSION = "markdown-v1"
-UNSUPPORTED_SOURCE = "docx"
+UNSUPPORTED_SOURCE = "html"
 PROFILE_ID_A = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
 PROFILE_ID_B = uuid.UUID("00000000-0000-0000-0000-0000000000b2")
 
@@ -319,11 +322,43 @@ def test_profile_contract_error_is_a_value_error() -> None:
     assert issubclass(ProfileContractError, ValueError)
 
 
-def test_supported_source_types_cover_markdown_and_pdf() -> None:
-    assert SUPPORTED_SOURCE_TYPES == frozenset({SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF})
+def test_supported_source_types_cover_markdown_pdf_and_docx() -> None:
+    assert SUPPORTED_SOURCE_TYPES == frozenset(
+        {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_PDF, SOURCE_TYPE_DOCX}
+    )
     assert SOURCE_TYPE_MARKDOWN == SERVICE_SOURCE_TYPE
     assert SOURCE_TYPE_PDF == SERVICE_SOURCE_TYPE_PDF
+    assert SOURCE_TYPE_DOCX == SERVICE_SOURCE_TYPE_DOCX
     assert SOURCE_TYPE_PDF == "pdf"
+    assert SOURCE_TYPE_DOCX == "docx"
+
+
+def test_docx_source_with_docx_parser_is_allowed(expected: IndexProfileContract) -> None:
+    assert (
+        _decide(
+            expected,
+            _stored(expected),
+            source_type=SOURCE_TYPE_DOCX,
+            parser_version=DOCX_PARSER_VERSION,
+            expected_parser_version=DOCX_PARSER_VERSION,
+        )
+        is ProfileIdentityDecision.ALLOWED
+    )
+
+
+def test_docx_source_with_markdown_parser_is_rejected(
+    expected: IndexProfileContract,
+) -> None:
+    assert (
+        _decide(
+            expected,
+            _stored(expected),
+            source_type=SOURCE_TYPE_DOCX,
+            parser_version=MARKDOWN_PARSER_VERSION,
+            expected_parser_version=DOCX_PARSER_VERSION,
+        )
+        is ProfileIdentityDecision.PARSER_UNSUPPORTED
+    )
 
 
 def test_pdf_source_with_pdf_parser_is_allowed(expected: IndexProfileContract) -> None:

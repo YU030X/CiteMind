@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from rag_backend.dispatch.protocol import INGEST_REQUESTED_EVENT_TYPE
+from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
 from rag_backend.ingestion.errors import (
     DocumentDeleted,
     DocumentNotFound,
@@ -58,6 +59,7 @@ from rag_backend.ingestion.profile_repository import (
 )
 from rag_backend.ingestion.storage import DocumentBlobStore, content_hash
 from rag_backend.ingestion.validation import (
+    DOCX_MEDIA_TYPE,
     MARKDOWN_MEDIA_TYPE,
     PDF_MEDIA_TYPE,
     build_dedupe_key,
@@ -67,6 +69,7 @@ from rag_backend.ingestion.validation import (
     normalize_idempotency_key,
     normalize_title,
     parse_version_dedupe_key,
+    validate_docx_content,
     validate_pdf_content,
 )
 from rag_backend.models.ingestion import IngestJob, OutboxEvent
@@ -75,6 +78,7 @@ from rag_backend.models.profile_contract import current_keyword_analyzer_version
 
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_PDF = "pdf"
+SOURCE_TYPE_DOCX = "docx"
 DOCUMENT_LIFECYCLE_CREATED = "CREATED"
 DOCUMENT_LIFECYCLE_DELETED = "DELETED"
 VERSION_STATUS_PENDING = "PENDING"
@@ -199,6 +203,37 @@ async def create_pdf_document(
     )
 
 
+async def create_docx_document(
+    session: AsyncSession,
+    store: DocumentBlobStore,
+    *,
+    kb_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    title: str,
+    content: bytes,
+    idempotency_key: str,
+) -> UploadOutcome:
+    """受理 DOCX：标准库 ZIP 元数据校验后保存原文件并登记 DOCX 真实解析器版本。
+
+    嵌套表、实体声明、CRC 与实际解压总量属于解析期判定，由 worker 子进程在写 blob 之后
+    静态落库；本函数与 Markdown/PDF 路径共享幂等/去重/默认 profile 登记逻辑。
+    """
+
+    validate_docx_content(content)
+    return await _create_document(
+        session,
+        store,
+        kb_id=kb_id,
+        organization_id=organization_id,
+        title=title,
+        content=content,
+        idempotency_key=idempotency_key,
+        source_type=SOURCE_TYPE_DOCX,
+        media_type=DOCX_MEDIA_TYPE,
+        parser_version=DOCX_PARSER_VERSION,
+    )
+
+
 async def _create_document(
     session: AsyncSession,
     store: DocumentBlobStore,
@@ -212,7 +247,7 @@ async def _create_document(
     media_type: str,
     parser_version: str,
 ) -> UploadOutcome:
-    """Markdown/PDF 共用的入库受理：幂等判定、profile 登记、blob 发布与四表事务。"""
+    """Markdown/PDF/DOCX 共用的入库受理：幂等判定、profile 登记、blob 发布与四表事务。"""
 
     normalized_title = normalize_title(title)
     normalized_key = normalize_idempotency_key(idempotency_key)
@@ -595,6 +630,37 @@ async def create_pdf_version(
         source_type=SOURCE_TYPE_PDF,
         media_type=PDF_MEDIA_TYPE,
         parser_version=PDF_PARSER_VERSION,
+    )
+
+
+async def create_docx_version(
+    session: AsyncSession,
+    store: DocumentBlobStore,
+    *,
+    kb_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    document_id: uuid.UUID,
+    title: str,
+    content: bytes,
+    idempotency_key: str,
+    expected_active_version_id: uuid.UUID,
+) -> UploadOutcome:
+    """受理 DOCX 文档的新版本；只做受理期标准库 ZIP 元数据校验。"""
+
+    validate_docx_content(content)
+    return await _create_version(
+        session,
+        store,
+        kb_id=kb_id,
+        organization_id=organization_id,
+        document_id=document_id,
+        title=title,
+        content=content,
+        idempotency_key=idempotency_key,
+        expected_active_version_id=expected_active_version_id,
+        source_type=SOURCE_TYPE_DOCX,
+        media_type=DOCX_MEDIA_TYPE,
+        parser_version=DOCX_PARSER_VERSION,
     )
 
 

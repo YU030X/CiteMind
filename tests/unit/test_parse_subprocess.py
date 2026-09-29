@@ -10,7 +10,13 @@ import subprocess
 from typing import Any
 
 import pytest
+from docx_samples import (
+    corrupted_zip_docx,
+    nested_table_docx,
+    positive_simple_table,
+)
 from rag_backend.ingestion import parse_subprocess as ps
+from rag_backend.ingestion.docx_parsing import parse_docx
 from rag_backend.ingestion.parsing import parse_markdown
 from rag_backend.ingestion.pdf_parsing import parse_pdf
 from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES, MAX_MARKDOWN_BYTES
@@ -193,4 +199,58 @@ def test_pdf_oversized_input_is_rejected_before_spawn(
 
 
 def test_unknown_source_argument_is_rejected() -> None:
-    assert ps.main(["docx"]) == ps.EXIT_INVALID_INPUT
+    assert ps.main(["html"]) == ps.EXIT_INVALID_INPUT
+
+
+def test_real_docx_subprocess_parse_matches_direct() -> None:
+    content = positive_simple_table()
+
+    parsed = ps.parse_docx_in_subprocess(content)
+
+    expected = parse_docx(content)
+    assert parsed.source_sha256 == expected.source_sha256
+    assert parsed.parser_version == expected.parser_version
+    assert parsed.source_type == "docx"
+    assert [(b.kind, b.text, b.table_index, b.row_index) for b in parsed.blocks] == [
+        (b.kind, b.text, b.table_index, b.row_index) for b in expected.blocks
+    ]
+    assert parsed.blocks[1].cells == expected.blocks[1].cells
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [
+        (ps.EXIT_DOCX_UNSUPPORTED, ps.DocxUnsupportedSubprocessError),
+        (ps.EXIT_DOCX_INVALID, ps.DocxInvalidSubprocessError),
+    ],
+)
+def test_docx_named_exit_codes_map_to_static_errors(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, expected: type[Exception]
+) -> None:
+    process = _FakeProcess(returncode=returncode)
+    _install_fake_popen(monkeypatch, process)
+
+    with pytest.raises(expected):
+        ps.parse_docx_in_subprocess(positive_simple_table())
+
+
+def test_real_docx_nested_table_fails_statically() -> None:
+    with pytest.raises(ps.DocxUnsupportedSubprocessError):
+        ps.parse_docx_in_subprocess(nested_table_docx())
+
+
+def test_real_docx_corrupted_zip_fails_statically() -> None:
+    with pytest.raises(ps.DocxInvalidSubprocessError):
+        ps.parse_docx_in_subprocess(corrupted_zip_docx())
+
+
+def test_docx_oversized_input_is_rejected_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("超限输入不得启动子进程")
+
+    monkeypatch.setattr(subprocess, "Popen", explode)
+
+    with pytest.raises(ps.ParseSubprocessFailed):
+        ps.parse_docx_in_subprocess(b"x" * (MAX_DOCUMENT_BYTES + 1))

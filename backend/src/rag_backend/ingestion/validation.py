@@ -11,8 +11,16 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from rag_backend.ingestion.docx_parsing import (
+    DocxParsingError,
+    DocxTooLargeError,
+    DocxUnsupportedError,
+    inspect_docx_zip,
+)
 from rag_backend.ingestion.errors import (
+    DocumentDocxUnsupported,
     DocumentEmpty,
+    DocumentNotDocx,
     DocumentNotPdf,
     DocumentNotText,
     DocumentTooLarge,
@@ -32,11 +40,16 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_PDF = "pdf"
+SOURCE_TYPE_DOCX = "docx"
 MARKDOWN_EXTENSIONS = (".md", ".markdown")
 PDF_EXTENSIONS = (".pdf",)
+DOCX_EXTENSIONS = (".docx",)
 # 服务端判定的规范化 MIME；不采用客户端声明的值，客户端 MIME 只作为兼容输入被忽略。
 MARKDOWN_MEDIA_TYPE = "text/markdown"
 PDF_MEDIA_TYPE = "application/pdf"
+DOCX_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
 
 # 允许出现在文本中的 C0 控制字符；其余 C0 与 DEL 视为伪装成文本的二进制。
 # 这些值在 UTF-8 中只可能以单字节 ASCII 出现，因此可直接在字节层扫描。
@@ -176,7 +189,7 @@ def _base_filename(filename: str | None) -> str:
 def resolve_upload_format(filename: str | None) -> UploadFormat:
     """按后缀判定受支持的来源。
 
-    只接受 ``.md``/``.markdown``/``.pdf``；后缀大小写不敏感，存储路径不使用文件名。
+    只接受 ``.md``/``.markdown``/``.pdf``/``.docx``；后缀大小写不敏感，存储路径不使用文件名。
     规范化 MIME 与真实解析器版本由各自写路径按来源选定，不在此重复登记。
     """
 
@@ -186,7 +199,9 @@ def resolve_upload_format(filename: str | None) -> UploadFormat:
         return UploadFormat(source_type=SOURCE_TYPE_MARKDOWN)
     if lowered.endswith(PDF_EXTENSIONS):
         return UploadFormat(source_type=SOURCE_TYPE_PDF)
-    raise UnsupportedDocumentType("本切片只接受 .md、.markdown 与 .pdf 文件")
+    if lowered.endswith(DOCX_EXTENSIONS):
+        return UploadFormat(source_type=SOURCE_TYPE_DOCX)
+    raise UnsupportedDocumentType("本切片只接受 .md、.markdown、.pdf 与 .docx 文件")
 
 
 def decode_markdown_content(data: bytes) -> str:
@@ -218,3 +233,25 @@ def validate_pdf_content(data: bytes) -> None:
         raise DocumentTooLarge("上传内容超过单文件字节上限")
     if not data.startswith(PDF_MAGIC):
         raise DocumentNotPdf("上传内容不是可识别的 PDF")
+
+
+def validate_docx_content(data: bytes) -> None:
+    """校验 DOCX 字节：非空、未超单文件上限、标准库 ZIP 元数据符合收窄子集。
+
+    这里只做受理期可独立判断的 ZIP 元数据校验（非空/大小/PK 魔数/条目数/声明解压量/压缩比/
+    加密/路径/重复名/必需部件/宏部件），不导入 ``python-docx``；嵌套表、实体声明与 CRC/实际
+    解压总量由 worker 解析子进程在写 blob 之后静态判定。
+    """
+
+    if not data:
+        raise DocumentEmpty("上传内容为空")
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise DocumentTooLarge("上传内容超过单文件字节上限")
+    try:
+        inspect_docx_zip(data)
+    except DocxTooLargeError as error:
+        raise DocumentTooLarge("DOCX 内部条目超过解压上限") from error
+    except DocxUnsupportedError as error:
+        raise DocumentDocxUnsupported("DOCX 含宏部件，本切片不支持") from error
+    except DocxParsingError as error:
+        raise DocumentNotDocx("上传内容不是有效或可识别的 DOCX") from error

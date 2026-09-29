@@ -27,6 +27,14 @@ class DocumentNotPdf(IngestionError):
     """内容不具备 PDF 魔数头，不是可识别的 PDF。"""
 
 
+class DocumentNotDocx(IngestionError):
+    """内容不是可识别的 DOCX/ZIP 包，或 CRC/必需部件损坏。"""
+
+
+class DocumentDocxUnsupported(IngestionError):
+    """DOCX 包有效但属于不收窄支持的结构（宏部件等）。"""
+
+
 class DocumentTooLarge(IngestionError):
     """内容超过单文件字节上限。"""
 

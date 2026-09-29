@@ -47,11 +47,29 @@ _LIST_CLOSE = frozenset({"bullet_list_close", "ordered_list_close"})
 
 
 @dataclass(frozen=True)
+class DocxCellSpan:
+    """DOCX 表格行内一个真实来源单元格在规范化行文字中的位置。
+
+    ``grid_column`` 是 1-based 布局网格列（已计入 ``gridBefore`` 偏移），``grid_span``
+    是横向合并跨越的列数（未合并为 1），``char_start``/``char_end`` 是该单元格文本在
+    ``ParsedBlock.text`` 中的字符区间。纵向合并的 continue 单元格不产生本结构，也不把
+    上一行的文字复制到本行。
+    """
+
+    grid_column: int
+    grid_span: int
+    char_start: int
+    char_end: int
+
+
+@dataclass(frozen=True)
 class ParsedBlock:
     """一个带来源位置的纯数据块；Markdown 的线路字段是 1-based 闭区间。
 
     ``start_line``/``end_line`` 仅对 Markdown 有意义；PDF 按页抽取时没有可靠行号，
-    因此保持 ``None``，绝不伪造行号。``page`` 仅 PDF 使用，1-based。
+    因此保持 ``None``，绝不伪造行号。``page`` 仅 PDF 使用，1-based。DOCX 使用
+    ``paragraph_index``/``table_index``/``row_index`` 与 ``cells``（见
+    :class:`DocxCellSpan`），同样不伪造 Word 页码。
     """
 
     ordinal: int
@@ -64,6 +82,10 @@ class ParsedBlock:
     level: int | None = None
     code_info: str | None = None
     page: int | None = None
+    paragraph_index: int | None = None
+    table_index: int | None = None
+    row_index: int | None = None
+    cells: tuple[DocxCellSpan, ...] = ()
 
 
 @dataclass(frozen=True)

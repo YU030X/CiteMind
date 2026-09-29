@@ -16,7 +16,7 @@ export type VersionStatus = "PENDING" | "READY" | "FAILED" | "NEEDS_OCR";
 
 export type LifecycleStatus = "CREATED" | "INDEXING" | "READY" | "FAILED" | "DELETED";
 
-export type SourceType = "markdown" | "pdf";
+export type SourceType = "markdown" | "pdf" | "docx";
 
 export interface UserSummary {
   id: string;

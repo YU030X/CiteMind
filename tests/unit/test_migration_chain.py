@@ -23,6 +23,7 @@ CONVERSATION_REVISION = "20260927_0009"
 CONVERSATION_METADATA_REVISION = "20260927_0010"
 QUERY_RUN_OPTIONS_REVISION = "20260927_0011"
 DOCUMENT_ACL_REVISION = "20260928_0012"
+DOCUMENT_SOURCE_DOCX_REVISION = "20260929_0013"
 
 CORE_TABLES = (
     "index_profile",
@@ -142,9 +143,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [DOCUMENT_ACL_REVISION]
+    assert script_directory.get_heads() == [DOCUMENT_SOURCE_DOCX_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    document_source_docx = script_directory.get_revision(DOCUMENT_SOURCE_DOCX_REVISION)
     document_acl = script_directory.get_revision(DOCUMENT_ACL_REVISION)
     query_run_options = script_directory.get_revision(QUERY_RUN_OPTIONS_REVISION)
     conversation_metadata = script_directory.get_revision(CONVERSATION_METADATA_REVISION)
@@ -163,7 +165,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     assert query_run_options.down_revision == CONVERSATION_METADATA_REVISION
     assert query_run_options.nextrev == {DOCUMENT_ACL_REVISION}
     assert document_acl.down_revision == QUERY_RUN_OPTIONS_REVISION
-    assert document_acl.nextrev == set()
+    assert document_acl.nextrev == {DOCUMENT_SOURCE_DOCX_REVISION}
+    assert document_source_docx.down_revision == DOCUMENT_ACL_REVISION
+    assert document_source_docx.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -626,8 +630,13 @@ def test_offline_upgrade_sql_names_every_check_constraint_once(
     command.upgrade(alembic_config(), "head", sql=True)
     output = capsys.readouterr().out
 
+    # ``20260929_0013`` 会 drop 并按新允许集合重建 ``ck_document_source_type``，因此它在整个离
+    # 线升级 SQL 中恰好出现两次（0002 建、0013 重建）；其余具名 CHECK 仍恰好一次，不弱化断言。
     for name in EXPECTED_CHECK_CONSTRAINTS:
-        assert output.count(f"CONSTRAINT {name} CHECK") == 1, f"{name} 的具名 CHECK 缺失或重复"
+        expected = 2 if name == "ck_document_source_type" else 1
+        assert output.count(f"CONSTRAINT {name} CHECK") == expected, (
+            f"{name} 的具名 CHECK 数量不是预期的 {expected}"
+        )
     # 共享 naming convention 会补 ck_<table>_ 前缀，迁移不能再传全名，否则会双前缀。
     for table in ALL_TABLES:
         assert f"ck_{table}_ck_{table}_" not in output

@@ -29,7 +29,9 @@ from rag_backend.api.errors import (
     CODE_DOCUMENT_ACL_MEMBER_INVALID,
     CODE_DOCUMENT_CONTENT_UNAVAILABLE,
     CODE_DOCUMENT_DELETED,
+    CODE_DOCUMENT_DOCX_UNSUPPORTED,
     CODE_DOCUMENT_EMPTY,
+    CODE_DOCUMENT_NOT_DOCX,
     CODE_DOCUMENT_NOT_FOUND,
     CODE_DOCUMENT_NOT_PDF,
     CODE_DOCUMENT_NOT_TEXT,
@@ -58,7 +60,9 @@ from rag_backend.ingestion import service as ingestion_service
 from rag_backend.ingestion.errors import (
     BlobReadError,
     DocumentDeleted,
+    DocumentDocxUnsupported,
     DocumentEmpty,
+    DocumentNotDocx,
     DocumentNotFound,
     DocumentNotPdf,
     DocumentNotText,
@@ -72,10 +76,12 @@ from rag_backend.ingestion.errors import (
 )
 from rag_backend.ingestion.storage import DocumentBlobStore, InvalidBlobReference
 from rag_backend.ingestion.validation import (
+    DOCX_MEDIA_TYPE,
     MARKDOWN_MEDIA_TYPE,
     MAX_DOCUMENT_BYTES,
     MAX_TITLE_LENGTH,
     PDF_MEDIA_TYPE,
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     resolve_upload_format,
@@ -163,6 +169,10 @@ def _ingestion_error(error: IngestionError) -> ApiError:
         return ApiError(422, CODE_DOCUMENT_NOT_TEXT, str(error))
     if isinstance(error, DocumentNotPdf):
         return ApiError(422, CODE_DOCUMENT_NOT_PDF, str(error))
+    if isinstance(error, DocumentNotDocx):
+        return ApiError(422, CODE_DOCUMENT_NOT_DOCX, str(error))
+    if isinstance(error, DocumentDocxUnsupported):
+        return ApiError(422, CODE_DOCUMENT_DOCX_UNSUPPORTED, str(error))
     if isinstance(error, UnsupportedDocumentType):
         return ApiError(422, CODE_UNSUPPORTED_DOCUMENT_TYPE, str(error))
     if isinstance(error, TitleInvalid):
@@ -346,7 +356,7 @@ async def get_document(
 def _content_media_type(source_type: str) -> tuple[str, str] | None:
     """按来源返回受控 MIME 与安全后缀；未知来源返回 ``None``，由路由静态失败。
 
-    只接受服务端写入的 ``markdown``/``pdf``（`document.source_type` 的 CHECK 值）；
+    只接受服务端写入的 ``markdown``/``pdf``/``docx``（`document.source_type` 的 CHECK 值）；
     不把未知值一律当 PDF，避免类型伪装。
     """
 
@@ -354,6 +364,8 @@ def _content_media_type(source_type: str) -> tuple[str, str] | None:
         return MARKDOWN_MEDIA_TYPE, ".md"
     if source_type == SOURCE_TYPE_PDF:
         return PDF_MEDIA_TYPE, ".pdf"
+    if source_type == SOURCE_TYPE_DOCX:
+        return DOCX_MEDIA_TYPE, ".docx"
     return None
 
 
@@ -497,7 +509,10 @@ async def replace_document_acl_route(
                             "file": {
                                 "type": "string",
                                 "format": "binary",
-                                "description": "文本源文件：.md、.markdown 或 PDF（.pdf）",
+                                "description": (
+                                    "文本源文件：.md、.markdown、"
+                                    "PDF（.pdf）或 DOCX（.docx）"
+                                ),
                             },
                         },
                     }
@@ -533,6 +548,16 @@ async def upload_markdown_document(
         store = DocumentBlobStore(settings.document_storage_directory)
         if upload_format.source_type == SOURCE_TYPE_PDF:
             outcome = await ingestion_service.create_pdf_document(
+                session,
+                store,
+                kb_id=access.kb_id,
+                organization_id=access.organization_id,
+                title=title_value,
+                content=content,
+                idempotency_key=idempotency_key,
+            )
+        elif upload_format.source_type == SOURCE_TYPE_DOCX:
+            outcome = await ingestion_service.create_docx_document(
                 session,
                 store,
                 kb_id=access.kb_id,
@@ -585,7 +610,10 @@ async def upload_markdown_document(
                             "file": {
                                 "type": "string",
                                 "format": "binary",
-                                "description": "文本源文件：.md、.markdown 或 PDF（.pdf）",
+                                "description": (
+                                    "文本源文件：.md、.markdown、"
+                                    "PDF（.pdf）或 DOCX（.docx）"
+                                ),
                             },
                         },
                     }
@@ -624,6 +652,18 @@ async def upload_document_version(
         store = DocumentBlobStore(settings.document_storage_directory)
         if upload_format.source_type == SOURCE_TYPE_PDF:
             outcome = await ingestion_service.create_pdf_version(
+                session,
+                store,
+                kb_id=access.kb_id,
+                organization_id=access.organization_id,
+                document_id=document_id,
+                title=title_value,
+                content=content,
+                idempotency_key=idempotency_key,
+                expected_active_version_id=expected_active_version_id,
+            )
+        elif upload_format.source_type == SOURCE_TYPE_DOCX:
+            outcome = await ingestion_service.create_docx_version(
                 session,
                 store,
                 kb_id=access.kb_id,
