@@ -234,6 +234,19 @@ uv run pytest tests/unit/test_evaluation_costs.py -q
 
 **边界**：这是**估算快照复算，不是账单**，不覆盖折扣/赠送额度/阶梯价与供应商结算差异，provider 可能改价；只支持 USD，不做汇率；`knownCostAmount` 只汇总可计算 attempt，未知 attempt 由 `unknownCostAttemptCount` 计数、不得当作 0；`llm_usage` 价目/费用列、`results.json` 契约与 API 均不变，离线产物不 `UPDATE` 账本。**本轮未运行**：真实 PostgreSQL 只读回读、真实 runner `--usage-out`、任何真实 100 题成本或账单核对、Docker 与全量 pytest/mypy。
 
+## 已实现：runner 追问改写观测产物（2026-09-29）
+
+`evaluation/rewrite_artifact.py` 新增严格 camelCase 的 `RunnerRewriteArtifact`：每题每次已捕获的 ask 一条 `RewriteRun`（`questionId`/`conversationId`/`queryRunId`/`turnIndex`/`isFinalQuestion`/`question`/`standaloneQuestion`），文本全部由 runner 按已捕获 `queryRunId` 从数据库 `query_run` **只读回读**，不由 runner 编造；`generatedFrom` 固定为 `runner`，`complete` 表示运行是否完整，runs 按 `(questionId, turnIndex)` 稳定排序。
+
+- **对齐必须无歧义。** captured `queryRunId` 与数据库返回行都不允许重复；未知 row、缺失 row、同题重复 `turnIndex` 一律静态失败。**即使 `complete=false`，每个 captured run 也必须有权威行**：final ask 失败时 HTTP 错误响应不返回 `queryRunId`，因此本来就没有 `AskRunRecord`，产物**不按时间窗口猜测**改写或回答失败。`REFUSED` 是成功响应，仍有 `query_run` 行与 `queryRunId`，正常记录。
+- **首轮一致性与 strip。** `turnIndex=0` 未发生改写，`standaloneQuestion` 必须等于 `question`；更晚轮次允许两者相等（模型判定问题已独立）。两个文本都必须非空，且 `standaloneQuestion` 必须已 strip。字符串相等只是**结构一致性**检查，**不是语义改写质量分数**；本产物不做 gold 字符串比对、不判定改写是否更优。
+- **只读、复用同一 engine。** `SqlEvaluationDatabase.rewrite_rows_for` 用参数化 expanding `SELECT id, question, standalone_question FROM query_run WHERE id IN :ids` 回读，空输入不查询；SQLAlchemy 错误收敛为静态 `RunnerError`，消息不含 SQL/UUID/文本。不写库、不建表、不迁移、不新增授权。
+- **runner 侧。** 真实 CLI 新增可选 `--rewrite-out`：dry-run 不写；真实运行若提供，则在 `database.close()` 前按捕获的 `queryRunId` 只读回读并原子写出（唯一临时文件 + `os.replace`，拒绝与 `--results-out`/`--diagnostics-out`/`--usage-out` 同路径，拒绝覆盖已存在文件）。完整运行在 usage 之后、results 之前写出；**不完整运行也写 `complete=false`** 后再返回 1，但绝不写 results（完整或不完整都输出已捕获 runs）。未提供 `--rewrite-out` 时行为与旧版逐字一致，`results.json`、`AskRunRecord` 与 API 均不变。
+
+**敏感性与边界（诚实记录）**：产物包含用户生成的原始问题与改写文本，仅允许在隔离评估环境内使用，真实产物默认不提交仓库。真实 PostgreSQL 只读回读、真实 HTTP `queryRunId` 解析与真实 `--rewrite-out` 本轮未运行；单测全为合成 fake 与 fake engine 映射，不代表真实链路验收。
+
+离线聚焦验证：`uv run --no-sync pytest tests/unit/test_evaluation_rewrite_artifact.py tests/unit/test_evaluation_runner.py -q -p no:cacheprovider` 为 **60 passed**；`uv run --no-sync ruff check`（5 文件）与 `uv run --no-sync mypy`（5 文件）均通过。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。

@@ -20,6 +20,7 @@
 | [phase3-offline-ranking-calibration-ablation](implemented/phase3-offline-ranking-calibration-ablation.md) | Phase 3 第 2 片离线 Recall@10/nDCG@10、拒答阈值扫描与 A/B/C 消融产物契约 |
 | [phase3-llm-usage-query-run-correlation](implemented/phase3-llm-usage-query-run-correlation.md) | Phase 3 成本片 `llm_usage.query_run_id` 调用前关联键、无外键与探针边界 |
 | [phase3-runner-usage-artifact](implemented/phase3-runner-usage-artifact.md) | Phase 3 成本片 runner 逐题原始 usage 产物、只读归因与最终 ask 失败边界 |
+| [phase3-runner-rewrite-artifact](implemented/phase3-runner-rewrite-artifact.md) | Phase 3 runner 追问改写观测产物、只读权威回读与不打语义质量分边界 |
 | [phase3-offline-cost-recompute](implemented/phase3-offline-cost-recompute.md) | Phase 3 成本片固定价目快照、显式 band 与纯离线 `Decimal` 成本复算边界 |
 | [phase3-readonly-ablation-probe-core](implemented/phase3-readonly-ablation-probe-core.md) | Phase 3 第 3 片只读 A/B/C 探针核心、授权来源映射与降级边界 |
 | [phase3-readonly-probe-cli-and-adapters](implemented/phase3-readonly-probe-cli-and-adapters.md) | Phase 3 第 4 片只读探针真实 adapter、DSN/身份/profile 护栏与 dry-run CLI、原子落盘 |

@@ -51,6 +51,7 @@ from rag_backend.evaluation.runner import (
 )
 from rag_backend.evaluation.runner_adapters import (
     HttpBackend,
+    QueryRunRewriteRow,
     SqlEvaluationDatabase,
     UsageAttemptRow,
 )
@@ -753,6 +754,74 @@ def test_sql_usage_query_empty_input_does_not_touch_engine() -> None:
         database.close()
 
 
+def test_sql_rewrite_query_empty_input_does_not_touch_engine() -> None:
+    database = SqlEvaluationDatabase("postgresql+psycopg://u:p@127.0.0.1:1/db_test")
+    try:
+        assert database.rewrite_rows_for([]) == ()
+    finally:
+        database.close()
+
+
+def test_sql_rewrite_query_maps_rows() -> None:
+    query_run_id = uuid.uuid4()
+
+    class _Result:
+        def all(self) -> list[tuple[uuid.UUID, str, str]]:
+            return [(query_run_id, "追问问题", "独立问题")]
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def execute(self, *_args: object, **_kwargs: object) -> _Result:
+            return _Result()
+
+    class _Engine:
+        def connect(self) -> _Connection:
+            return _Connection()
+
+        def dispose(self) -> None:
+            pass
+
+    database = SqlEvaluationDatabase("postgresql+psycopg://u:p@127.0.0.1:1/db_test")
+    database._engine = _Engine()  # type: ignore[assignment]
+    try:
+        assert database.rewrite_rows_for([query_run_id]) == (
+            QueryRunRewriteRow(
+                query_run_id=query_run_id,
+                question="追问问题",
+                standalone_question="独立问题",
+            ),
+        )
+    finally:
+        database.close()
+
+
+def test_sql_rewrite_query_error_is_static_runner_error() -> None:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    class _Engine:
+        def connect(self) -> object:
+            raise SQLAlchemyError("secret-dsn-and-text")
+
+        def dispose(self) -> None:
+            pass
+
+    database = SqlEvaluationDatabase("postgresql+psycopg://u:p@127.0.0.1:1/db_test")
+    database._engine = _Engine()  # type: ignore[assignment]
+    try:
+        with pytest.raises(RunnerError) as excinfo:
+            database.rewrite_rows_for([uuid.uuid4()])
+    finally:
+        database.close()
+    message = str(excinfo.value)
+    assert "query_run" in message
+    assert "secret-dsn-and-text" not in message
+
+
 # ---------------------------------------------------------------------------
 # HTTP 适配器（合成 MockTransport）
 
@@ -1054,6 +1123,7 @@ def _install_usage_fakes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, fail_final: bool
 ) -> Path:
     kb_uuid = uuid.uuid4()
+    question_by_query: dict[uuid.UUID, str] = {}
 
     class FakeSession:
         def knowledge_base_roles(self) -> Mapping[uuid.UUID, str]:
@@ -1065,8 +1135,10 @@ def _install_usage_fakes(
         def ask(self, conversation_id: uuid.UUID, question: str) -> AskOutcome:
             if fail_final and question == "追问问题":
                 raise BackendError("提问失败（HTTP 502/GENERATION_FAILED）")
+            query_run_id = uuid.uuid4()
+            question_by_query[query_run_id] = question
             return AskOutcome(
-                query_run_id=uuid.uuid4(),
+                query_run_id=query_run_id,
                 refused=True,
                 citation_ids=(),
                 answer_text="无法回答。",
@@ -1129,6 +1201,22 @@ def _install_usage_fakes(
                 for query_run_id in query_run_ids
             )
 
+        def rewrite_rows_for(
+            self, query_run_ids: Sequence[uuid.UUID]
+        ) -> Sequence[QueryRunRewriteRow]:
+            return tuple(
+                QueryRunRewriteRow(
+                    query_run_id=query_run_id,
+                    question=question_by_query[query_run_id],
+                    standalone_question=(
+                        "独立问题"
+                        if question_by_query[query_run_id] == "追问问题"
+                        else question_by_query[query_run_id]
+                    ),
+                )
+                for query_run_id in query_run_ids
+            )
+
     dataset = _multi_turn_dataset()
     manifest = _FakeManifest("staff")
     monkeypatch.setattr(
@@ -1167,6 +1255,22 @@ def _usage_cli_args(tmp_path: Path, descriptor: Path, *, usage_out: Path | None)
     ]
     if usage_out is not None:
         args += ["--usage-out", str(usage_out)]
+    return args
+
+
+def _artifact_cli_args(
+    tmp_path: Path,
+    descriptor: Path,
+    *,
+    usage_out: Path | None = None,
+    rewrite_out: Path | None = None,
+    diagnostics_out: Path | None = None,
+) -> list[str]:
+    args = _usage_cli_args(tmp_path, descriptor, usage_out=usage_out)
+    if rewrite_out is not None:
+        args += ["--rewrite-out", str(rewrite_out)]
+    if diagnostics_out is not None:
+        args += ["--diagnostics-out", str(diagnostics_out)]
     return args
 
 
@@ -1236,3 +1340,108 @@ def test_runner_refuses_to_overwrite_existing_usage_file(
     assert rc == 1
     assert "拒绝覆盖" in capsys.readouterr().err
     assert usage_out.read_text(encoding="utf-8") == "{}"
+
+
+# ---------------------------------------------------------------------------
+# runner CLI 的 --rewrite-out（合成 adapter，不联网、不读真实数据库）
+
+def test_runner_writes_complete_rewrite_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    rewrite_out = tmp_path / "rewrite.json"
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor, rewrite_out=rewrite_out))
+    assert rc == 0
+    assert (tmp_path / "results.json").exists()
+    payload = json.loads(rewrite_out.read_text(encoding="utf-8"))
+    assert payload["generatedFrom"] == "runner"
+    assert payload["complete"] is True
+    assert [
+        (run["questionId"], run["turnIndex"], run["isFinalQuestion"]) for run in payload["runs"]
+    ] == [("q-multi", 0, False), ("q-multi", 1, True), ("q-single", 0, True)]
+    assert payload["runs"][0]["standaloneQuestion"] == "第一问"
+    assert payload["runs"][1]["question"] == "追问问题"
+    assert payload["runs"][1]["standaloneQuestion"] == "独立问题"
+
+
+def test_runner_writes_incomplete_rewrite_artifact_without_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=True)
+    rewrite_out = tmp_path / "rewrite.json"
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor, rewrite_out=rewrite_out))
+    assert rc == 1
+    assert not (tmp_path / "results.json").exists()
+    payload = json.loads(rewrite_out.read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    # setup 成功的历史轮仍输出；失败的最终 ask 不出现。产物按 (questionId, turnIndex) 排序。
+    assert [
+        (run["questionId"], run["turnIndex"], run["isFinalQuestion"]) for run in payload["runs"]
+    ] == [("q-multi", 0, False), ("q-single", 0, True)]
+
+
+def test_runner_without_rewrite_out_keeps_old_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor))
+    assert rc == 0
+    assert (tmp_path / "results.json").exists()
+    assert not (tmp_path / "rewrite.json").exists()
+
+
+def test_runner_rejects_rewrite_out_path_conflicts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+
+    results = tmp_path / "results.json"
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor, rewrite_out=results))
+    assert rc == 1
+    assert "不能与 --results-out" in capsys.readouterr().err
+
+    usage = tmp_path / "usage.json"
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor, usage_out=usage, rewrite_out=usage))
+    assert rc == 1
+    assert "不能与 --usage-out" in capsys.readouterr().err
+
+    diagnostics = tmp_path / "diagnostics.json"
+    rc = runner_main(
+        _artifact_cli_args(
+            tmp_path, descriptor, rewrite_out=diagnostics, diagnostics_out=diagnostics
+        )
+    )
+    assert rc == 1
+    assert "不能与 --diagnostics-out" in capsys.readouterr().err
+
+
+def test_runner_refuses_to_overwrite_existing_rewrite_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    rewrite_out = tmp_path / "rewrite.json"
+    rewrite_out.write_text("{}", encoding="utf-8")
+    rc = runner_main(_artifact_cli_args(tmp_path, descriptor, rewrite_out=rewrite_out))
+    assert rc == 1
+    assert "拒绝覆盖" in capsys.readouterr().err
+    assert rewrite_out.read_text(encoding="utf-8") == "{}"
+
+
+def test_write_rewrite_artifact_cleans_temp_on_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from rag_backend.evaluation.rewrite_artifact import RunnerRewriteArtifact
+
+    artifact = RunnerRewriteArtifact(
+        dataset_kind="dev", dataset_version="v1", complete=False, runs=[]
+    )
+    target = tmp_path / "rewrite.json"
+
+    def _boom(_src: object, _dst: object) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("os.replace", _boom)
+    with pytest.raises(RunnerError):
+        runner_module._write_rewrite_artifact(target, artifact)
+    assert not target.exists()
+    assert list(tmp_path.glob(".*.tmp")) == []

@@ -379,6 +379,15 @@ class UsageAttemptRow:
     latency_ms: int | None
 
 
+@dataclass(frozen=True)
+class QueryRunRewriteRow:
+    """``query_run`` 中一条已捕获 run 的权威改写文本（只读三列）。"""
+
+    query_run_id: uuid.UUID
+    question: str
+    standalone_question: str
+
+
 class SqlEvaluationDatabase:
     """只读评估数据库：引用 UUID -> 版本 UUID、账本行与 READY/删除状态轮询。"""
 
@@ -401,6 +410,10 @@ class SqlEvaluationDatabase:
         WHERE query_run_id IN :ids
         ORDER BY query_run_id, stage, created_at, id
         """
+    ).bindparams(bindparam("ids", expanding=True))
+    # 追问改写观测：按已捕获 queryRunId 只读回读权威文本；只 SELECT，复用同一 engine。
+    _REWRITE_QUERY = text(
+        "SELECT id, question, standalone_question FROM query_run WHERE id IN :ids"
     ).bindparams(bindparam("ids", expanding=True))
 
     def __init__(self, database_url: str) -> None:
@@ -460,6 +473,29 @@ class SqlEvaluationDatabase:
             for row in rows
         )
 
+    def rewrite_rows_for(
+        self, query_run_ids: Sequence[uuid.UUID]
+    ) -> Sequence[QueryRunRewriteRow]:
+        """按已捕获 ``queryRunId`` 只读返回 ``query_run`` 权威改写文本；空输入不查询。"""
+
+        if not query_run_ids:
+            return ()
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    self._REWRITE_QUERY, {"ids": list(query_run_ids)}
+                ).all()
+        except SQLAlchemyError as error:
+            raise core.RunnerError("query_run 追问改写只读查询失败") from error
+        return tuple(
+            QueryRunRewriteRow(
+                query_run_id=_coerce_uuid(row[0]),
+                question=row[1],
+                standalone_question=row[2],
+            )
+            for row in rows
+        )
+
     def missing_knowledge_base_ids(self, kb_ids: Sequence[uuid.UUID]) -> frozenset[uuid.UUID]:
         """返回只读数据库中不存在的 KB UUID；用于确认 API 与数据库同栈。"""
 
@@ -509,6 +545,7 @@ class SqlEvaluationDatabase:
 __all__ = [
     "HttpBackend",
     "HttpRoleSession",
+    "QueryRunRewriteRow",
     "SqlEvaluationDatabase",
     "UsageAttemptRow",
 ]

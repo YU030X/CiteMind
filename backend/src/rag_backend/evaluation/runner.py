@@ -47,6 +47,11 @@ from rag_backend.evaluation.metrics import (
     QuestionResult,
     ResultCitation,
 )
+from rag_backend.evaluation.rewrite_artifact import (
+    RewriteArtifactError,
+    RunnerRewriteArtifact,
+    build_runner_rewrite_artifact,
+)
 from rag_backend.evaluation.usage_artifact import (
     RunnerUsageArtifact,
     UsageArtifactError,
@@ -54,7 +59,10 @@ from rag_backend.evaluation.usage_artifact import (
 )
 
 if TYPE_CHECKING:
-    from rag_backend.evaluation.runner_adapters import UsageAttemptRow
+    from rag_backend.evaluation.runner_adapters import (
+        QueryRunRewriteRow,
+        UsageAttemptRow,
+    )
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -330,6 +338,14 @@ class UsageLedgerLookup(Protocol):
     def usage_attempts_for(
         self, query_run_ids: Sequence[uuid.UUID]
     ) -> Sequence[UsageAttemptRow]: ...
+
+
+class RewriteLookup(Protocol):
+    """只读追问改写查询：按已捕获 queryRunId 返回 ``query_run`` 权威文本行。"""
+
+    def rewrite_rows_for(
+        self, query_run_ids: Sequence[uuid.UUID]
+    ) -> Sequence[QueryRunRewriteRow]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +894,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="可选：逐题原始 provider usage 产物路径（真实运行且查询账本前需已部署迁移 0016）",
     )
     parser.add_argument(
+        "--rewrite-out",
+        type=Path,
+        default=None,
+        help="可选：逐题追问改写观测产物路径（真实运行；只读回读 query_run 权威文本）",
+    )
+    parser.add_argument(
         "--allow-non-loopback-api",
         action="store_true",
         help="允许 api-base-url 指向非回环地址；默认只接受回环地址",
@@ -1022,6 +1044,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if conflict is not None:
             print(conflict, file=sys.stderr)
             return 1
+    if args.rewrite_out is not None:
+        conflict = _rewrite_out_conflict(
+            args.rewrite_out, args.results_out, args.diagnostics_out, args.usage_out
+        )
+        if conflict is not None:
+            print(conflict, file=sys.stderr)
+            return 1
     database_url = _read_database_url(args.database_url_env, args.allow_database_name)
     if database_url is None:
         return 1
@@ -1070,6 +1099,27 @@ def _usage_out_conflict(
             return f"--usage-out 不能与 {flag} 指向同一路径。"
     if usage_out.exists():
         return "--usage-out 已存在同名文件，拒绝覆盖。"
+    return None
+
+
+def _rewrite_out_conflict(
+    rewrite_out: Path,
+    results_out: Path | None,
+    diagnostics_out: Path | None,
+    usage_out: Path | None,
+) -> str | None:
+    """静态检查 rewrite 产物路径：不得与 results/diagnostics/usage 相同，也不得覆盖已存在文件。"""
+
+    rewrite_path = _normalise_path(rewrite_out)
+    for flag, other in (
+        ("--results-out", results_out),
+        ("--diagnostics-out", diagnostics_out),
+        ("--usage-out", usage_out),
+    ):
+        if other is not None and _normalise_path(other) == rewrite_path:
+            return f"--rewrite-out 不能与 {flag} 指向同一路径。"
+    if rewrite_out.exists():
+        return "--rewrite-out 已存在同名文件，拒绝覆盖。"
     return None
 
 
@@ -1165,6 +1215,13 @@ def _run_real(
             database=database,
             dataset=dataset,
         )
+        # rewrite 观测同样在 DB close 前写出；完整或不完整运行都输出已捕获 run。
+        _emit_rewrite_artifact(
+            rewrite_out=args.rewrite_out,
+            outcome=outcome,
+            database=database,
+            dataset=dataset,
+        )
         if not outcome.complete or outcome.results is None:
             print("运行不完整，未写出结果文件。", file=sys.stderr)
             _print_diagnostics(diagnostics)
@@ -1245,6 +1302,65 @@ def _write_usage_artifact(path: Path, artifact: RunnerUsageArtifact) -> None:
         except OSError:
             pass
         raise RunnerError("usage 产物写入失败") from error
+
+
+def _emit_rewrite_artifact(
+    *,
+    rewrite_out: Path | None,
+    outcome: RunOutcome,
+    database: RewriteLookup,
+    dataset: EvaluationDataset,
+) -> None:
+    """按捕获的 ``queryRunId`` 只读回读 ``query_run`` 并原子写出产物；未提供路径则不做事。"""
+
+    if rewrite_out is None:
+        return
+    rows = database.rewrite_rows_for([record.query_run_id for record in outcome.usage_runs])
+    artifact = _build_rewrite_artifact(
+        rewrite_runs=outcome.usage_runs,
+        rewrite_rows=rows,
+        dataset=dataset,
+        complete=outcome.complete,
+    )
+    _write_rewrite_artifact(rewrite_out, artifact)
+
+
+def _build_rewrite_artifact(
+    *,
+    rewrite_runs: Sequence[AskRunRecord],
+    rewrite_rows: Sequence[QueryRunRewriteRow],
+    dataset: EvaluationDataset,
+    complete: bool,
+) -> RunnerRewriteArtifact:
+    try:
+        return build_runner_rewrite_artifact(
+            rewrite_runs,
+            rewrite_rows,
+            dataset_kind=dataset.dataset_kind,
+            dataset_version=dataset.dataset_version,
+            complete=complete,
+        )
+    except RewriteArtifactError as error:
+        raise RunnerError(f"rewrite 产物构建失败：{error}") from error
+
+
+def _write_rewrite_artifact(path: Path, artifact: RunnerRewriteArtifact) -> None:
+    """唯一临时文件 + ``os.replace`` 原子写出；已存在同名文件则拒绝覆盖。"""
+
+    if path.exists():
+        raise RunnerError("rewrite 产物目标已存在同名文件，拒绝覆盖")
+    temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temp.write_text(
+            artifact.model_dump_json(by_alias=True, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temp, path)
+    except OSError as error:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise RunnerError("rewrite 产物写入失败") from error
 
 
 def _print_diagnostics(diagnostics: Sequence[QuestionDiagnostic]) -> None:
