@@ -247,6 +247,25 @@ uv run pytest tests/unit/test_evaluation_costs.py -q
 
 离线聚焦验证：`uv run --no-sync pytest tests/unit/test_evaluation_rewrite_artifact.py tests/unit/test_evaluation_runner.py -q -p no:cacheprovider` 为 **60 passed**；`uv run --no-sync ruff check`（5 文件）与 `uv run --no-sync mypy`（5 文件）均通过。
 
+## 已实现：Phase 3 追问改写观测纯离线检查（结构覆盖与单一参考重合，非质量分）
+
+`python -m rag_backend.evaluation.rewrite_inspect` 新增为纯离线检查入口：只读题集与 `RunnerRewriteArtifact`，不联网、不读环境文件、不连接数据库、不调用模型、也不写任何文件。它补齐 runner 改写产物之后的**消费侧结构观察**，但不产生任何语义质量结论。
+
+- **元数据与结构覆盖。** 产物的 `datasetKind`/`datasetVersion` 必须与题集一致（漂移静态失败）。`complete=true` 时，产物中 final run 的 `questionId` 集合必须恰好覆盖题集全部 id：缺少任一 final、出现未知 `questionId` 或同一题多个 final 都静态失败；`complete=false` 时允许 final 缺失，但未知 `questionId` 仍然禁止，绝不把 partial 当完整。输出报告 `observedFinal`/`expectedFinal` 与缺失 id。
+- **单一参考重合观察。** 只对题集中带 `standaloneQuestion` 且已观察到 final 的题，比较 final run 的 `standaloneQuestion` 与题集参考，分三类且互斥：`exactMatch`（逐字相等）、`normalizedMatch`（非逐字，但经 Unicode NFKC + casefold + 所有连续 whitespace 折叠为单空格 + strip 后相等）、`different`。分母明确是“有参考且已观察到 final”的题数；没有分母时输出 `None/0`。另报告首轮/all run 数、final 观测数与 partial 标志，并输出落入 `different` 的题 id 供人工复核。
+- **结构观察，不是质量分。** 题集只有一个 gold `standaloneQuestion`，它是单一参考、不是唯一正确表达；重合计数不衡量改写是否更优，也不做 token 相似度、编辑距离、阈值、pass/fail 或质量等级。真实语义需要人工或另立授权成本的裁判。
+- **不泄露用户文本。** CLI 的 stdout/stderr 只打印题 id 与静态计数，绝不打印 `question`/`standaloneQuestion` 原文；非法 schema/元数据/覆盖退出 1 并输出静态中文错误、无 traceback。
+
+单行命令（在仓库根目录，需自备题集与 runner 写出的改写产物）：
+
+```text
+uv run python -m rag_backend.evaluation.rewrite_inspect --dataset tests/evaluation/dev-questions.json --rewrite path/to/rewrite.json
+```
+
+聚焦单测（同样离线、合成数据）：`uv run pytest tests/unit/test_evaluation_rewrite_inspect.py -q`。
+
+**本轮未测**：真实 runner `--rewrite-out` 产物、真实留出集改写观测与任何真实重合计数；`normalizedMatch`/`different` 只是字符串结构分类，不是语义改写质量的度量。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。
