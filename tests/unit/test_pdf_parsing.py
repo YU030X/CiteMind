@@ -1,7 +1,8 @@
 """文本 PDF 解析/切分与页定位的聚焦单测（不连数据库、Redis 或模型）。
 
-用 pypdf 在内存中构造自制 PDF 样本：可提取文本、空白页、加密、损坏与超页数。假计数器把
-每个字符当成一个 token，因此这里只验证页边界与 locator 形状，不代表真实 tokenizer 预算。
+用 :mod:`pdf_samples` 的内存样本与 pypdf 构造的加密样本覆盖：可提取文本、中文文本层、多栏/缩进、
+单页长文本、空白页+文本页，以及加密、损坏与超页数等负例。假计数器把每个字符当成一个 token，
+因此这里只验证页边界与 locator 形状，不代表真实 tokenizer 预算。
 """
 
 from __future__ import annotations
@@ -9,11 +10,25 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import cast
 
 import pytest
+from pdf_samples import (
+    all_blank_pdf,
+    corrupt_pdf,
+    encrypted_pdf,
+    positive_ascii_multipage,
+    positive_blank_and_text_pages,
+    positive_cjk_text_layer,
+    positive_long_single_page,
+    positive_multi_column_indent,
+    positive_samples,
+    too_many_pages_pdf,
+)
 from rag_backend.ingestion import pdf_parsing
 from rag_backend.ingestion.chunking import (
     PDF_LOCATOR_VERSION,
@@ -39,6 +54,7 @@ from rag_backend.ingestion.validation import (
 )
 
 pypdf = pytest.importorskip("pypdf")
+pdfplumber = pytest.importorskip("pdfplumber")
 
 
 class CharacterCounter:
@@ -102,9 +118,137 @@ def _segments(chunk: Chunk) -> list[dict[str, object]]:
     return cast("list[dict[str, object]]", chunk.source_locator["segments"])
 
 
-def test_parser_version_matches_installed_library() -> None:
-    assert pdf_parsing.PDF_PARSER_VERSION == "pypdf-6.19.0-v1"
-    assert pdf_parsing.PDF_PARSER_VERSION == f"pypdf-{pypdf.__version__}-v1"
+def test_parser_version_matches_installed_libraries() -> None:
+    assert pdf_parsing.PDF_PARSER_VERSION == "pypdf-6.19.0+pdfplumber-0.11.10-v1"
+    assert pdf_parsing.PYPDF_VERSION == pypdf.__version__
+    assert pdf_parsing.PDFPLUMBER_VERSION == pdfplumber.__version__
+    assert pdf_parsing.PDF_PARSER_VERSION == (
+        f"pypdf-{pypdf.__version__}+pdfplumber-{pdfplumber.__version__}-v1"
+    )
+
+
+def test_api_entrypoint_import_does_not_load_pdf_engines() -> None:
+    """全新子进程导入 API 入口后，两个 PDF 引擎及其依赖都不得进入 ``sys.modules``。
+
+    在本进程断言会受已导入状态污染，因此必须另起解释器；只证明 API 入口不导入这些依赖，
+    不代表它们未安装在 dev/worker 组。
+    """
+
+    code = (
+        "import sys; import rag_backend.main; "
+        "forbidden = {'pdfplumber', 'pdfminer', 'PIL', 'pypdf'}; "
+        "loaded = forbidden & set(sys.modules); "
+        "assert not loaded, sorted(loaded)"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_positive_samples_are_five_distinct_documents() -> None:
+    samples = positive_samples()
+    assert len(samples) == 5
+    # 5 份样本必须字节不同，不能用同一份样本冒充多份。
+    assert len(set(samples.values())) == 5
+
+
+def test_positive_ascii_multipage_extracts_each_page() -> None:
+    document = parse_pdf(positive_ascii_multipage())
+
+    assert [block.page for block in document.blocks] == [1, 2, 3]
+    assert "Employee Handbook" in document.blocks[0].text
+    assert "Leave Policy" in document.blocks[1].text
+    assert "Travel" in document.blocks[2].text
+    assert all(block.heading_path == () for block in document.blocks)
+    assert all(
+        block.start_line is None and block.end_line is None for block in document.blocks
+    )
+
+
+def test_positive_cjk_text_layer_extracts_chinese() -> None:
+    document = parse_pdf(positive_cjk_text_layer())
+
+    assert len(document.blocks) == 1
+    assert document.blocks[0].page == 1
+    assert "员工餐厅营业时间" in document.blocks[0].text
+    assert "访客餐券" in document.blocks[0].text
+    assert document.blocks[0].heading_path == ()
+
+
+def test_positive_multi_column_indent_keeps_all_fragments() -> None:
+    document = parse_pdf(positive_multi_column_indent())
+
+    assert len(document.blocks) == 1
+    text = document.blocks[0].text
+    for fragment in (
+        "Left column first line",
+        "Indented continuation line",
+        "Right column second line",
+    ):
+        assert fragment in text
+
+
+def test_positive_long_single_page_splits_within_page() -> None:
+    document = parse_pdf(positive_long_single_page())
+
+    chunks = chunk_markdown(
+        document,
+        CharacterCounter(),
+        ChunkBudget(target_tokens=100, overlap_tokens=0, max_tokens=200),
+    )
+
+    assert len(chunks) > 1
+    assert all(chunk.source_locator["pages"] == [1] for chunk in chunks)
+
+
+def test_positive_blank_and_text_pages_ignore_blank_pages() -> None:
+    document = parse_pdf(positive_blank_and_text_pages())
+
+    assert [block.page for block in document.blocks] == [2]
+    assert "middle page" in document.blocks[0].text
+
+
+def test_positive_samples_chunk_to_locator_version_two() -> None:
+    for name, raw in positive_samples().items():
+        parsed = parse_pdf(raw)
+        if not parsed.blocks:
+            continue
+        chunks = chunk_markdown(
+            parsed,
+            CharacterCounter(),
+            ChunkBudget(target_tokens=100, overlap_tokens=0, max_tokens=200),
+        )
+        assert chunks, name
+        for chunk in chunks:
+            locator = chunk.source_locator
+            assert locator["locator_version"] == PDF_LOCATOR_VERSION == 2, name
+            assert locator["source_type"] == "pdf", name
+            assert locator["parser_version"] == pdf_parsing.PDF_PARSER_VERSION, name
+            assert locator["source_sha256"] == hashlib.sha256(raw).hexdigest(), name
+            pages = locator["pages"]
+            assert isinstance(pages, list) and len(pages) == 1, name
+            assert "start_line" not in locator and "end_line" not in locator, name
+
+
+def test_all_blank_pdf_has_no_blocks_and_is_not_chunkable() -> None:
+    document = parse_pdf(all_blank_pdf())
+
+    assert document.blocks == ()
+    assert document.parser_version == pdf_parsing.PDF_PARSER_VERSION
+    with pytest.raises(NoChunkableContent):
+        chunk_markdown(document, CharacterCounter())
+
+
+def test_negative_pdf_samples_fail_statically() -> None:
+    with pytest.raises(PdfEncryptedError):
+        parse_pdf(encrypted_pdf())
+    with pytest.raises(PdfInvalidError):
+        parse_pdf(corrupt_pdf())
+    with pytest.raises(PdfTooManyPagesError):
+        parse_pdf(too_many_pages_pdf())
 
 
 def test_pages_extracted_with_empty_heading_and_no_fabricated_lines() -> None:

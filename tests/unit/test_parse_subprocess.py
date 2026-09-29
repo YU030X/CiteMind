@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from typing import Any
 
@@ -15,12 +16,22 @@ from docx_samples import (
     nested_table_docx,
     positive_simple_table,
 )
+from pdf_samples import (
+    all_blank_pdf,
+    corrupt_pdf,
+    encrypted_pdf,
+    too_many_pages_pdf,
+)
+from pdf_samples import (
+    positive_samples as pdf_positive_samples,
+)
 from rag_backend.ingestion import parse_subprocess as ps
+from rag_backend.ingestion.chunking import ChunkBudget, chunk_markdown
 from rag_backend.ingestion.docx_parsing import parse_docx
 from rag_backend.ingestion.parsing import parse_markdown
-from rag_backend.ingestion.pdf_parsing import parse_pdf
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION, parse_pdf
 from rag_backend.ingestion.validation import MAX_DOCUMENT_BYTES, MAX_MARKDOWN_BYTES
-from test_pdf_parsing import _build_pdf
+from test_pdf_parsing import CharacterCounter, _build_pdf
 
 
 class _FakeProcess:
@@ -166,6 +177,42 @@ def test_real_pdf_subprocess_parse_matches_direct() -> None:
         (b.text, b.page, b.heading_path) for b in expected.blocks
     ]
     assert all(b.start_line is None and b.end_line is None for b in parsed.blocks)
+
+
+def test_pdf_subprocess_extracts_all_positive_samples_to_locator_v2() -> None:
+    """5 份自制正样本都走真实 PDF 解析子进程，并可切出 locator_version=2 的页定位。"""
+
+    samples = pdf_positive_samples()
+    assert len(samples) == 5
+    for name, raw in samples.items():
+        parsed = ps.parse_pdf_in_subprocess(raw)
+        assert parsed.source_type == "pdf", name
+        assert parsed.parser_version == PDF_PARSER_VERSION, name
+        assert parsed.source_sha256 == hashlib.sha256(raw).hexdigest(), name
+        chunks = chunk_markdown(
+            parsed,
+            CharacterCounter(),
+            ChunkBudget(target_tokens=100, overlap_tokens=0, max_tokens=200),
+        )
+        assert chunks, name
+        for chunk in chunks:
+            assert chunk.source_locator["locator_version"] == 2, name
+            assert chunk.source_locator["source_type"] == "pdf", name
+            pages = chunk.source_locator["pages"]
+            assert isinstance(pages, list) and len(pages) == 1, name
+
+
+def test_pdf_subprocess_named_failures_are_static() -> None:
+    """真实子进程把加密/损坏/超页分别映射为可区分的具名静态失败。"""
+
+    with pytest.raises(ps.PdfEncryptedSubprocessError):
+        ps.parse_pdf_in_subprocess(encrypted_pdf())
+    with pytest.raises(ps.PdfInvalidSubprocessError):
+        ps.parse_pdf_in_subprocess(corrupt_pdf())
+    with pytest.raises(ps.PdfTooManyPagesSubprocessError):
+        ps.parse_pdf_in_subprocess(too_many_pages_pdf())
+    # 全空白页不是失败：子进程正常返回空块序列，由上层判 NEEDS_OCR。
+    assert ps.parse_pdf_in_subprocess(all_blank_pdf()).blocks == ()
 
 
 @pytest.mark.parametrize(

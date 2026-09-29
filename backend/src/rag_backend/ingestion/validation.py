@@ -224,7 +224,7 @@ def validate_pdf_content(data: bytes) -> None:
     """校验 PDF 字节：非空、未超单文件上限、具备 ``%PDF-`` 魔数头。
 
     这里只做受理期可独立判断的二进制形状校验；页数、加密与结构损坏由 worker 解析子进程在
-    写 blob 之后判定（API 镜像不安装 pypdf）。
+    写 blob 之后判定（API 镜像不安装 pypdf/pdfplumber）。
     """
 
     if not data:

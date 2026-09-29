@@ -532,7 +532,7 @@
           "quote": "Weekends 09:00-14:00",
           "locator": {
             "sourceType": "pdf",
-            "parserVersion": "pypdf-6.19.0-v1",
+            "parserVersion": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
             "headingPath": [],
             "page": 1
           }
@@ -555,7 +555,7 @@
           "quote": "Place orders by 17:00 the day before",
           "locator": {
             "sourceType": "pdf",
-            "parserVersion": "pypdf-6.19.0-v1",
+            "parserVersion": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
             "headingPath": [],
             "page": 2
           }
@@ -578,7 +578,7 @@
           "quote": "Each voucher is worth 30 CNY",
           "locator": {
             "sourceType": "pdf",
-            "parserVersion": "pypdf-6.19.0-v1",
+            "parserVersion": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
             "headingPath": [],
             "page": 3
           }
@@ -823,7 +823,7 @@
           "quote": "Place orders by 17:00 the day before",
           "locator": {
             "sourceType": "pdf",
-            "parserVersion": "pypdf-6.19.0-v1",
+            "parserVersion": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
             "headingPath": [],
             "page": 2
           }

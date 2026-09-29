@@ -14,6 +14,7 @@ from rag_backend.ingestion.embedding_client import (
     EmbeddingTransportError,
 )
 from rag_backend.ingestion.identity_preflight import ProfileIdentityDecision
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 
 
 def claim_facts(**overrides: Any) -> iw.ClaimFacts:
@@ -46,8 +47,8 @@ STALE_VERSION = uuid.UUID("00000000-0000-0000-0000-0000000000bb")
         (claim_facts(), iw.ClaimAction.CLAIM),
         (
             claim_facts(
-                parser_version="pypdf-6.19.0-v1",
-                expected_parser_version="pypdf-6.19.0-v1",
+                parser_version=PDF_PARSER_VERSION,
+                expected_parser_version=PDF_PARSER_VERSION,
             ),
             iw.ClaimAction.CLAIM,
         ),

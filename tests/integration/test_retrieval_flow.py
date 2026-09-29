@@ -1185,7 +1185,7 @@ async def test_mixed_markdown_and_pdf_same_kb_are_both_recalled(
         {
             "locator_version": 2,
             "source_type": "pdf",
-            "parser_version": "pypdf-6.19.0-v1",
+            "parser_version": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
             "source_sha256": "a" * 64,
             "pages": [1],
             "block_ordinals": [0],

@@ -36,6 +36,7 @@ from rag_backend.dispatch.repository import SqlOutboxRepository
 from rag_backend.ingestion import indexing_worker as iw
 from rag_backend.ingestion import service as ingestion_service
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore
 from rag_backend.ingestion.validation import (
     build_version_dedupe_key,
@@ -271,7 +272,7 @@ def identity_for_job(engine: Engine, job_id: uuid.UUID) -> FakeIdentity:
     return FakeIdentity(
         profile=contract,
         parser_version=MARKDOWN_PARSER_VERSION,
-        pdf_parser_version="pypdf-6.19.0-v1",
+        pdf_parser_version=PDF_PARSER_VERSION,
         docx_parser_version="python-docx-1.2.0-v1",
         token_counter=FakeCounter(),
         keyword_analyzer=PipelineAnalyzer(),

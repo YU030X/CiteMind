@@ -28,14 +28,17 @@ dependencies = [
 [dependency-groups]
 dev = [
   "mypy>=1.17,<2",
-  # DOCX 解析依赖只进 dev 与 worker 组：api 镜像不安装 python-docx/lxml。
+  # PDF/DOCX 解析依赖只进 dev 与 worker 组：api 镜像不安装 pdfplumber/pdfminer/Pillow/python-docx/lxml。
+  "pdfplumber==0.11.10",
   "python-docx==1.2.0",
   "pypdf==6.19.0",
   "pytest>=8.4,<10",
   "ruff>=0.12,<1",
 ]
 worker = [
-  # worker 侧 PDF/DOCX 解析依赖；api 镜像不安装 pypdf/python-docx，也不复制 BGE tokenizer 产物。
+  # worker 侧 PDF/DOCX 解析依赖；api 镜像不安装 pypdf/pdfplumber/pdfminer/Pillow/python-docx，也不复制 tokenizer 产物。
+  # pypdf 只做加密/页数/结构预检，pdfplumber 负责逐页正文抽取。
+  "pdfplumber==0.11.10",
   "pypdf==6.19.0",
   "python-docx==1.2.0",
 ]

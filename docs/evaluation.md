@@ -19,7 +19,7 @@ MVP 先有至少 30 道开发题；100 题与留出集用于完整评估。gold 
 
 Phase 1 要交付的“至少 30 道开发题”已落地为**开发集**（`datasetKind=dev`，不是留出集或测试集）：`tests/evaluation/dev-questions.json` 含 40 道唯一题，分类计数与上表开发列一致（单文档 24、跨文档 8、无答案/证据不足 4、当前角色无权限 4），并覆盖版本更新、逻辑删除、多轮追问与 PDF 页定位四种场景标签。
 
-**语料与定位。** 语料为自制、无敏感内容：`tests/evaluation/corpus/` 下的 Markdown 样本与由 `tests/evaluation/tools/build_corpus.py`（只用 dev 组已有的 `pypdf`，输出字节确定）生成的文本层 `cafeteria.pdf`；语料清单 `tests/evaluation/corpus/manifest.json` 记录每个逻辑文档的版本、样本文件、来源类型、解析器版本与 active/superseded/deleted 状态，另登记各角色可访问的 KB 集合。gold 引用只绑定（KB、文档、版本）与原文定位，外加解析器版本，**不绑定 chunk UUID**：Markdown 用 `locator.headingPath`（标题路径数组）加 1-based 闭区间 `startLine`/`endLine`；PDF 用 1-based `page`，`headingPath` 必须为空且不带行号（PDF 没有可靠行号，绝不伪造）。校验器用与入库同一实现重放样本文件：Markdown 重新解析后必须存在 `headingPath` 与行区间都相等的块且 `quote` 落在该块文本内，PDF 必须能在声明页抽到含 `quote` 的文本；清单 `parserVersion` 与实现常量不一致时报解析器漂移。
+**语料与定位。** 语料为自制、无敏感内容：`tests/evaluation/corpus/` 下的 Markdown 样本与由 `tests/evaluation/tools/build_corpus.py`（只用 dev 组已有的 `pypdf`，输出字节确定）生成的文本层 `cafeteria.pdf`（解析与校验走 `rag_backend.ingestion.pdf_parsing` 的 pypdf 预检 + pdfplumber 逐页抽取，`parserVersion` 记录的是解析实现版本）；语料清单 `tests/evaluation/corpus/manifest.json` 记录每个逻辑文档的版本、样本文件、来源类型、解析器版本与 active/superseded/deleted 状态，另登记各角色可访问的 KB 集合。gold 引用只绑定（KB、文档、版本）与原文定位，外加解析器版本，**不绑定 chunk UUID**：Markdown 用 `locator.headingPath`（标题路径数组）加 1-based 闭区间 `startLine`/`endLine`；PDF 用 1-based `page`，`headingPath` 必须为空且不带行号（PDF 没有可靠行号，绝不伪造）。校验器用与入库同一实现重放样本文件：Markdown 重新解析后必须存在 `headingPath` 与行区间都相等的块且 `quote` 落在该块文本内，PDF 必须能在声明页抽到含 `quote` 的文本；清单 `parserVersion` 与实现常量不一致时报解析器漂移。
 
 **每题字段。** 每题保存角色、请求 KB 集合（`scope.kbIds`）、问题（多轮题另存 `standaloneQuestion` 与 `history`）、预期行为、gold 答案要点与 `goldSourceSpans`。另有两类可选字段：
 

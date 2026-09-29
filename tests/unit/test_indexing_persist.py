@@ -22,6 +22,7 @@ from rag_backend.ingestion.parse_subprocess import (
     PdfTooManyPagesSubprocessError,
 )
 from rag_backend.ingestion.parsing import ParsedDocument, parse_markdown
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy.exc import OperationalError
@@ -54,7 +55,7 @@ class FakeAnalyzer:
 class FakeIdentity:
     profile = PROFILE
     parser_version = "markdown-it-py-4.2.0-v1"
-    pdf_parser_version = "pypdf-6.19.0-v1"
+    pdf_parser_version = PDF_PARSER_VERSION
     docx_parser_version = "python-docx-1.2.0-v1"
     token_counter = FakeCounter()
     keyword_analyzer = FakeAnalyzer()
@@ -84,7 +85,6 @@ MARKDOWN_TEXT = "# 标题\n\n正文段落。\n"
 MARKDOWN_SHA256 = hashlib.sha256(MARKDOWN_TEXT.encode("utf-8")).hexdigest()
 PDF_TEXT = "PDF page text\n"
 PDF_SHA256 = hashlib.sha256(PDF_TEXT.encode("utf-8")).hexdigest()
-PDF_PARSER_VERSION = "pypdf-6.19.0-v1"
 
 
 def dummy_session_factory() -> Any:

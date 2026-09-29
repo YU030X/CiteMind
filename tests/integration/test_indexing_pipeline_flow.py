@@ -41,6 +41,7 @@ from test_core_migration import alembic_config, alembic_revision, business_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
 from docx_samples import nested_table_docx, positive_samples  # noqa: E402
+from pdf_samples import positive_samples as pdf_positive_samples  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -335,7 +336,7 @@ def make_dependencies(
     resolved_identity = identity or FakeIdentity(
         profile=PROFILE,
         parser_version=MARKDOWN_PARSER_VERSION,
-        pdf_parser_version="pypdf-6.19.0-v1",
+        pdf_parser_version=PDF_PARSER_VERSION,
         docx_parser_version="python-docx-1.2.0-v1",
         token_counter=FakeCounter(),
         keyword_analyzer=FakeAnalyzer(),
@@ -981,6 +982,55 @@ def test_pdf_pipeline_publishes_ready_with_page_locator(
         assert locator["source_type"] == "pdf"
         assert len(locator["pages"]) == 1
         assert "start_line" not in locator
+
+
+def test_pdf_pipeline_publishes_ready_for_all_positive_samples(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    """真实解析子进程（假编码器）把 5 份自制 PDF 正样本发布为 READY，并落 v2 页定位。"""
+
+    samples = pdf_positive_samples()
+    assert len(samples) == 5
+    for name, raw in samples.items():
+        seeded = seed_job(
+            pipeline_schema,
+            storage,
+            parser_version=PDF_PARSER_VERSION,
+            source_type="pdf",
+            content=raw,
+        )
+        dependencies = make_dependencies(worker_sessions, storage)
+
+        status = iw.process_ingest_event(
+            dependencies, job_id=seeded.job_id, event_id=str(uuid.uuid4())
+        )
+
+        assert status == iw.PROCESS_STATUS_READY, name
+        assert read_job(pipeline_schema, seeded.job_id)["status"] == "READY"
+        document = read_document(pipeline_schema, seeded.document_id)
+        assert document["active_version_id"] == seeded.version_id, name
+        with pipeline_schema.connect() as connection:
+            locators = [
+                row[0]
+                for row in connection.execute(
+                    text(
+                        "SELECT source_locator FROM chunk WHERE document_id = :id "
+                        "ORDER BY chunk_index"
+                    ),
+                    {"id": seeded.document_id},
+                )
+            ]
+        assert locators, name
+        for locator in locators:
+            assert locator["locator_version"] == 2, name
+            assert locator["source_type"] == "pdf", name
+            assert "start_line" not in locator, name
+            assert locator["segments"], name
+            assert all(
+                segment["page"] is not None for segment in locator["segments"]
+            ), name
 
 
 def test_pdf_zero_text_marks_version_needs_ocr(

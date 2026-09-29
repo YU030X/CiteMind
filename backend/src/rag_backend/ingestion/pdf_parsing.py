@@ -1,22 +1,26 @@
-"""文本层 PDF 纯解析：把 PDF 字节按页抽取为带页定位的纯数据块。
+"""文本层 PDF 纯解析：pypdf 预检 + pdfplumber 逐页抽取，输出带页定位的纯数据块。
 
 本模块只做解析，不接触数据库、队列或模型：输入是上传校验已接受的 PDF 字节，输出是不可变
 的数据结构。它不写文件、不写日志、不渲染、不联网，因此可在单元测试里独立验证。
 
-边界（与 [文档入库](../../../docs/ingestion.md) 的来源定位表一致）：
+双引擎边界（与 [文档入库](../../../docs/ingestion.md) 的来源定位表一致）：
 
-- 逐页调用 pypdf ``extract_text``；每个非空页产生一个块，``heading_path`` 为空元组，
-  ``start_line``/``end_line`` 保持 ``None``——PDF 没有可靠行号，绝不伪造。
+- ``pypdf`` 只在 worker 解析子进程阶段做预检：读取结构、判定 ``is_encrypted`` 标志与页数；结构
+  损坏、任何加密标志（含仅空口令即可解密的 PDF）与页数超限分别抛具名错误。它在文本层抽取
+  之前失败，因此预检不依赖 pdfplumber。
+- ``pdfplumber`` 只负责逐页正文抽取：每个非空页产生一个块，``heading_path`` 为空元组，
+  ``start_line``/``end_line`` 保持 ``None``——PDF 没有可靠行号，绝不伪造；部分空白页被忽略，
+  只有全部页都无文本才返回空块序列，由入库管线判为 ``NEEDS_OCR``。
 - ``source_sha256`` 只按原始 bytes 计算；``page`` 为 1-based 页号，供 ``locator_version=2``
   的页定位使用。
 - 页数上限 ``MAX_PDF_PAGES``（200）：超过即拒绝；零可提取文本（扫描件）返回空块序列，由
   入库管线判为 ``NEEDS_OCR``，不把空提取当成功。
 - 加密、结构损坏分别抛 :class:`PdfEncryptedError` / :class:`PdfInvalidError`，由上层映射为
-  静态失败，不携带正文、路径或凭据。任何 ``is_encrypted`` 标志都拒绝（包括仅用空口令即可
-  解密的 PDF）；本模块不做 ``decrypt``，也暂不区分加密种类。
+  静态失败，不携带正文、路径或凭据。本模块不做 ``decrypt``，也不尝试空白口令解密。
 
-``pypdf`` 是 worker 组依赖：本模块顶层**不**导入 pypdf，只有 ``parse_pdf`` 被真正调用时才
-延迟导入，因此 API 镜像（不安装 worker 组）仍可导入本模块取得 ``PDF_PARSER_VERSION``。
+``pypdf`` 与 ``pdfplumber`` 都是 worker 组依赖：本模块顶层**不**导入它们，只有 ``parse_pdf``
+被真正调用时才延迟导入，因此 API 镜像（不安装 worker 组）仍可导入本模块取
+``PDF_PARSER_VERSION``，且不会加载 pdfplumber/pdfminer/Pillow。
 """
 
 from __future__ import annotations
@@ -26,8 +30,11 @@ import io
 
 from rag_backend.ingestion.parsing import ParsedBlock, ParsedDocument
 
-# 上传事务与解析实现共用的单一真源：包含精确 pypdf 版本；升级依赖时必须同步评审。
-PDF_PARSER_VERSION = "pypdf-6.19.0-v1"
+# 上传事务与解析实现共用的单一真源：分别钉死两个引擎的精确版本，再拼成实现版本字符串。
+# 升级任一依赖都必须同步评审并更新对应常量与字面量测试。
+PYPDF_VERSION = "6.19.0"
+PDFPLUMBER_VERSION = "0.11.10"
+PDF_PARSER_VERSION = f"pypdf-{PYPDF_VERSION}+pdfplumber-{PDFPLUMBER_VERSION}-v1"
 
 # 单文档最多解析的页数；超过则不抽取、静态失败，避免资源无界占用。
 MAX_PDF_PAGES = 200
@@ -51,7 +58,7 @@ class PdfTooManyPagesError(PdfParsingError):
 
 
 class PdfInvalidError(PdfParsingError):
-    """PDF 结构损坏、不是 PDF 或 pypdf 无法解析。"""
+    """PDF 结构损坏、不是 PDF，或 pdfplumber 无法抽取文本层。"""
 
 
 def _normalize_page_text(raw: str) -> str:
@@ -60,22 +67,17 @@ def _normalize_page_text(raw: str) -> str:
     return raw.strip()
 
 
-def parse_pdf(content: bytes) -> ParsedDocument:
-    """逐页抽取 PDF 文本层，返回带页定位的块序列。
-
-    零可提取文本返回空块序列（调用方据此判 ``NEEDS_OCR``）；加密、页数超限、结构损坏分
-    别抛具名错误。``pypdf`` 在函数内延迟导入，避免 API 镜像导入本模块时失败。
-    """
+def _precheck(content: bytes) -> int:
+    """用 pypdf 做结构/加密/页数预检，返回页数；失败抛具名错误。"""
 
     from pypdf import PdfReader
     from pypdf.errors import PdfReadError
 
-    source_sha256 = hashlib.sha256(content).hexdigest()
     try:
         reader = PdfReader(io.BytesIO(content), strict=False)
         if reader.is_encrypted:
             raise PdfEncryptedError("PDF 已加密")
-        page_count = len(reader.pages)
+        return len(reader.pages)
     except PdfEncryptedError:
         raise
     except PdfReadError:
@@ -84,18 +86,43 @@ def parse_pdf(content: bytes) -> ParsedDocument:
         # 非 pypdf 已知错误（含畸形对象/内存边界外的异常）统一收敛为静态损坏。
         raise PdfInvalidError("PDF 结构损坏") from None
 
+
+def _extract_page_texts(content: bytes, page_count: int) -> list[str]:
+    """用 pdfplumber 逐页抽取文本层；结构/页数不一致都收敛为静态损坏。"""
+
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            pages = pdf.pages
+            if len(pages) != page_count:
+                # 两个引擎对页数判断不一致：结果不确定，静态失败而不是产出可疑正文。
+                raise PdfInvalidError("PDF 页数不一致")
+            return [_normalize_page_text(page.extract_text() or "") for page in pages]
+    except PdfInvalidError:
+        raise
+    except Exception:
+        # pdfplumber/pdfminer 已知与未知错误统一收敛，不泄露底层正文或路径。
+        raise PdfInvalidError("PDF 结构损坏或文本层抽取失败") from None
+
+
+def parse_pdf(content: bytes) -> ParsedDocument:
+    """先用 pypdf 预检、再用 pdfplumber 逐页抽取，返回带页定位的块序列。
+
+    零可提取文本返回空块序列（调用方据此判 ``NEEDS_OCR``）；加密、页数超限、结构损坏分
+    别抛具名错误。两个引擎都在函数内延迟导入，避免 API 镜像导入本模块时失败，也不把
+    pdfplumber/pdfminer/Pillow 带进 API 进程。
+    """
+
+    source_sha256 = hashlib.sha256(content).hexdigest()
+    page_count = _precheck(content)
     if page_count > MAX_PDF_PAGES:
         raise PdfTooManyPagesError("PDF 页数超过上限")
 
+    page_texts = _extract_page_texts(content, page_count)
+
     blocks: list[ParsedBlock] = []
-    page_texts: list[str] = []
-    for index in range(page_count):
-        try:
-            text = reader.pages[index].extract_text() or ""
-        except Exception:
-            raise PdfInvalidError("PDF 页解析失败") from None
-        normalized = _normalize_page_text(text)
-        page_texts.append(normalized)
+    for index, normalized in enumerate(page_texts):
         if not normalized:
             continue
         blocks.append(
@@ -121,8 +148,10 @@ def parse_pdf(content: bytes) -> ParsedDocument:
 
 __all__ = [
     "MAX_PDF_PAGES",
+    "PDFPLUMBER_VERSION",
     "PDF_MAGIC",
     "PDF_PARSER_VERSION",
+    "PYPDF_VERSION",
     "SOURCE_TYPE_PDF",
     "PdfEncryptedError",
     "PdfInvalidError",

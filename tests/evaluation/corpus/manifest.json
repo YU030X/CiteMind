@@ -73,7 +73,7 @@
               "version": 1,
               "file": "cafeteria.pdf",
               "sourceType": "pdf",
-              "parserVersion": "pypdf-6.19.0-v1",
+              "parserVersion": "pypdf-6.19.0+pdfplumber-0.11.10-v1",
               "status": "active"
             }
           ]

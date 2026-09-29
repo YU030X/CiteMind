@@ -25,6 +25,7 @@ from rag_backend.ingestion import (
     worker_index_identity,
 )
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
+from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.token_counting import (
     DEFAULT_MODEL_DIRECTORY,
     TokenCounterError,
@@ -184,7 +185,7 @@ def test_identity_matches_frozen_golden_seven_fields(
     assert profile.keyword_analyzer_version == GOLDEN_KEYWORD_ANALYZER_VERSION
     assert profile.config_hash() == GOLDEN_CONFIG_HASH
     assert identity.parser_version == MARKDOWN_PARSER_VERSION == "markdown-it-py-4.2.0-v1"
-    assert identity.pdf_parser_version == "pypdf-6.19.0-v1"
+    assert identity.pdf_parser_version == PDF_PARSER_VERSION
     # 真实 KeywordAnalyzer 构造一次并直接取自报 analyzer_id。
     assert isinstance(identity.keyword_analyzer, KeywordAnalyzer)
     assert identity.keyword_analyzer.analyzer_id == GOLDEN_KEYWORD_ANALYZER_VERSION

@@ -499,9 +499,9 @@ def _assert_gold_match(
         )
     try:
         parsed = parse_pdf(content)
-    except ImportError as error:  # pypdf 属 dev/worker 组，仅在校验 PDF 时才需要
+    except ImportError as error:  # pdfplumber 属 dev/worker 组，仅在校验 PDF 时才需要
         raise DatasetValidationError(
-            f"[{question_id}] 缺少 pypdf，无法校验 PDF gold 引用"
+            f"[{question_id}] 缺少 pdfplumber，无法校验 PDF gold 引用"
         ) from error
     except PdfParsingError as error:
         raise DatasetValidationError(f"[{question_id}] PDF 解析失败：{error}") from error
