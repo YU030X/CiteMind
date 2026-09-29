@@ -15,6 +15,10 @@ Phase 3 第 2 片新增纯离线模块：``ranking_metrics``（固定 Recall@10/
 （拒答阈值扫描）、``ablation``（A/B/C 产物 schema 与三元组校验）与 ``analysis``
 （``python -m rag_backend.evaluation.analysis`` 只读题集与三个产物的离线入口）。它们不联网、
 不调用模型，也不产生真实指标数值。
+
+Phase 3 第 3 片新增只读探针核心 ``probe``、真实适配器 ``probe_adapters`` 与可执行入口
+``probe_cli``（``python -m rag_backend.evaluation.probe_cli``）。入口默认 dry-run，只校验覆盖与
+预算；真实运行必须显式开启并给出硬上限，且本轮尚未对真实数据库/inference 运行。
 """
 
 from rag_backend.evaluation.dataset import (

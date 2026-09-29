@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
 from pydantic import ValidationError
 from rag_backend.evaluation.calibration import (
     Behavior,
+    CalibrationArtifact,
     CalibrationInputError,
     RefusalProbeRecord,
     evaluate_refusal_threshold,
@@ -130,3 +132,34 @@ def test_select_returns_none_without_usable_points() -> None:
 def test_non_finite_threshold_rejected() -> None:
     with pytest.raises(CalibrationInputError):
         evaluate_refusal_threshold([], threshold=math.inf)
+
+
+def test_calibration_artifact_dumps_aliased_fixed_contract() -> None:
+    artifact = CalibrationArtifact(
+        dataset_kind="dev",
+        dataset_version="v1",
+        created_at="2026-09-29T00:00:00+00:00",
+        records=[_record("a", "answer", 0.5)],
+    )
+    payload = json.loads(artifact.model_dump_json(by_alias=True, indent=2))
+    assert payload["datasetKind"] == "dev"
+    assert payload["sourceVariant"] == "B_RRF"
+    assert payload["scoreField"] == "fusionScore"
+    assert payload["records"][0]["questionId"] == "a"
+
+
+def test_calibration_artifact_rejects_duplicates_and_empty_records() -> None:
+    with pytest.raises(ValidationError):
+        CalibrationArtifact(
+            dataset_kind="dev",
+            dataset_version="v1",
+            created_at="2026-09-29T00:00:00+00:00",
+            records=[_record("dup", "answer", 0.5), _record("dup", "answer", 0.6)],
+        )
+    with pytest.raises(ValidationError):
+        CalibrationArtifact(
+            dataset_kind="dev",
+            dataset_version="v1",
+            created_at="2026-09-29T00:00:00+00:00",
+            records=[],
+        )

@@ -27,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 Behavior = Literal["answer", "refuse"]
+CalibrationVariant = Literal["B_RRF"]
+CalibrationScoreField = Literal["fusionScore"]
 
 
 class CalibrationInputError(Exception):
@@ -54,6 +56,29 @@ class RefusalProbeRecord(_Model):
             raise ValueError(f"[{self.question_id}] candidateCount=0 时 topScore 必须为空")
         if self.candidate_count > 0 and self.top_score is None:
             raise ValueError(f"[{self.question_id}] candidateCount>0 时必须提供 topScore")
+        return self
+
+
+class CalibrationArtifact(_Model):
+    """一次拒答标定探针的落盘产物；来源与计分口径固定为 B 的 RRF 融合分。
+
+    只描述**已记录**的观察值，不生成阈值、不挑选最优阈值，也不产生任何真实指标。重复
+    ``questionId`` 直接拒绝，避免同一题被重复计分。
+    """
+
+    dataset_kind: Literal["dev", "holdout"]
+    dataset_version: str = Field(min_length=1)
+    source_variant: CalibrationVariant = "B_RRF"
+    score_field: CalibrationScoreField = "fusionScore"
+    created_at: str = Field(min_length=1)
+    records: list[RefusalProbeRecord] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_unique_records(self) -> CalibrationArtifact:
+        ids = [record.question_id for record in self.records]
+        duplicates = sorted({item for item in ids if ids.count(item) > 1})
+        if duplicates:
+            raise ValueError(f"重复的题目 id：{', '.join(duplicates)}")
         return self
 
 

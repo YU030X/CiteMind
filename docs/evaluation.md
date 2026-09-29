@@ -1,6 +1,6 @@
 # 评估与验收计划
 
-> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，第 2 片已落地纯离线的 Recall@10/nDCG@10 计算、拒答阈值扫描与 A/B/C 消融产物契约，但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，排序/拒答/消融没有任何真实指标数值，质量与性能目标仍未测量。
+> 所有数字是待验证的目标，没有已完成的测试结果——本节已实测的 Phase 1 开发集结果与五项确定性指标例外（见“已运行：Phase 1 真实 40 题开发评估”）。保留数据集版本、模型 revision、配置、原始输出、硬件、并发、失败分母与评估脚本，使结果可复算。Phase 1 的 40 题开发集、自制语料、离线校验与最小 runner 已实现并已对真实隔离链路运行一次；Phase 3 第 1 片已落地固定留出集文件、扩展 schema、跨集校验与冲突/注入指标定义，第 2 片已落地纯离线的 Recall@10/nDCG@10 计算、拒答阈值扫描与 A/B/C 消融产物契约，第 3 片已落地依赖注入式只读探针核心，第 4 片已落地真实 PostgreSQL/inference adapter 与可执行 `probe_cli`（默认 dry-run，尚未真实运行），但 **100 题（开发 + 留出）尚未对真实模型与真实权限环境运行**，排序/拒答/消融没有任何真实指标数值，质量与性能目标仍未测量。
 
 ## 固定题集
 
@@ -113,6 +113,14 @@ uv run pytest tests/unit/test_ranking_metrics.py tests/unit/test_calibration.py 
 候选 locator 只能由 `load_evidence_chunks` 返回的授权行映射，且必须与资产表中的逻辑 KB、文档、版本完全一致；题目按 `scope.role` 使用各自用户/组织身份。只有预期 `no_permission` 题的授权拒绝会形成三组空候选；只有明确的 `RerankUnavailableError` 会让 C 原样回退 B 并标记 `rerank_unavailable`。拒答探针固定记录 B 的 rank-1 `fusionScore`，`actualBehavior` 仍为空，不代表真实问答拒答结果。A/B 分别记录自身检索墙钟时间，C 记录 B 加额外重排时间；预算在每次本地 embedding/rerank 请求前硬计数。
 
 本片尚未实现真实 PostgreSQL/inference adapter、角色身份解析、CLI/dry-run 护栏或 JSON 原子落盘，因此**不能运行真实探针，也没有任何真实指标或时延结果**。初版核心曾运行 8 个 fake 聚焦测试并通过；随后按静态核对补强多角色身份、授权 locator、异常与延迟契约，补强后的测试未再次执行。
+
+## 已实现：Phase 3 第 4 片真实 adapter 与探针 CLI（可执行，尚未真实运行）
+
+`evaluation/probe_adapters.py` 提供只读 PostgreSQL 与 inference 的真实适配器：DSN 必须是 `postgresql+psycopg` 且数据库名以 `_test` 结尾（可用 `--allow-database-name` 精确重申）；`AsyncProbeDatabase` 按需创建并追踪 `AsyncSession`，允许 `release` 交接连接，运行结束统一关闭全部 session 并 `dispose` engine。身份解析要求题集实际角色 `username` 在同一组织内唯一命中 `user_account`，全部 scope KB 属于同一组织；所有 active `index_profile` 身份（profile id/模型名/revision/dimension/normalize/查询契约/关键词分析器）必须完全一致，否则静态失败——artifact 的 `modelIdentities` 只允许全局 scalar，不能任选一个 profile。候选 `locator` 只从 `EvidenceChunkRow.source_locator` 解析当前评估支持的 `markdown`/`pdf`，畸形或 `web`/`docx` 一律静态失败。inference 客户端只用显式 token 与 base URL 构造，复用既有 URL 白名单与超时；运行时统一 `close`。
+
+`evaluation/probe_cli.py`（`python -m rag_backend.evaluation.probe_cli`）默认 dry-run：只读取题集、环境描述（`EnvironmentDescriptor`）与 `load_asset_map` 产物，校验 scope KB 覆盖、角色凭据存在与预算最坏下界（`maxEmbedding >= 2 * 题数`、`maxRerank >= 非 no_permission 题数`），**不读取数据库 DSN/token 环境变量、不构造客户端、不写文件**。真实运行必须 `--allow-real-probe` 与 `--allow-real-rerank`，holdout 另需 `--confirm-holdout`；DSN 与 token 从指定环境变量读取（不读 `.env`），缺失即静态失败。产物先驻留内存并通过 `validate_ablation_triplet` 与严格 `CalibrationArtifact` 校验，再在同一输出目录写唯一临时文件，四份全部成功后才 `os.replace` 为 `a-vector.json`/`b-rrf.json`/`c-rerank.json`/`calibration.json`；正式目标已存在则拒绝覆盖，校验或运行失败不创建任何正式文件。错误消息静态，不回显 query/text/token/DSN/username/UUID，也不打印 traceback。
+
+**本轮未运行**：真实 PostgreSQL/inference 连接、真实 A/B/C 探针与任何 `Recall@10`/`nDCG@10`/标定/时延数值。dry-run 与全部 adapter/CLI 单测使用 fake 运行时，不建 engine、不联网。
 
 ## 已实现：开发集最小结果 producer（runner）
 
