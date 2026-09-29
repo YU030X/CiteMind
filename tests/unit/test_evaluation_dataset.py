@@ -87,7 +87,7 @@ def test_dev_dataset_validates_with_expected_distribution() -> None:
     report = validate_dataset(dataset, manifest, corpus_dir)
 
     assert dataset.dataset_kind == "dev"
-    assert report.dataset_version == "citemind-eval-dev-1"
+    assert report.dataset_version == "citemind-eval-dev-2"
     assert report.total == 40 == len(dataset.questions)
     assert report.category_counts == _EXPECTED_CATEGORY_COUNTS
 

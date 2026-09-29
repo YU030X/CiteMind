@@ -12,7 +12,8 @@
 - 结果只有恰好覆盖题集全部 id 时才写出；任何 API 错误、超时、未 READY 或无法映射的引用都让
   运行不完整，CLI 退出非零且不写结果文件，绝不编造拒答填充 40 题。
 - 默认 dry-run：不联网、不写库、不调用模型，只打印计划与预算估算。真实调用必须显式
-  ``--allow-real-llm`` 并给出正的 ``--max-model-requests`` 硬上限。
+  ``--allow-real-llm`` 并给出正的 ``--max-model-requests`` 硬上限；对 ``datasetKind=holdout``
+  的真实运行还必须显式 ``--confirm-holdout``，dry-run 与离线结构校验不要求。
 
 本模块不建评估平台、不建新数据库、不用 LLM 裁判、不改业务 API、不引入新框架。
 """
@@ -558,7 +559,13 @@ def run_questions(
 
     complete = _covers_exactly(dataset, results)
     return RunOutcome(
-        EvaluationResults(results=results) if complete else None,
+        EvaluationResults(
+            dataset_kind=dataset.dataset_kind,
+            dataset_version=dataset.dataset_version,
+            results=results,
+        )
+        if complete
+        else None,
         tuple(diagnostics),
         budget.spent,
     )
@@ -818,6 +825,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="显式开启真实 API/模型调用；默认 dry-run 不联网",
     )
     parser.add_argument(
+        "--confirm-holdout",
+        action="store_true",
+        help="真实运行 holdout 题集时必须显式确认的护栏；dry-run 不要求",
+    )
+    parser.add_argument(
         "--max-model-requests",
         type=int,
         default=0,
@@ -873,6 +885,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         dataset, manifest, corpus_dir = load_dataset_bundle(args.dataset)
         validate_dataset(dataset, manifest, corpus_dir)
+        if (
+            args.allow_real_llm
+            and dataset.dataset_kind == "holdout"
+            and not args.confirm_holdout
+        ):
+            print("真实运行 holdout 题集必须显式加 --confirm-holdout。", file=sys.stderr)
+            return 1
         descriptor = _load_descriptor(args.descriptor)
         registry = AssetRegistry()
         _register_descriptor_kbs(descriptor, registry)

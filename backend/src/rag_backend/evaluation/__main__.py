@@ -4,10 +4,11 @@
 
     uv run python -m rag_backend.evaluation
     uv run python -m rag_backend.evaluation --dataset tests/evaluation/dev-questions.json
+    uv run python -m rag_backend.evaluation --holdout tests/evaluation/holdout-questions.json
     uv run python -m rag_backend.evaluation --results path/to/results.json
 
-不传 ``--results`` 时只校验题集结构、分类、来源与 gold 匹配；该入口不联网、不读环境文件、
-不调用任何模型，也不产生质量评分。
+不传 ``--results`` 时只校验题集结构、分类、来源与 gold 匹配；给出 ``--holdout`` 时额外做跨集校验
+（id 不重叠、归一化近重复、合计矩阵 50/20/15/15）。该入口不联网、不读环境文件、不调用任何模型。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from rag_backend.evaluation.dataset import (
     DatasetValidationError,
     load_dataset_bundle,
     validate_dataset,
+    validate_dataset_pair,
 )
 from rag_backend.evaluation.metrics import (
     EvaluationResults,
@@ -50,11 +52,23 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="可选：真实运行产生的结果文件，用于计算确定性指标",
     )
+    parser.add_argument(
+        "--holdout",
+        type=Path,
+        default=None,
+        help="可选：留出题集 JSON 路径；给出后做 dev+holdout 跨集校验",
+    )
     args = parser.parse_args(argv)
 
     try:
         dataset, manifest, corpus_dir = load_dataset_bundle(args.dataset)
         report = validate_dataset(dataset, manifest, corpus_dir)
+        pair_report = None
+        if args.holdout is not None:
+            holdout, holdout_manifest, holdout_corpus = load_dataset_bundle(args.holdout)
+            pair_report = validate_dataset_pair(
+                dataset, holdout, holdout_manifest, holdout_corpus
+            )
     except (DatasetValidationError, ValidationError) as error:
         print(f"题集校验失败：{error}", file=sys.stderr)
         return 1
@@ -70,6 +84,16 @@ def main(argv: list[str] | None = None) -> int:
     if report.tag_counts:
         tags = "、".join(f"{key}={value}" for key, value in sorted(report.tag_counts.items()))
         print("标签：" + tags)
+
+    if pair_report is not None:
+        combined = "、".join(
+            f"{key}={value}" for key, value in sorted(pair_report.combined_category_counts.items())
+        )
+        print(
+            f"跨集校验通过：dev={pair_report.dev.total} holdout={pair_report.holdout.total} "
+            f"合计 total={pair_report.total}"
+        )
+        print("跨集矩阵：" + combined)
 
     if args.results is None:
         print("未提供 --results，跳过指标计算（真实指标需由实际运行结果文件产生）。")
@@ -89,6 +113,9 @@ def main(argv: list[str] | None = None) -> int:
         f"citationSourceValidity={metrics.citation_source_validity} "
         f"goldSourceCoverage={metrics.gold_source_coverage} "
         f"permissionLeakCount={metrics.permission_leak_count} "
+        f"conflictResolutionRate={metrics.conflict_resolution_rate} "
+        f"injectionLeakCount={metrics.injection_leak_count} "
+        f"injectionResistanceRate={metrics.injection_resistance_rate} "
         f"(answered={metrics.answered} refused={metrics.refused} "
         f"expectedAnswer={metrics.expected_answer} expectedRefuse={metrics.expected_refuse})"
     )

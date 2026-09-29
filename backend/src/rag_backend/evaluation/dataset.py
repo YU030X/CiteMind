@@ -5,11 +5,16 @@
 - gold 引用只绑定**来源版本**与**原文行区间或页码**（外加解析器版本），不绑定 chunk UUID；
   校验时用同一解析器重放样本文件，确认引文确实落在声明的区间/页。
 - 校验器不联网、不读环境文件、不调用模型；PDF 校验才延迟导入 ``pypdf``。
-- 开发题集（``datasetKind="dev"``）用于结构自检，不冒充留出集或质量评分。
+- 开发题集（``datasetKind="dev"``）与留出题集（``datasetKind="holdout"``）共用同一语料清单；
+  留出集按“流程隔离固定留出”提交仓库，仅是固定问题与固定分母，不是保密或盲测。
+- 跨集校验 ``validate_dataset_pair`` 只做确定性结构检查（id 不重叠、归一化近重复、合计矩阵），
+  不引入模糊语义模型。
 """
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +34,19 @@ CATEGORIES: tuple[Category, ...] = (
     "no_permission",
 )
 MIN_DEV_QUESTIONS = 30
+HOLDOUT_QUESTION_COUNT = 60
+HOLDOUT_CATEGORY_COUNTS: dict[str, int] = {
+    "single_document": 26,
+    "cross_document": 12,
+    "unanswerable": 11,
+    "no_permission": 11,
+}
+PAIR_CATEGORY_COUNTS: dict[str, int] = {
+    "single_document": 50,
+    "cross_document": 20,
+    "unanswerable": 15,
+    "no_permission": 15,
+}
 
 # 题集自身不得泄露的最小“实质行”长度；短行（标题、口令等）不参与泄漏判定。
 _LEAK_MIN_LINE_CHARS = 12
@@ -183,6 +201,8 @@ class EvaluationQuestion(_Model):
     unavailable_document_ids: list[str] = Field(default_factory=list)
     unavailable_reason: UnavailableReason | None = None
     distractors: list[GoldSpan] = Field(default_factory=list)
+    conflicting_spans: list[GoldSpan] = Field(default_factory=list)
+    injection_canary: str | None = None
     tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -227,13 +247,23 @@ class EvaluationQuestion(_Model):
             raise ValueError("pdf_page 题必须至少有一个 PDF gold span")
         if "version_update" in self.tags and not self.distractors:
             raise ValueError("version_update 题必须给出 superseded 版本 distractor")
+        if "evidence_conflict" in self.tags:
+            if not self.conflicting_spans:
+                raise ValueError("evidence_conflict 题必须至少有一个 conflictingSpans")
+        elif self.conflicting_spans:
+            raise ValueError("未标记 evidence_conflict 的题不能带 conflictingSpans")
+        if "prompt_injection" in self.tags:
+            if not self.injection_canary:
+                raise ValueError("prompt_injection 题必须带非空 injectionCanary")
+        elif self.injection_canary:
+            raise ValueError("未标记 prompt_injection 的题不能带 injectionCanary")
         return self
 
 
 class EvaluationDataset(_Model):
-    """开发题集文件；``datasetKind`` 目前只允许 ``dev``，防止开发集冒充留出/测试集。"""
+    """评估题集文件；``datasetKind`` 区分 ``dev`` 与 ``holdout``，防止开发集冒充留出集。"""
 
-    dataset_kind: Literal["dev"]
+    dataset_kind: Literal["dev", "holdout"]
     dataset_version: str = Field(min_length=1)
     corpus_manifest: str = Field(min_length=1)
     notes: str = ""
@@ -249,6 +279,17 @@ class ValidationReport:
     total: int
     category_counts: dict[str, int]
     tag_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class PairValidationReport:
+    """开发集 + 留出集的跨集校验汇总；分母固定为两集合计。"""
+
+    dev: ValidationReport
+    holdout: ValidationReport
+    total: int
+    combined_category_counts: dict[str, int]
+    combined_tag_counts: dict[str, int]
 
 
 def load_manifest(path: Path) -> CorpusManifest:
@@ -280,8 +321,10 @@ def validate_dataset(
     for question in dataset.questions:
         _validate_scope(question, manifest)
         _validate_gold_spans(question, manifest, corpus_dir)
+        _validate_conflicting_spans(question, manifest, corpus_dir)
         _validate_distractors(question, manifest, corpus_dir)
         _validate_unavailable_documents(question, manifest, corpus_dir)
+        _validate_injection_canary(question, manifest, corpus_dir)
     return ValidationReport(
         dataset_kind=dataset.dataset_kind,
         dataset_version=dataset.dataset_version,
@@ -289,6 +332,100 @@ def validate_dataset(
         category_counts=dict(Counter(question.category for question in dataset.questions)),
         tag_counts=dict(Counter(tag for question in dataset.questions for tag in question.tags)),
     )
+
+
+def validate_dataset_pair(
+    dev: EvaluationDataset,
+    holdout: EvaluationDataset,
+    manifest: CorpusManifest,
+    corpus_dir: Path,
+) -> PairValidationReport:
+    """校验开发集 + 留出集：各自合法、id 不重叠、无跨集近重复，且合计矩阵为 50/20/15/15。"""
+
+    if dev.dataset_kind != "dev" or holdout.dataset_kind != "holdout":
+        raise DatasetValidationError("跨集校验要求第一个题集为 dev、第二个为 holdout")
+    if dev.corpus_manifest != holdout.corpus_manifest:
+        raise DatasetValidationError("dev 与 holdout 必须声明同一个 corpusManifest")
+    dev_report = validate_dataset(dev, manifest, corpus_dir)
+    holdout_report = validate_dataset(holdout, manifest, corpus_dir)
+    _assert_no_id_overlap(dev, holdout)
+    _assert_no_near_duplicates(dev, holdout)
+    combined = Counter(question.category for question in dev.questions)
+    combined.update(question.category for question in holdout.questions)
+    combined_by_name = {str(key): value for key, value in combined.items()}
+    if combined_by_name != PAIR_CATEGORY_COUNTS:
+        raise DatasetValidationError(f"dev+holdout 分类矩阵不符：{combined_by_name}")
+    combined_tags = Counter(tag for question in dev.questions for tag in question.tags)
+    combined_tags.update(tag for question in holdout.questions for tag in question.tags)
+    return PairValidationReport(
+        dev=dev_report,
+        holdout=holdout_report,
+        total=dev_report.total + holdout_report.total,
+        combined_category_counts=combined_by_name,
+        combined_tag_counts=dict(combined_tags),
+    )
+
+
+def _assert_no_id_overlap(dev: EvaluationDataset, holdout: EvaluationDataset) -> None:
+    overlap = {question.id for question in dev.questions} & {
+        question.id for question in holdout.questions
+    }
+    if overlap:
+        raise DatasetValidationError(
+            f"dev 与 holdout 存在重复题目 id：{', '.join(sorted(overlap))}"
+        )
+
+
+def _assert_no_near_duplicates(dev: EvaluationDataset, holdout: EvaluationDataset) -> None:
+    for dev_question in dev.questions:
+        for holdout_question in holdout.questions:
+            if _questions_near_duplicate(dev_question, holdout_question):
+                raise DatasetValidationError(
+                    f"开发题 {dev_question.id} 与留出题 {holdout_question.id} 的问题文本近重复"
+                )
+
+
+def _questions_near_duplicate(
+    first: EvaluationQuestion, second: EvaluationQuestion
+) -> bool:
+    first_texts = _question_texts(first)
+    second_texts = _question_texts(second)
+    for left in first_texts:
+        for right in second_texts:
+            if left and right and _edit_distance_at_most_one(left, right):
+                return True
+    return False
+
+
+def _question_texts(question: EvaluationQuestion) -> list[str]:
+    texts = [_normalize_question_text(question.question)]
+    if question.standalone_question:
+        texts.append(_normalize_question_text(question.standalone_question))
+    return texts
+
+
+def _normalize_question_text(text: str) -> str:
+    """NFKC + casefold + 空白折叠；用于跨集近重复判定。"""
+
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _edit_distance_at_most_one(first: str, second: str) -> bool:
+    """判断两个已归一化字符串的编辑距离（插入/删除/替换）是否 ≤1。"""
+
+    if first == second:
+        return True
+    if abs(len(first) - len(second)) > 1:
+        return False
+    if len(first) > len(second):
+        first, second = second, first
+    index = 0
+    while index < len(first) and first[index] == second[index]:
+        index += 1
+    if len(first) == len(second):
+        return first[index + 1 :] == second[index + 1 :]
+    return first[index:] == second[index + 1 :]
 
 
 def _assert_unique_ids(dataset: EvaluationDataset) -> None:
@@ -303,6 +440,17 @@ def _assert_category_coverage(dataset: EvaluationDataset) -> None:
         raise DatasetValidationError(
             f"开发题集至少需要 {MIN_DEV_QUESTIONS} 道题，当前 {len(dataset.questions)} 道"
         )
+    if dataset.dataset_kind == "holdout":
+        if len(dataset.questions) != HOLDOUT_QUESTION_COUNT:
+            raise DatasetValidationError(
+                f"留出题集必须恰好 {HOLDOUT_QUESTION_COUNT} 道题，当前 {len(dataset.questions)} 道"
+            )
+        counts = Counter(question.category for question in dataset.questions)
+        counts_by_name = {str(key): value for key, value in counts.items()}
+        if counts_by_name != HOLDOUT_CATEGORY_COUNTS:
+            raise DatasetValidationError(
+                f"留出题集分类计数不符：{counts_by_name}"
+            )
     present = {question.category for question in dataset.questions}
     missing = [category for category in CATEGORIES if category not in present]
     if missing:
@@ -329,6 +477,72 @@ def _validate_gold_spans(
         if entry.status != "active":
             raise DatasetValidationError(f"[{question.id}] 可回答题的 gold 必须绑定 active 版本")
         _assert_gold_match(question.id, corpus_dir / entry.file, span, entry)
+
+
+def _validate_conflicting_spans(
+    question: EvaluationQuestion, manifest: CorpusManifest, corpus_dir: Path
+) -> None:
+    """冲突 span 必须绑定 active 版本、落在本题 scope 内，且不得与 gold 重复。"""
+
+    gold_keys = {
+        (span.kb_id, span.document_id, span.version, span.quote)
+        for span in question.gold_source_spans
+    }
+    gold_source_keys = {
+        (span.kb_id, span.document_id, span.version)
+        for span in question.gold_source_spans
+    }
+    for span in question.conflicting_spans:
+        _assert_span_scope_and_access(question, span, manifest)
+        entry = _resolve_span_entry(question, span, manifest)
+        if entry.status != "active":
+            raise DatasetValidationError(f"[{question.id}] conflicting span 必须绑定 active 版本")
+        key = (span.kb_id, span.document_id, span.version, span.quote)
+        if key in gold_keys:
+            raise DatasetValidationError(f"[{question.id}] conflicting span 不得与 gold 重复")
+        if (span.kb_id, span.document_id, span.version) in gold_source_keys:
+            raise DatasetValidationError(
+                f"[{question.id}] conflicting span 必须与 gold 来自不同文档版本，"
+                "以匹配结果引用的可判定粒度"
+            )
+        _assert_gold_match(question.id, corpus_dir / entry.file, span, entry)
+
+
+def _validate_injection_canary(
+    question: EvaluationQuestion, manifest: CorpusManifest, corpus_dir: Path
+) -> None:
+    """注入 canary 必须非空且出现在本题 scope 内角色可访问的 active 语料正文中。"""
+
+    canary = question.injection_canary
+    if canary is None:
+        return
+    for kb_id in question.scope.kb_ids:
+        if not manifest.role_can_access_kb(question.scope.role, kb_id):
+            continue
+        documents = manifest.knowledge_bases[kb_id].documents.values()
+        for document in documents:
+            for entry in document.versions:
+                if entry.status != "active" or entry.source_type != "markdown":
+                    continue
+                if _canary_in_markdown(question.id, corpus_dir / entry.file, canary):
+                    return
+    raise DatasetValidationError(
+        f"[{question.id}] injectionCanary 未出现在本题 scope 内可访问语料正文中"
+    )
+
+
+def _canary_in_markdown(question_id: str, path: Path, canary: str) -> bool:
+    from rag_backend.ingestion.parsing import parse_markdown
+
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise DatasetValidationError(f"[{question_id}] 语料文件不可读：{path.name}") from error
+    try:
+        parsed = parse_markdown(content)
+    except UnicodeDecodeError as error:
+        raise DatasetValidationError(f"[{question_id}] 语料文件不是有效 UTF-8") from error
+    return any(canary in block.text for block in parsed.blocks)
 
 
 def _assert_span_scope_and_access(

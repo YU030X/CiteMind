@@ -1,6 +1,6 @@
 {
   "datasetKind": "dev",
-  "datasetVersion": "citemind-eval-dev-1",
+  "datasetVersion": "citemind-eval-dev-2",
   "corpusManifest": "corpus/manifest.json",
   "notes": "Phase 1 开发评估集：自制无敏感语料，用于开发期调参与离线结构校验。它不是留出集或测试集，不得用其结果声称最终质量；真实质量指标仍需在留出集上按固定分母、真实模型与真实权限环境测量。",
   "questions": [

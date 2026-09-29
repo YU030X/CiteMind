@@ -41,10 +41,14 @@ from rag_backend.evaluation.runner import (
     validate_static_configuration,
     verify_environment,
 )
+from rag_backend.evaluation.runner import (
+    main as runner_main,
+)
 from rag_backend.evaluation.runner_adapters import HttpBackend, SqlEvaluationDatabase
 
 _EVALUATION_DIR = Path(__file__).resolve().parents[1] / "evaluation"
 _DATASET_PATH = _EVALUATION_DIR / "dev-questions.json"
+_HOLDOUT_DATASET_PATH = _EVALUATION_DIR / "holdout-questions.json"
 _CORPUS_DIR = _EVALUATION_DIR / "corpus"
 _KB_HANDBOOK = "kb-handbook"
 _KB_RESTRICTED = "kb-restricted"
@@ -138,15 +142,16 @@ def _seeded_registry() -> tuple[AssetRegistry, FakeUploader, FakeReadiness]:
 def test_seed_corpus_uploads_versions_in_order_and_waits() -> None:
     registry, uploader, readiness = _seeded_registry()
     kinds = [call[0] for call in uploader.calls]
-    # 先按 KB 列表确认专用隔离 KB 为空；handbook 有两个逻辑版本，legacy-bonus 上传后被删除。
+    # 先按 KB 列表确认专用隔离 KB 为空；handbook 与 leave-policy 各有两个逻辑版本。
     assert kinds.count("list") == 2
-    assert kinds.count("new") == 7
+    # kb-handbook 9 个文档 + kb-restricted 1 个文档 = 10 个首版上传。
+    assert kinds.count("new") == 10
     assert kinds.count("version") == 2  # handbook 与 leave-policy 各一个第二版
     assert kinds.count("delete") == 1
     # 每个版本上传后都立即等待 active；删除后再等 deleted。
     active_events = [event for event in readiness.events if event[0] == "active"]
     deleted_events = [event for event in readiness.events if event[0] == "deleted"]
-    assert len(active_events) == 9
+    assert len(active_events) == 12
     assert len(deleted_events) == 1
     # 逻辑版本映射：handbook 的第一版登记为清单版本 2，第二版为 3。
     assert registry.version_ref(registry.version_uuid(_HANDBOOK_V3)) == _HANDBOOK_V3
@@ -548,6 +553,8 @@ def test_run_questions_covers_all_40_dev_questions() -> None:
     assert outcome.results is not None
     assert len(outcome.results.results) == 40
     assert len(outcome.diagnostics) == 40
+    assert outcome.results.dataset_kind == "dev"
+    assert outcome.results.dataset_version == "citemind-eval-dev-2"
 
 
 def test_run_questions_login_failure_is_incomplete_with_question_id() -> None:
@@ -818,3 +825,53 @@ def test_question_execution_error_requires_question_id() -> None:
     error = QuestionExecutionError("q-1", "引用缺失")
     assert error.question_id == "q-1"
     assert error.reason == "引用缺失"
+
+
+def _write_holdout_descriptor(tmp_path: Path) -> Path:
+    payload = {
+        "knowledgeBases": {
+            _KB_HANDBOOK: str(uuid.uuid4()),
+            _KB_RESTRICTED: str(uuid.uuid4()),
+        },
+        "roles": {
+            "staff": {"username": "staff-user", "password": "pw"},
+            "hr": {"username": "hr-user", "password": "pw"},
+            "seed": {"username": "seed-user", "password": "pw"},
+        },
+        "seedRole": "seed",
+    }
+    path = tmp_path / "descriptor.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_runner_requires_confirm_holdout_for_real_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = runner_main(
+        [
+            "--dataset",
+            str(_HOLDOUT_DATASET_PATH),
+            "--descriptor",
+            str(tmp_path / "missing.json"),
+            "--allow-real-llm",
+            "--max-model-requests",
+            "10",
+            "--api-base-url",
+            "http://127.0.0.1:1",
+            "--results-out",
+            str(tmp_path / "results.json"),
+        ]
+    )
+    assert rc == 1
+    assert "confirm-holdout" in capsys.readouterr().err
+
+
+def test_runner_dry_run_holdout_needs_no_confirm(tmp_path: Path) -> None:
+    descriptor = _write_holdout_descriptor(tmp_path)
+
+    rc = runner_main(
+        ["--dataset", str(_HOLDOUT_DATASET_PATH), "--descriptor", str(descriptor)]
+    )
+
+    assert rc == 0

@@ -89,6 +89,42 @@
               "status": "deleted"
             }
           ]
+        },
+        "expense-policy": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "expense-policy.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "expense-policy-appendix": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "expense-policy-appendix.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
+        },
+        "security-bulletin": {
+          "currentVersion": 1,
+          "versions": [
+            {
+              "version": 1,
+              "file": "security-bulletin.md",
+              "sourceType": "markdown",
+              "parserVersion": "markdown-it-py-4.2.0-v1",
+              "status": "active"
+            }
+          ]
         }
       }
     },

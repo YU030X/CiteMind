@@ -16,4 +16,5 @@
 | [document-acl-read-narrowing](implemented/document-acl-read-narrowing.md) | 文档 ACL 只收紧读取、首次 DELETE 授权与下载鉴权时序 |
 | [docx-minimal-subset](implemented/docx-minimal-subset.md) | DOCX 允许子集、`locator_version=3` 与 ZIP 安全限额 |
 | [pdf-dual-engine-text-layer](implemented/pdf-dual-engine-text-layer.md) | PDF pypdf 预检 + pdfplumber 抽取的双引擎分工与诚实解析器版本 |
+| [phase3-fixed-holdout-dataset-contract](implemented/phase3-fixed-holdout-dataset-contract.md) | Phase 3 固定 100 题数据契约、流程隔离留出与冲突/注入确定性指标 |
 | [web-static-fetch](implemented/web-static-fetch.md) | 受限静态网页抓取、`locator_version=4` 与 DNS 竞态边界 |
