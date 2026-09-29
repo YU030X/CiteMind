@@ -219,9 +219,7 @@ async def search_authorized_chunks(
     except KeywordAnalyzerInputError as error:
         raise RetrievalQueryInvalid("查询超出可处理长度") from error
 
-    embedded = await _embed_query(embedder, query, scope)
-    if len(embedded.vector) != scope.dimension:
-        raise RetrievalEmbeddingError("查询向量维度与索引 profile 不一致")
+    embedded = await embed_query_for_scope(embedder, query, scope)
 
     try:
         vector_candidates = await repository.fetch_vector_candidates(
@@ -296,21 +294,51 @@ async def _rerank_top_candidates(
         scores = await run_in_threadpool(reranker.rerank, query, inputs)
     except RerankUnavailableError:
         return fused, (STAGE_RERANK_UNAVAILABLE,)
-    score_by_id = {score.candidate_id: score.score for score in scores}
-    if set(score_by_id) != {candidate.candidate_id for candidate in inputs}:
+    ordered = apply_rerank_scores(fused, scores)
+    if ordered is None:
         return fused, (STAGE_RERANK_UNAVAILABLE,)
+    return ordered, ()
+
+
+def apply_rerank_scores(
+    fused: Sequence[FusedCandidate],
+    scores: Sequence[RerankScore],
+) -> list[FusedCandidate] | None:
+    """把 ``candidateId -> score`` 应用到 RRF top-K，返回完整候选顺序。
+
+    排序规则冻结在此处：只重排 ``fused[:RERANK_TOP_K]``，按分数降序、同分 ``chunkId`` 整数值
+    升序；``fusionRank``/``fusionScore`` 等既有字段不改，其余候选保持原融合顺序跟在其后。
+    分数集合与 top-K 的 ``candidateId`` 不完全一致（缺失、多余或重复）时返回 ``None``，由调用方
+    决定降级（生产）或整体失败（探针），本函数不伪造分数。
+    """
+
+    top = list(fused[:RERANK_TOP_K])
+    rest = list(fused[RERANK_TOP_K:])
+    expected = {str(candidate.chunk_id) for candidate in top}
+    score_by_id: dict[str, float] = {}
+    for score in scores:
+        if score.candidate_id in score_by_id:
+            return None
+        score_by_id[score.candidate_id] = score.score
+    if set(score_by_id) != expected:
+        return None
     ordered = sorted(
         top,
         key=lambda candidate: (-score_by_id[str(candidate.chunk_id)], candidate.chunk_id.int),
     )
-    return [*ordered, *rest], ()
+    return [*ordered, *rest]
 
 
-async def _embed_query(embedder: QueryEmbedder, query: str, scope: RetrievalScope) -> EmbeddedQuery:
-    """在线程池内执行同步编码客户端，并把失败收敛为静态领域错误。"""
+async def embed_query_for_scope(
+    embedder: QueryEmbedder, query: str, scope: RetrievalScope
+) -> EmbeddedQuery:
+    """在线程池内编码查询、核对维度，并把失败收敛为静态领域错误。
+
+    生产检索与只读 A 探针共用这一处编码语义，避免探针复制维度校验或错误分类。
+    """
 
     try:
-        return await run_in_threadpool(embedder.embed_query, query, scope.model_revision)
+        embedded = await run_in_threadpool(embedder.embed_query, query, scope.model_revision)
     except QueryEmbeddingInputError as error:
         raise RetrievalQueryInvalid("查询无法编码") from error
     except QueryEmbeddingError as error:
@@ -319,6 +347,9 @@ async def _embed_query(embedder: QueryEmbedder, query: str, scope: RetrievalScop
             retryable=error.retryable,
             retry_after_seconds=error.retry_after_seconds,
         ) from error
+    if len(embedded.vector) != scope.dimension:
+        raise RetrievalEmbeddingError("查询向量维度与索引 profile 不一致")
+    return embedded
 
 
 __all__ = [
@@ -328,6 +359,8 @@ __all__ = [
     "Reranker",
     "RetrievalResult",
     "RetrievalScope",
+    "apply_rerank_scores",
+    "embed_query_for_scope",
     "resolve_retrieval_scope",
     "search_authorized_chunks",
 ]

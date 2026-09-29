@@ -18,4 +18,5 @@
 | [pdf-dual-engine-text-layer](implemented/pdf-dual-engine-text-layer.md) | PDF pypdf 预检 + pdfplumber 抽取的双引擎分工与诚实解析器版本 |
 | [phase3-fixed-holdout-dataset-contract](implemented/phase3-fixed-holdout-dataset-contract.md) | Phase 3 固定 100 题数据契约、流程隔离留出与冲突/注入确定性指标 |
 | [phase3-offline-ranking-calibration-ablation](implemented/phase3-offline-ranking-calibration-ablation.md) | Phase 3 第 2 片离线 Recall@10/nDCG@10、拒答阈值扫描与 A/B/C 消融产物契约 |
+| [phase3-readonly-ablation-probe-core](implemented/phase3-readonly-ablation-probe-core.md) | Phase 3 第 3 片只读 A/B/C 探针核心、授权来源映射与降级边界 |
 | [web-static-fetch](implemented/web-static-fetch.md) | 受限静态网页抓取、`locator_version=4` 与 DNS 竞态边界 |

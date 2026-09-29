@@ -106,6 +106,14 @@ uv run pytest tests/unit/test_ranking_metrics.py tests/unit/test_calibration.py 
 
 **本轮未测**：任何真实 A/B/C 探针、真实拒答阈值扫描、真实 Recall@10/nDCG@10 数值，以及它们与生产检索/问答默认开关、路由、配置的关系。
 
+## 已实现：Phase 3 第 3 片只读探针核心（尚不可独立运行）
+
+`evaluation/probe.py` 已把 A/B/C 的内存编排接到生产检索契约，但仍是依赖注入核心，不是可执行 CLI：A 单独复用授权 scope、查询编码与向量候选 SQL；B 复用 `search_authorized_chunks(..., reranker=None)`；C 对 B 的 top-10 授权加载正文，释放数据库事务后调用 reranker。生产与探针共用 `embed_query_for_scope` 和 `apply_rerank_scores`，避免复制向量维度校验与重排排序规则。
+
+候选 locator 只能由 `load_evidence_chunks` 返回的授权行映射，且必须与资产表中的逻辑 KB、文档、版本完全一致；题目按 `scope.role` 使用各自用户/组织身份。只有预期 `no_permission` 题的授权拒绝会形成三组空候选；只有明确的 `RerankUnavailableError` 会让 C 原样回退 B 并标记 `rerank_unavailable`。拒答探针固定记录 B 的 rank-1 `fusionScore`，`actualBehavior` 仍为空，不代表真实问答拒答结果。A/B 分别记录自身检索墙钟时间，C 记录 B 加额外重排时间；预算在每次本地 embedding/rerank 请求前硬计数。
+
+本片尚未实现真实 PostgreSQL/inference adapter、角色身份解析、CLI/dry-run 护栏或 JSON 原子落盘，因此**不能运行真实探针，也没有任何真实指标或时延结果**。初版核心曾运行 8 个 fake 聚焦测试并通过；随后按静态核对补强多角色身份、授权 locator、异常与延迟契约，补强后的测试未再次执行。
+
 ## 已实现：开发集最小结果 producer（runner）
 
 `rag_backend.evaluation.runner` 把开发集或留出集接到**真实 API** 上，产出恰好覆盖题集全部 id 的 results 文件供既有 `--results` 指标消费；它不建评估平台、不建新数据库、不引入 LLM 裁判，也不改业务 API 或公开 `Citation` 字段。
