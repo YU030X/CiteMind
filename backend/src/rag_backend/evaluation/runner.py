@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic.alias_generators import to_camel
@@ -47,6 +47,14 @@ from rag_backend.evaluation.metrics import (
     QuestionResult,
     ResultCitation,
 )
+from rag_backend.evaluation.usage_artifact import (
+    RunnerUsageArtifact,
+    UsageArtifactError,
+    build_runner_usage_artifact,
+)
+
+if TYPE_CHECKING:
+    from rag_backend.evaluation.runner_adapters import UsageAttemptRow
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -247,9 +255,22 @@ class UploadReceipt:
 
 @dataclass(frozen=True)
 class AskOutcome:
+    # 调用前生成的整轮关联键；成功响应必带，失败响应不返回该值。
+    query_run_id: uuid.UUID
     refused: bool
     citation_ids: tuple[uuid.UUID, ...]
     answer_text: str
+
+
+@dataclass(frozen=True)
+class AskRunRecord:
+    """runner 已成功拿到 ``queryRunId`` 的一次 ask；用于构建原始 usage 产物。"""
+
+    question_id: str
+    conversation_id: uuid.UUID
+    query_run_id: uuid.UUID
+    turn_index: int
+    is_final_question: bool
 
 
 class CorpusUploader(Protocol):
@@ -301,6 +322,14 @@ class CitationLookup(Protocol):
     def version_ids_for(
         self, citation_ids: Sequence[uuid.UUID]
     ) -> Mapping[uuid.UUID, uuid.UUID]: ...
+
+
+class UsageLedgerLookup(Protocol):
+    """只读账本查询：按调用前关联键返回 provider attempt 行。"""
+
+    def usage_attempts_for(
+        self, query_run_ids: Sequence[uuid.UUID]
+    ) -> Sequence[UsageAttemptRow]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +549,8 @@ class RunOutcome:
     results: EvaluationResults | None
     diagnostics: tuple[QuestionDiagnostic, ...]
     budget_spent: int
+    # 包括运行失败前已经成功拿到 queryRunId 的 ask；失败运行的最终 ask 不在其中。
+    usage_runs: tuple[AskRunRecord, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -538,10 +569,16 @@ def run_questions(
 
     results: list[QuestionResult] = []
     diagnostics: list[QuestionDiagnostic] = []
+    usage_runs: list[AskRunRecord] = []
     for question in dataset.questions:
         try:
             result = _run_question(
-                question, registry=registry, backend=backend, citations=citations, budget=budget
+                question,
+                registry=registry,
+                backend=backend,
+                citations=citations,
+                budget=budget,
+                usage_runs=usage_runs,
             )
         except ConversationDenied as error:
             results.append(
@@ -553,7 +590,7 @@ def run_questions(
             continue
         except QuestionExecutionError as error:
             diagnostics.append(QuestionDiagnostic(question.id, "error", error.reason))
-            return RunOutcome(None, tuple(diagnostics), budget.spent)
+            return RunOutcome(None, tuple(diagnostics), budget.spent, tuple(usage_runs))
         results.append(result)
         diagnostics.append(QuestionDiagnostic(question.id, result.behavior))
 
@@ -568,6 +605,7 @@ def run_questions(
         else None,
         tuple(diagnostics),
         budget.spent,
+        tuple(usage_runs),
     )
 
 
@@ -578,6 +616,7 @@ def _run_question(
     backend: QuestionBackend,
     citations: CitationLookup,
     budget: ModelRequestBudget,
+    usage_runs: list[AskRunRecord],
 ) -> QuestionResult:
     try:
         session = backend.session_for(question.scope.role)
@@ -597,9 +636,18 @@ def _run_question(
             continue
         _spend(question, budget=budget, rewrite=prior_asks > 0)
         try:
-            session.ask(conversation_id, turn.text)
+            history_outcome = session.ask(conversation_id, turn.text)
         except BackendError as error:
             raise QuestionExecutionError(question.id, f"历史轮次回放失败：{error}") from error
+        usage_runs.append(
+            AskRunRecord(
+                question_id=question.id,
+                conversation_id=conversation_id,
+                query_run_id=history_outcome.query_run_id,
+                turn_index=prior_asks,
+                is_final_question=False,
+            )
+        )
         prior_asks += 1
 
     _spend(question, budget=budget, rewrite=prior_asks > 0)
@@ -607,6 +655,15 @@ def _run_question(
         outcome = session.ask(conversation_id, question.question)
     except BackendError as error:
         raise QuestionExecutionError(question.id, str(error)) from error
+    usage_runs.append(
+        AskRunRecord(
+            question_id=question.id,
+            conversation_id=conversation_id,
+            query_run_id=outcome.query_run_id,
+            turn_index=prior_asks,
+            is_final_question=True,
+        )
+    )
 
     if outcome.refused:
         return QuestionResult(
@@ -815,6 +872,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--results-out", type=Path, default=None, help="真实运行的结果文件路径")
     parser.add_argument("--diagnostics-out", type=Path, default=None, help="可选诊断文件路径")
     parser.add_argument(
+        "--usage-out",
+        type=Path,
+        default=None,
+        help="可选：逐题原始 provider usage 产物路径（真实运行且查询账本前需已部署迁移 0016）",
+    )
+    parser.add_argument(
         "--allow-non-loopback-api",
         action="store_true",
         help="允许 api-base-url 指向非回环地址；默认只接受回环地址",
@@ -954,6 +1017,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.results_out is None:
         print("真实运行必须提供 --results-out。", file=sys.stderr)
         return 1
+    if args.usage_out is not None:
+        conflict = _usage_out_conflict(args.usage_out, args.results_out, args.diagnostics_out)
+        if conflict is not None:
+            print(conflict, file=sys.stderr)
+            return 1
     database_url = _read_database_url(args.database_url_env, args.allow_database_name)
     if database_url is None:
         return 1
@@ -989,6 +1057,24 @@ def _read_database_url(env_name: str, allowed_name: str | None) -> str | None:
         )
         return None
     return database_url
+
+
+def _usage_out_conflict(
+    usage_out: Path, results_out: Path | None, diagnostics_out: Path | None
+) -> str | None:
+    """静态检查 usage 产物路径：不得与 results/diagnostics 相同，也不得覆盖已存在文件。"""
+
+    usage_path = _normalise_path(usage_out)
+    for flag, other in (("--results-out", results_out), ("--diagnostics-out", diagnostics_out)):
+        if other is not None and _normalise_path(other) == usage_path:
+            return f"--usage-out 不能与 {flag} 指向同一路径。"
+    if usage_out.exists():
+        return "--usage-out 已存在同名文件，拒绝覆盖。"
+    return None
+
+
+def _normalise_path(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
 
 
 def _database_name(database_url: str) -> str:
@@ -1072,6 +1158,13 @@ def _run_real(
             budget=budget,
         )
         diagnostics = outcome.diagnostics
+        # usage 产物先于 results 写出；不完整运行也写 complete=false，但绝不写 results。
+        _emit_usage_artifact(
+            usage_out=args.usage_out,
+            outcome=outcome,
+            database=database,
+            dataset=dataset,
+        )
         if not outcome.complete or outcome.results is None:
             print("运行不完整，未写出结果文件。", file=sys.stderr)
             _print_diagnostics(diagnostics)
@@ -1091,6 +1184,67 @@ def _run_real(
         if backend is not None:
             backend.close()
         database.close()
+
+
+def _emit_usage_artifact(
+    *,
+    usage_out: Path | None,
+    outcome: RunOutcome,
+    database: UsageLedgerLookup,
+    dataset: EvaluationDataset,
+) -> None:
+    """按捕获的 ``queryRunId`` 只读查询账本并原子写出 usage 产物；未提供路径则不做事。"""
+
+    if usage_out is None:
+        return
+    rows = database.usage_attempts_for(
+        [record.query_run_id for record in outcome.usage_runs]
+    )
+    artifact = _build_usage_artifact(
+        usage_runs=outcome.usage_runs,
+        usage_rows=rows,
+        dataset=dataset,
+        complete=outcome.complete,
+    )
+    _write_usage_artifact(usage_out, artifact)
+
+
+def _build_usage_artifact(
+    *,
+    usage_runs: Sequence[AskRunRecord],
+    usage_rows: Sequence[UsageAttemptRow],
+    dataset: EvaluationDataset,
+    complete: bool,
+) -> RunnerUsageArtifact:
+    try:
+        return build_runner_usage_artifact(
+            usage_runs,
+            usage_rows,
+            dataset_kind=dataset.dataset_kind,
+            dataset_version=dataset.dataset_version,
+            complete=complete,
+        )
+    except UsageArtifactError as error:
+        raise RunnerError(f"usage 产物构建失败：{error}") from error
+
+
+def _write_usage_artifact(path: Path, artifact: RunnerUsageArtifact) -> None:
+    """唯一临时文件 + ``os.replace`` 原子写出；已存在同名文件则拒绝覆盖。"""
+
+    if path.exists():
+        raise RunnerError("usage 产物目标已存在同名文件，拒绝覆盖")
+    temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temp.write_text(
+            artifact.model_dump_json(by_alias=True, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temp, path)
+    except OSError as error:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise RunnerError("usage 产物写入失败") from error
 
 
 def _print_diagnostics(diagnostics: Sequence[QuestionDiagnostic]) -> None:

@@ -43,7 +43,7 @@
 
 迁移 `20260929_0016_llm_usage_query_run_id` 紧接 `20260929_0015`，只给 append-only 的 `llm_usage` 增加一个可空 UUID 列 `query_run_id` 与普通 btree 索引 `ix_llm_usage_query_run_id`，线性单 head。
 
-`query_run_id` 是**调用前生成的整轮关联键，不建外键**：一次提问在调用任何 provider 之前生成一次，本轮全部 attempt（`qa_rewrite`、`qa_answer`、失败与来源变化重试）共用同一值，失败提问可能永远没有对应的 `query_run` 行，且账本按 attempt 分次提交，因此普通或 deferred 外键都会失败。历史行保持 NULL，不回填、不伪造。它只用于把整轮 attempt 归到一起，不代表一定存在对应 `query_run`，也不是完整计费系统：价目快照与费用仍为 NULL。服务写入时业务调用必传非空值，独立探针 `rag_backend.llm_probe` 不归任何业务 run，省略该列。表级 `SELECT`/`INSERT` GRANT 已覆盖新列，api 授权不变，worker 仍无任何权限。降级先删索引再删列。SQLAlchemy 模型 `LlmUsage` 同步声明该列。真实 PostgreSQL 迁移与授权由 `tests/integration/test_llm_usage_query_run_id_migration.py` 承担（列可空 UUID、无外键、具名 btree 索引、历史行 NULL、api 可读写、worker 拒绝、降级恢复），未配置测试 DSN 时按守卫跳过。
+`query_run_id` 是**调用前生成的整轮关联键，不建外键**：一次提问在调用任何 provider 之前生成一次，本轮全部 attempt（`qa_rewrite`、`qa_answer`、失败与来源变化重试）共用同一值，失败提问可能永远没有对应的 `query_run` 行，且账本按 attempt 分次提交，因此普通或 deferred 外键都会失败。历史行保持 NULL，不回填、不伪造。它只用于把整轮 attempt 归到一起，不代表一定存在对应 `query_run`，也不是完整计费系统：价目快照与费用仍为 NULL。服务写入时业务调用必传非空值，独立探针 `rag_backend.llm_probe` 不归任何业务 run，省略该列。表级 `SELECT`/`INSERT` GRANT 已覆盖新列，api 授权不变，worker 仍无任何权限。降级先删索引再删列。SQLAlchemy 模型 `LlmUsage` 同步声明该列。runner 的 `--usage-out` 通过 `SqlEvaluationDatabase.usage_attempts_for` 只用参数化 expanding `SELECT` 按该列读回账本行，即 **runner 使用 usage 产物前要求目标库已部署 `20260929_0016`**；该路径不写库、不新增授权。真实 PostgreSQL 迁移与授权由 `tests/integration/test_llm_usage_query_run_id_migration.py` 承担（列可空 UUID、无外键、具名 btree 索引、历史行 NULL、api 可读写、worker 拒绝、降级恢复），未配置测试 DSN 时按守卫跳过。
 
 ## 已实现：第四切片（迁移 20260923_0005）
 

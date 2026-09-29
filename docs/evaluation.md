@@ -144,7 +144,7 @@ uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.j
 uv run python -m rag_backend.evaluation.runner --descriptor path/to/descriptor.json --api-base-url http://127.0.0.1:58080 --results-out path/to/results.json --diagnostics-out path/to/diagnostics.json --allow-real-llm --max-model-requests 120
 ```
 
-本轮离线实测只覆盖离线编排与合成 HTTP：`uv run pytest tests/unit/test_evaluation_runner.py -q` 为 25 passed，`uv run ruff check backend/src/rag_backend/evaluation tests/unit/test_evaluation_runner.py` 与 `uv run mypy` 通过。**本 runner 已在 2026-09-28 于真实隔离栈（真 API + 真 PostgreSQL/Redis/Celery + 真本地 BGE + 真 DeepSeek provider）运行一次**，产出恰好 40 题结果，见下节；上述 86 与 `--max-model-requests` 是保守预留上界，不是实际计费次数。
+本轮离线实测只覆盖离线编排与合成 HTTP：`uv run --no-sync pytest tests/unit/test_evaluation_runner.py -q -p no:cacheprovider` 为 39 passed（含 usage-out 与 queryRunId 解析），`uv run --no-sync ruff check` 与 `uv run --no-sync mypy` 覆盖 `evaluation` 改动文件通过。**本 runner 已在 2026-09-28 于真实隔离栈（真 API + 真 PostgreSQL/Redis/Celery + 真本地 BGE + 真 DeepSeek provider）运行一次**，产出恰好 40 题结果，见下节；上述 86 与 `--max-model-requests` 是保守预留上界，不是实际计费次数。
 
 ## 已运行：Phase 1 真实 40 题开发评估（2026-09-28）
 
@@ -169,6 +169,16 @@ uv run python -m rag_backend.evaluation --results tests/evaluation/results/2026-
 ## 已实现：成本归因关联键（2026-09-29，迁移 `20260929_0016`）
 
 `llm_usage` 新增可空 UUID `query_run_id`（无外键）与普通 btree 索引 `ix_llm_usage_query_run_id`。`answer_question` 在调用任何 provider 之前生成一次该键，并透传给 `qa_rewrite` 与全部 `qa_answer` attempt（含失败与来源变化重试）；`_persist_turn` 用同一个值写 `query_run.id`，因此同轮全部账本行与运行行可互相归因。该键只在调用前存在、可能没有对应 `query_run`（例如生成失败），历史行保持 NULL，不是完整计费系统。本片**不做** runner usage artifact、价目快照/`Decimal` 成本、`conversation_id` 列、UI 与汇率；按题重算成本与独立 usage 产物仍属后续片。
+
+## 已实现：runner 逐题原始 usage 产物（2026-09-29，第 2 提交）
+
+`evaluation/usage_artifact.py` 新增严格 camelCase 的 `RunnerUsageArtifact`：每题每次 ask 一条 `UsageRun`（`questionId`/`conversationId`/`queryRunId`/`turnIndex`/`isFinalQuestion`/`usage`），`usage` 是带 `usageId`/`createdAt` 的 provider attempt 原始账本事实（同一 source retry 可有相同 `stage`/`attempt`，按账本身份保留；`stage` 只允许 `qa_rewrite`/`qa_answer`，`status` 只允许 `SUCCEEDED`/`FAILED`/`TIMEOUT`，token 缺失保持 `null` 并计入 `missingCount`，不填 0）。`totals` 同时给出全量与 `finalQuestionOnly` 的 `providerAttempts`/`succeeded`/`failed`/`timedOut` 与四个 token 字段的 `knownSum`/`missingCount`（另含 latency 已知和）。`generatedFrom` 固定为 `runner`。每个捕获的 run 都保留，即使 `usage=[]`；重复 `queryRunId`、每题重复 `turnIndex` 拒绝；`complete=true` 时每题必须恰有一个 `isFinalQuestion`，失败 partial 允许 0 个 final。构建时账本行必须落在已知 `queryRunId` 上，同一 run 内 `(stage, attempt)` 不得重复，否则静态失败。
+
+runner 侧：`AskOutcome` 新增必填 `query_run_id`，`_run_question` 把历史 user ask（`turnIndex` 从 0 递增）与 final ask（`turnIndex=len(历史 user 轮)`）逐次记为 `AskRunRecord`；发生 `QuestionExecutionError` 时 `RunOutcome.usage_runs` 仍携带失败前已成功拿到 `queryRunId` 的 ask。真实 CLI 新增可选 `--usage-out`：dry-run 不写；真实运行若提供，则在 `database.close()` 前按捕获的 `queryRunId` 只读查询 `llm_usage`（参数化 expanding `SELECT`，空输入不查询，需已部署迁移 `20260929_0016`）并原子写出（唯一临时文件 + `os.replace`，拒绝与 `--results-out`/`--diagnostics-out` 同路径，拒绝覆盖已存在文件）。完整运行先写 usage 再写 results；**不完整运行也写 `complete=false`** 后再返回 1，但绝不写 results。未提供 `--usage-out` 时行为与旧版逐字一致，`results.json` 字节契约不变。
+
+**已知边界（诚实记录）**：当前 HTTP 错误响应不返回 `queryRunId`，因此**最终 ask 失败**时该次 provider attempt 无法无歧义归因；产物只包含已拿到 `queryRunId` 的成功 HTTP ask，用 `complete=false` 与 diagnostics 表明不完整，**严禁**按时间窗口猜测失败 usage。setup（历史轮）成功但 final 失败时，setup 的 run 仍会输出。本提交**不做**价格/费用/汇率、不做 `Decimal` 成本、不改 API/schema/migration/grant/results metrics。
+
+离线聚焦验证：`uv run --no-sync pytest tests/unit/test_evaluation_usage_artifact.py tests/unit/test_evaluation_runner.py -q -p no:cacheprovider` 为 **50 passed**（全为合成 fake，无网络、无真实数据库、无模型）；`uv run --no-sync ruff check`（5 文件）与 `uv run --no-sync mypy`（3 个源文件）均通过。**未运行**：真实 PostgreSQL（`usage_attempts_for` 的 `SELECT`）、真实 HTTP `queryRunId` 解析、真实 runner `--usage-out`、Docker、全量 pytest/mypy。
 
 ## 消融与计分
 

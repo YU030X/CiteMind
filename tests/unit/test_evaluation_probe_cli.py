@@ -130,7 +130,10 @@ def _make_full_runtime() -> ProbeRuntime:
                 model_revision="rev-1",
                 dimension=512,
                 normalize=True,
+                tokenizer_revision="tokenizer-1",
+                chunker_version="chunker-1",
                 keyword_analyzer_version="analyzer-1",
+                config_hash="config-hash-1",
             )
             for kb_id in kb_ids
         ]

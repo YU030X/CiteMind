@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
 from pydantic import ValidationError
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from rag_backend.api.errors import (
     CODE_KNOWLEDGE_BASE_NOT_FOUND,
@@ -47,6 +50,17 @@ def _coerce_uuid(value: Any) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(str(value))
+
+
+def _required_uuid(payload: Mapping[str, Any], key: str, message: str) -> uuid.UUID:
+    """严格解析必填 UUID 字段；缺失或非法一律抛 ``BackendError``。"""
+
+    if key not in payload:
+        raise BackendError(message)
+    try:
+        return _coerce_uuid(payload[key])
+    except (ValueError, TypeError, AttributeError) as error:
+        raise BackendError(message) from error
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -163,6 +177,7 @@ class HttpRoleSession:
         )
         self._require(response, 200, "提问")
         payload = _json_object(response)
+        query_run_id = _required_uuid(payload, "queryRunId", "提问响应缺少或非法 queryRunId")
         refused = payload.get("insufficientEvidence")
         if not isinstance(refused, bool):
             raise BackendError("提问响应缺少 insufficientEvidence")
@@ -177,7 +192,12 @@ class HttpRoleSession:
         answer = payload.get("answer")
         if not isinstance(answer, str):
             raise BackendError("提问响应缺少 answer")
-        return AskOutcome(refused=refused, citation_ids=tuple(citation_ids), answer_text=answer)
+        return AskOutcome(
+            query_run_id=query_run_id,
+            refused=refused,
+            citation_ids=tuple(citation_ids),
+            answer_text=answer,
+        )
 
     # --- 语料准备 ---------------------------------------------------------
 
@@ -339,8 +359,27 @@ class HttpBackend:
         return session
 
 
+@dataclass(frozen=True)
+class UsageAttemptRow:
+    """``llm_usage`` 中的一条 provider attempt 事实（只读，含 queryRunId 与账本列）。"""
+
+    usage_id: uuid.UUID
+    query_run_id: uuid.UUID
+    created_at: datetime
+    stage: str
+    status: str
+    model: str
+    attempt: int
+    error_code: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    prompt_cache_hit_tokens: int | None
+    prompt_cache_miss_tokens: int | None
+    latency_ms: int | None
+
+
 class SqlEvaluationDatabase:
-    """只读评估数据库：引用 UUID -> 版本 UUID，以及 READY/删除状态轮询。"""
+    """只读评估数据库：引用 UUID -> 版本 UUID、账本行与 READY/删除状态轮询。"""
 
     _CITATION_QUERY = text(
         "SELECT id, version_id FROM citation WHERE id IN :ids"
@@ -351,6 +390,17 @@ class SqlEvaluationDatabase:
     _KB_QUERY = text("SELECT id FROM knowledge_base WHERE id IN :ids").bindparams(
         bindparam("ids", expanding=True)
     )
+    # 需要已部署迁移 20260929_0016（``llm_usage.query_run_id``）；只 SELECT，复用同一 engine。
+    _USAGE_QUERY = text(
+        """
+        SELECT id, query_run_id, created_at, stage, status, model, attempt, error_code,
+               prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
+               prompt_cache_miss_tokens, latency_ms
+        FROM llm_usage
+        WHERE query_run_id IN :ids
+        ORDER BY query_run_id, stage, created_at, id
+        """
+    ).bindparams(bindparam("ids", expanding=True))
 
     def __init__(self, database_url: str) -> None:
         try:
@@ -374,6 +424,39 @@ class SqlEvaluationDatabase:
                 self._CITATION_QUERY, {"ids": list(citation_ids)}
             ).all()
         return {_coerce_uuid(row[0]): _coerce_uuid(row[1]) for row in rows}
+
+    def usage_attempts_for(
+        self, query_run_ids: Sequence[uuid.UUID]
+    ) -> Sequence[UsageAttemptRow]:
+        """按调用前关联键只读返回账本行；空输入不查询。需要已部署迁移 ``20260929_0016``。"""
+
+        if not query_run_ids:
+            return ()
+        try:
+            with self._engine.connect() as connection:
+                rows = connection.execute(
+                    self._USAGE_QUERY, {"ids": list(query_run_ids)}
+                ).all()
+        except SQLAlchemyError as error:
+            raise core.RunnerError("usage 账本只读查询失败") from error
+        return tuple(
+            UsageAttemptRow(
+                usage_id=_coerce_uuid(row[0]),
+                query_run_id=_coerce_uuid(row[1]),
+                created_at=row[2],
+                stage=row[3],
+                status=row[4],
+                model=row[5],
+                attempt=row[6],
+                error_code=row[7],
+                prompt_tokens=row[8],
+                completion_tokens=row[9],
+                prompt_cache_hit_tokens=row[10],
+                prompt_cache_miss_tokens=row[11],
+                latency_ms=row[12],
+            )
+            for row in rows
+        )
 
     def missing_knowledge_base_ids(self, kb_ids: Sequence[uuid.UUID]) -> frozenset[uuid.UUID]:
         """返回只读数据库中不存在的 KB UUID；用于确认 API 与数据库同栈。"""
@@ -421,4 +504,9 @@ class SqlEvaluationDatabase:
         return row is not None and row[1] is not None
 
 
-__all__ = ["HttpBackend", "HttpRoleSession", "SqlEvaluationDatabase"]
+__all__ = [
+    "HttpBackend",
+    "HttpRoleSession",
+    "SqlEvaluationDatabase",
+    "UsageAttemptRow",
+]

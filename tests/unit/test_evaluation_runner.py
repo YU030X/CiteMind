@@ -10,16 +10,21 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretStr
 from rag_backend.auth.tokens import CSRF_HEADER_NAME
+from rag_backend.evaluation import runner as runner_module
+from rag_backend.evaluation import runner_adapters
 from rag_backend.evaluation.dataset import EvaluationDataset, load_dataset_bundle
 from rag_backend.evaluation.runner import (
     AskOutcome,
+    AskRunRecord,
     AssetRegistry,
     BackendError,
     ConversationDenied,
@@ -44,7 +49,11 @@ from rag_backend.evaluation.runner import (
 from rag_backend.evaluation.runner import (
     main as runner_main,
 )
-from rag_backend.evaluation.runner_adapters import HttpBackend, SqlEvaluationDatabase
+from rag_backend.evaluation.runner_adapters import (
+    HttpBackend,
+    SqlEvaluationDatabase,
+    UsageAttemptRow,
+)
 
 _EVALUATION_DIR = Path(__file__).resolve().parents[1] / "evaluation"
 _DATASET_PATH = _EVALUATION_DIR / "dev-questions.json"
@@ -322,6 +331,7 @@ class FakeSession:
         self._fail = fail
         self.asks: list[tuple[uuid.UUID, str]] = []
         self.conversations: list[tuple[uuid.UUID, ...]] = []
+        self.query_run_ids: list[uuid.UUID] = []
 
     def create_conversation(self, kb_ids: Sequence[uuid.UUID]) -> uuid.UUID:
         if self._deny:
@@ -334,11 +344,21 @@ class FakeSession:
         if self._fail:
             raise BackendError("提问失败（HTTP 502/GENERATION_FAILED）")
         self.asks.append((conversation_id, question))
+        query_run_id = uuid.uuid4()
+        self.query_run_ids.append(query_run_id)
         if self._refuse:
-            return AskOutcome(refused=True, citation_ids=(), answer_text="无法回答。")
+            return AskOutcome(
+                query_run_id=query_run_id,
+                refused=True,
+                citation_ids=(),
+                answer_text="无法回答。",
+            )
         assert self._citation_uuid is not None
         return AskOutcome(
-            refused=False, citation_ids=(self._citation_uuid,), answer_text="回答[1]。"
+            query_run_id=query_run_id,
+            refused=False,
+            citation_ids=(self._citation_uuid,),
+            answer_text="回答[1]。",
         )
 
 
@@ -597,6 +617,106 @@ def test_report_complete_only_for_all_ids() -> None:
     assert RunOutcome(None, (), 0).results is None
 
 
+def test_run_questions_records_history_and_final_usage_runs() -> None:
+    citation_uuid = uuid.uuid4()
+    session = FakeSession(citation_uuid=citation_uuid)
+    outcome = run_questions(
+        _multi_turn_dataset(),
+        registry=_question_registry(citation_uuid),
+        backend=FakeQuestionBackend(session),
+        citations=IdentityCitationLookup(),
+        budget=ModelRequestBudget(10),
+    )
+    assert outcome.complete
+    # q-single 只有最终 ask；q-multi 先历史 user（turn 0）再最终 ask（turn 1）。
+    assert [
+        (run.question_id, run.turn_index, run.is_final_question) for run in outcome.usage_runs
+    ] == [
+        ("q-single", 0, True),
+        ("q-multi", 0, False),
+        ("q-multi", 1, True),
+    ]
+    # 捕获的 queryRunId 必须与实际 ask 一一对应且不重复。
+    assert [run.query_run_id for run in outcome.usage_runs] == session.query_run_ids
+    assert len(set(run.query_run_id for run in outcome.usage_runs)) == 3
+
+
+def test_run_questions_partial_failure_keeps_successful_ask_runs() -> None:
+    citation_uuid = uuid.uuid4()
+
+    class FailFinalSession(FakeSession):
+        def ask(self, conversation_id: uuid.UUID, question: str) -> AskOutcome:
+            if question == "追问问题":
+                raise BackendError("提问失败（HTTP 502/GENERATION_FAILED）")
+            return super().ask(conversation_id, question)
+
+    session = FailFinalSession(citation_uuid=citation_uuid)
+    outcome = run_questions(
+        _multi_turn_dataset(),
+        registry=_question_registry(citation_uuid),
+        backend=FakeQuestionBackend(session),
+        citations=IdentityCitationLookup(),
+        budget=ModelRequestBudget(10),
+    )
+    assert not outcome.complete
+    assert outcome.results is None
+    # 失败前成功的 ask（含 setup 历史轮）仍被保留；失败的最终 ask 没有 queryRunId，不伪造。
+    assert [
+        (run.question_id, run.turn_index, run.is_final_question) for run in outcome.usage_runs
+    ] == [
+        ("q-single", 0, True),
+        ("q-multi", 0, False),
+    ]
+
+
+def test_build_runner_usage_artifact_rejects_unknown_and_duplicate_rows() -> None:
+    from rag_backend.evaluation.usage_artifact import (
+        UsageArtifactError,
+        build_runner_usage_artifact,
+    )
+
+    conversation_id = uuid.uuid4()
+    query_run_id = uuid.uuid4()
+    records = [AskRunRecord("q1", conversation_id, query_run_id, 0, True)]
+
+    def row(**overrides: Any) -> UsageAttemptRow:
+        payload: dict[str, Any] = {
+            "usage_id": uuid.uuid4(),
+            "query_run_id": query_run_id,
+            "created_at": datetime(2026, 9, 29, tzinfo=UTC),
+            "stage": "qa_answer",
+            "status": "SUCCEEDED",
+            "model": "deepseek-flash",
+            "attempt": 1,
+            "error_code": None,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 1,
+            "latency_ms": 10,
+        }
+        payload.update(overrides)
+        return UsageAttemptRow(**payload)
+
+    with pytest.raises(UsageArtifactError, match="未知"):
+        build_runner_usage_artifact(
+            records,
+            [row(query_run_id=uuid.uuid4())],
+            dataset_kind="dev",
+            dataset_version="v1",
+            complete=True,
+        )
+    usage_id = uuid.uuid4()
+    with pytest.raises(UsageArtifactError, match="重复 usageId"):
+        build_runner_usage_artifact(
+            records,
+            [row(usage_id=usage_id), row(usage_id=usage_id, model="deepseek-flash-2")],
+            dataset_kind="dev",
+            dataset_version="v1",
+            complete=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 轮询与数据库映射纯逻辑
 
@@ -621,6 +741,15 @@ def test_poll_until_times_out_without_waiting() -> None:
 def test_sql_database_rejects_non_psycopg_driver() -> None:
     with pytest.raises(RunnerError):
         SqlEvaluationDatabase("sqlite:///eval.db")
+
+
+def test_sql_usage_query_empty_input_does_not_touch_engine() -> None:
+    # 空输入不应发起查询（也未建连），直接返回空序列。
+    database = SqlEvaluationDatabase("postgresql+psycopg://u:p@127.0.0.1:1/db_test")
+    try:
+        assert database.usage_attempts_for([]) == ()
+    finally:
+        database.close()
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +792,7 @@ def test_http_backend_login_me_conversation_and_ask() -> None:
             return httpx.Response(
                 200,
                 json={
+                    "queryRunId": str(uuid.uuid4()),
                     "insufficientEvidence": False,
                     "answer": "回答[1]。",
                     "citations": [{"citationId": str(citation_uuid)}],
@@ -677,6 +807,7 @@ def test_http_backend_login_me_conversation_and_ask() -> None:
         conversation_id = session.create_conversation([kb_uuid])
         assert conversation_id == conversation_uuid
         outcome = session.ask(conversation_id, "问题")
+        assert outcome.query_run_id is not None
         assert outcome.refused is False
         assert outcome.citation_ids == (citation_uuid,)
         assert outcome.answer_text == "回答[1]。"
@@ -738,6 +869,35 @@ def test_http_backend_ask_server_error_is_backend_error() -> None:
     backend = _backend(handler, kb_uuid=kb_uuid)
     try:
         with pytest.raises(BackendError):
+            backend.session_for("staff").ask(conversation_uuid, "问题")
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"insufficientEvidence": True, "answer": "无法回答。", "citations": []},
+        {
+            "queryRunId": "not-a-uuid",
+            "insufficientEvidence": True,
+            "answer": "无法回答。",
+            "citations": [],
+        },
+    ],
+)
+def test_http_backend_ask_requires_valid_query_run_id(payload: dict[str, Any]) -> None:
+    kb_uuid = uuid.uuid4()
+    conversation_uuid = uuid.uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(200, json={"csrfToken": "c"})
+        return httpx.Response(200, json=payload)
+
+    backend = _backend(handler, kb_uuid=kb_uuid)
+    try:
+        with pytest.raises(BackendError, match="queryRunId"):
             backend.session_for("staff").ask(conversation_uuid, "问题")
     finally:
         backend.close()
@@ -875,3 +1035,202 @@ def test_runner_dry_run_holdout_needs_no_confirm(tmp_path: Path) -> None:
     )
 
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# runner CLI 的 --usage-out（合成 adapter，不联网、不读真实数据库）
+
+class _FakeManifest:
+    def __init__(self, role: str) -> None:
+        self.knowledge_bases: dict[str, Any] = {}
+        self.roles = {role: SimpleNamespace(knowledge_bases=())}
+
+    def role_can_access_kb(self, role: str, kb_id: str) -> bool:
+        return False
+
+
+def _install_usage_fakes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, fail_final: bool
+) -> Path:
+    kb_uuid = uuid.uuid4()
+
+    class FakeSession:
+        def knowledge_base_roles(self) -> Mapping[uuid.UUID, str]:
+            return {kb_uuid: "READER"}
+
+        def create_conversation(self, kb_ids: Sequence[uuid.UUID]) -> uuid.UUID:
+            return uuid.uuid4()
+
+        def ask(self, conversation_id: uuid.UUID, question: str) -> AskOutcome:
+            if fail_final and question == "追问问题":
+                raise BackendError("提问失败（HTTP 502/GENERATION_FAILED）")
+            return AskOutcome(
+                query_run_id=uuid.uuid4(),
+                refused=True,
+                citation_ids=(),
+                answer_text="无法回答。",
+            )
+
+    class FakeBackend:
+        def __init__(self, **_kwargs: Any) -> None:
+            self._session = FakeSession()
+
+        def session_for(self, role: str) -> FakeSession:
+            return self._session
+
+        def seed_session(self) -> FakeSession:
+            return self._session
+
+        def close(self) -> None:
+            pass
+
+    class FakeDb:
+        def __init__(self, _url: str) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def missing_knowledge_base_ids(self, _ids: Sequence[uuid.UUID]) -> frozenset[uuid.UUID]:
+            return frozenset()
+
+        def version_ids_for(
+            self, _ids: Sequence[uuid.UUID]
+        ) -> Mapping[uuid.UUID, uuid.UUID]:
+            return {}
+
+        def wait_active(self, **_kwargs: Any) -> None:
+            pass
+
+        def wait_deleted(self, **_kwargs: Any) -> None:
+            pass
+
+        def usage_attempts_for(
+            self, query_run_ids: Sequence[uuid.UUID]
+        ) -> Sequence[UsageAttemptRow]:
+            return tuple(
+                UsageAttemptRow(
+                    usage_id=uuid.uuid4(),
+                    query_run_id=query_run_id,
+                    created_at=datetime(2026, 9, 29, tzinfo=UTC),
+                    stage="qa_answer",
+                    status="SUCCEEDED",
+                    model="deepseek-flash",
+                    attempt=1,
+                    error_code=None,
+                    prompt_tokens=5,
+                    completion_tokens=1,
+                    prompt_cache_hit_tokens=0,
+                    prompt_cache_miss_tokens=5,
+                    latency_ms=12,
+                )
+                for query_run_id in query_run_ids
+            )
+
+    dataset = _multi_turn_dataset()
+    manifest = _FakeManifest("staff")
+    monkeypatch.setattr(
+        runner_module, "load_dataset_bundle", lambda _path: (dataset, manifest, Path("."))
+    )
+    monkeypatch.setattr(runner_module, "validate_dataset", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner_adapters, "HttpBackend", FakeBackend)
+    monkeypatch.setattr(runner_adapters, "SqlEvaluationDatabase", FakeDb)
+    monkeypatch.setenv("EVAL_DATABASE_URL", "postgresql+psycopg://u:p@127.0.0.1:5/db_test")
+    payload = {
+        "knowledgeBases": {_KB_HANDBOOK: str(kb_uuid)},
+        "roles": {
+            "staff": {"username": "staff-user", "password": "pw"},
+            "seed": {"username": "seed-user", "password": "pw"},
+        },
+        "seedRole": "seed",
+    }
+    descriptor = tmp_path / "descriptor.json"
+    descriptor.write_text(json.dumps(payload), encoding="utf-8")
+    return descriptor
+
+
+def _usage_cli_args(tmp_path: Path, descriptor: Path, *, usage_out: Path | None) -> list[str]:
+    args = [
+        "--dataset",
+        str(tmp_path / "dev.json"),
+        "--descriptor",
+        str(descriptor),
+        "--api-base-url",
+        "http://127.0.0.1:1",
+        "--results-out",
+        str(tmp_path / "results.json"),
+        "--allow-real-llm",
+        "--max-model-requests",
+        "10",
+    ]
+    if usage_out is not None:
+        args += ["--usage-out", str(usage_out)]
+    return args
+
+
+def test_runner_writes_complete_usage_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    usage_out = tmp_path / "usage.json"
+    rc = runner_main(_usage_cli_args(tmp_path, descriptor, usage_out=usage_out))
+    assert rc == 0
+    results = json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))
+    assert results["datasetKind"] == "dev"
+    assert len(results["results"]) == 2
+    payload = json.loads(usage_out.read_text(encoding="utf-8"))
+    assert payload["generatedFrom"] == "runner"
+    assert payload["complete"] is True
+    assert len(payload["runs"]) == 3
+    assert payload["totals"]["providerAttempts"] == 3
+    assert payload["totals"]["succeeded"] == 3
+    final_only = payload["totals"]["finalQuestionOnly"]
+    assert final_only["providerAttempts"] == 2
+
+
+def test_runner_writes_incomplete_usage_artifact_without_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=True)
+    usage_out = tmp_path / "usage.json"
+    rc = runner_main(_usage_cli_args(tmp_path, descriptor, usage_out=usage_out))
+    assert rc == 1
+    assert not (tmp_path / "results.json").exists()
+    payload = json.loads(usage_out.read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    # setup 成功的历史轮仍输出；失败的最终 ask 不出现。产物按 questionId 稳定排序。
+    assert [
+        (run["questionId"], run["turnIndex"], run["isFinalQuestion"]) for run in payload["runs"]
+    ] == [("q-multi", 0, False), ("q-single", 0, True)]
+
+
+def test_runner_without_usage_out_keeps_old_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    rc = runner_main(_usage_cli_args(tmp_path, descriptor, usage_out=None))
+    assert rc == 0
+    assert (tmp_path / "results.json").exists()
+    assert not (tmp_path / "usage.json").exists()
+
+
+def test_runner_rejects_usage_out_path_conflicts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    same = tmp_path / "results.json"
+    rc = runner_main(_usage_cli_args(tmp_path, descriptor, usage_out=same))
+    assert rc == 1
+    assert "不能与 --results-out" in capsys.readouterr().err
+
+
+def test_runner_refuses_to_overwrite_existing_usage_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    descriptor = _install_usage_fakes(monkeypatch, tmp_path, fail_final=False)
+    usage_out = tmp_path / "usage.json"
+    usage_out.write_text("{}", encoding="utf-8")
+    rc = runner_main(_usage_cli_args(tmp_path, descriptor, usage_out=usage_out))
+    assert rc == 1
+    assert "拒绝覆盖" in capsys.readouterr().err
+    assert usage_out.read_text(encoding="utf-8") == "{}"
