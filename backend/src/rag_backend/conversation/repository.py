@@ -223,11 +223,11 @@ _INSERT_LLM_USAGE_SQL = text(
     INSERT INTO llm_usage (
         id, provider, model, stage, status, error_code, usage_source, attempt,
         prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
-        prompt_cache_miss_tokens, latency_ms
+        prompt_cache_miss_tokens, latency_ms, query_run_id
     ) VALUES (
         :id, :provider, :model, :stage, :status, :error_code, :usage_source, :attempt,
         :prompt_tokens, :completion_tokens, :prompt_cache_hit_tokens,
-        :prompt_cache_miss_tokens, :latency_ms
+        :prompt_cache_miss_tokens, :latency_ms, :query_run_id
     )
     """
 )
@@ -307,6 +307,9 @@ class LlmUsageRecord:
     prompt_cache_hit_tokens: int | None
     prompt_cache_miss_tokens: int | None
     latency_ms: int
+    # 调用前生成的关联键；同一轮全部 attempt 共用，业务调用构造时必须显式传入（可为 None，
+    # 仅留给不归业务 run 的调用方）。
+    query_run_id: uuid.UUID | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -723,6 +726,7 @@ class SqlConversationRepository:
                 "prompt_cache_hit_tokens": record.prompt_cache_hit_tokens,
                 "prompt_cache_miss_tokens": record.prompt_cache_miss_tokens,
                 "latency_ms": record.latency_ms,
+                "query_run_id": record.query_run_id,
             },
         )
 

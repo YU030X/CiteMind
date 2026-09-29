@@ -613,6 +613,9 @@ async def test_happy_path_maps_server_side_citation_and_records_usage() -> None:
     assert len(repository.query_runs) == 1
     run = repository.query_runs[0]
     assert run.status == "SUCCEEDED"
+    # 账本行与 query_run 共用调用前生成的同一关联键。
+    assert repository.usage[0].query_run_id is not None
+    assert repository.usage[0].query_run_id == run.id
     assert run.insufficient_evidence is False
     assert run.estimated_input_tokens == result.usage.local_input_tokens
     assert run.provider_prompt_tokens == 11
@@ -765,8 +768,24 @@ async def test_no_evidence_refuses_without_calling_model() -> None:
     assert repository.usage == []
     assert repository.query_runs[0].status == "REFUSED"
     assert repository.query_runs[0].llm_usage_id is None
+    # 拒答未调用 provider，运行行存在但 usage 为空，也不产生新账本行。
+    assert repository.query_runs[0].id is not None
     assert repository.query_runs[0].scope_snapshot == ()
     assert repository.query_runs[0].evidence_count == 0
+
+
+@pytest.mark.anyio
+async def test_missing_conversation_writes_no_usage_or_run() -> None:
+    """没有 provider attempt 的调用不新写 usage/query_run（会话不存在先失败）。"""
+
+    repository = FakeConversationRepository(None)
+
+    with pytest.raises(ConversationNotFound):
+        await _run(repository=repository)
+
+    assert repository.usage == []
+    assert repository.query_runs == []
+    assert repository.messages == []
 
 
 @pytest.mark.anyio
@@ -818,6 +837,8 @@ async def test_provider_failure_is_a_failed_fact_and_error() -> None:
     assert repository.usage[0].status == "FAILED"
     assert repository.usage[0].error_code == "HTTP_500"
     assert repository.usage[0].prompt_tokens is None
+    # 回答失败没有 query_run 行，但失败 attempt 仍带调用前生成的关联键。
+    assert repository.usage[0].query_run_id is not None
     assert repository.query_runs == []
 
 
@@ -872,8 +893,10 @@ async def test_version_change_after_model_retrieves_once_then_succeeds() -> None
 
     assert result.insufficient_evidence is False
     assert retrieval.calls == 2
-    # 每次真实尝试都落账：初次与重检索后各一次。
+    # 每次真实尝试都落账：初次与重检索后各一次，且同属一轮关联键。
     assert len(repository.usage) == 2
+    assert repository.usage[0].query_run_id is not None
+    assert repository.usage[0].query_run_id == repository.usage[1].query_run_id
     # 来源变化触发的重检索是真实异常，需要记入静态阶段标识。
     assert repository.query_runs[0].degraded_stages == ("source_retry",)
 
@@ -886,8 +909,10 @@ async def test_version_change_after_model_twice_returns_retryable_failure() -> N
     with pytest.raises(ConversationSourcesChanged):
         await _run(repository=repository, evidence=evidence)
 
-    # 两次 provider attempt 都已落账，且没有持久化消息。
+    # 两次 provider attempt 都已落账，同属一轮关联键，且没有持久化消息。
     assert len(repository.usage) == 2
+    assert repository.usage[0].query_run_id is not None
+    assert repository.usage[0].query_run_id == repository.usage[1].query_run_id
     assert repository.query_runs == []
 
 
@@ -1318,9 +1343,12 @@ async def test_follow_up_rewrite_is_used_for_retrieval_and_persisted() -> None:
         message.content for message in generator.answer_messages[0]
     )
     assert "它的适用范围呢？" in answer_prompt
-    # 改写与回答分别记账，stage 分开。
+    # 改写与回答分别记账，stage 分开，但共用同一调用前生成的关联键。
     assert [row.stage for row in repository.usage] == [REWRITE_STAGE, "qa_answer"]
     assert repository.usage[0].prompt_tokens == 11
+    assert repository.usage[0].query_run_id is not None
+    assert repository.usage[0].query_run_id == repository.usage[1].query_run_id
+    assert run.id == repository.usage[1].query_run_id
 
 
 @pytest.mark.anyio

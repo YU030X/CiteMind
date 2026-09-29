@@ -45,7 +45,7 @@ from pdf_samples import positive_samples as pdf_positive_samples  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260929_0015"
+SCHEMA_REVISION = "20260929_0016"
 
 PROFILE = IndexProfileContract(
     embedding_model="test/model",

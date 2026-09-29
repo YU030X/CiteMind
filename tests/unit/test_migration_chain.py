@@ -26,6 +26,7 @@ DOCUMENT_ACL_REVISION = "20260928_0012"
 DOCUMENT_SOURCE_DOCX_REVISION = "20260929_0013"
 CHUNK_MODEL_INPUT_HASH_REVISION = "20260929_0014"
 DOCUMENT_SOURCE_WEB_REVISION = "20260929_0015"
+LLM_USAGE_QUERY_RUN_REVISION = "20260929_0016"
 
 CORE_TABLES = (
     "index_profile",
@@ -145,9 +146,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [DOCUMENT_SOURCE_WEB_REVISION]
+    assert script_directory.get_heads() == [LLM_USAGE_QUERY_RUN_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    llm_usage_query_run = script_directory.get_revision(LLM_USAGE_QUERY_RUN_REVISION)
     document_source_web = script_directory.get_revision(DOCUMENT_SOURCE_WEB_REVISION)
     chunk_model_input_hash = script_directory.get_revision(CHUNK_MODEL_INPUT_HASH_REVISION)
     document_source_docx = script_directory.get_revision(DOCUMENT_SOURCE_DOCX_REVISION)
@@ -175,7 +177,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     assert chunk_model_input_hash.down_revision == DOCUMENT_SOURCE_DOCX_REVISION
     assert chunk_model_input_hash.nextrev == {DOCUMENT_SOURCE_WEB_REVISION}
     assert document_source_web.down_revision == CHUNK_MODEL_INPUT_HASH_REVISION
-    assert document_source_web.nextrev == set()
+    assert document_source_web.nextrev == {LLM_USAGE_QUERY_RUN_REVISION}
+    assert llm_usage_query_run.down_revision == DOCUMENT_SOURCE_WEB_REVISION
+    assert llm_usage_query_run.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -420,7 +424,9 @@ def test_offline_upgrade_sql_grants_llm_usage_only_to_api(
     for statement in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "UPDATE"):
         assert f"GRANT {statement} ON TABLE llm_usage" not in output
     assert "llm_usage TO citemind_worker" not in output
-    assert "ON llm_usage" not in output
+    # 除建表片的 REVOKE 与唯一 GRANT 外不对 llm_usage 追加授权；
+    # 索引 SQL 的 "ON llm_usage (query_run_id)" 不是授权语句，不计入。
+    assert output.count("ON TABLE llm_usage") == 2
 
 
 def test_offline_downgrade_sql_removes_llm_usage(
@@ -690,6 +696,44 @@ def test_offline_downgrade_sql_removes_web_columns_and_restores_check(
     assert "DROP COLUMN source_url" in output
     assert "source_type IN ('markdown', 'pdf', 'docx')" in output
     assert "DROP TABLE" not in output
+
+
+def test_offline_upgrade_sql_adds_llm_usage_query_run_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{DOCUMENT_SOURCE_WEB_REVISION}:{LLM_USAGE_QUERY_RUN_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "ALTER TABLE llm_usage ADD COLUMN query_run_id UUID;" in output
+    assert "CREATE INDEX ix_llm_usage_query_run_id ON llm_usage (query_run_id);" in output
+    # 只加可空列与普通 btree 索引：不加默认值、不回填、不建外键、不改授权。
+    assert "DEFAULT" not in output
+    assert "UPDATE llm_usage" not in output
+    assert "FOREIGN KEY" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_removes_llm_usage_query_run_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{LLM_USAGE_QUERY_RUN_REVISION}:{DOCUMENT_SOURCE_WEB_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP INDEX ix_llm_usage_query_run_id;" in output
+    assert "DROP COLUMN query_run_id" in output
+    # 降级只删索引与列，不动其它表或 ACL。
+    assert "DROP TABLE" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
 
 
 def test_offline_upgrade_sql_has_no_ann_indexes(

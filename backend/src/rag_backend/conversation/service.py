@@ -7,6 +7,8 @@
    （:func:`plan_chat_context`，本地 token 估算）；
 3. 复核证据来源的版本/删除/权限；无入选证据时直接拒答，**不调用模型**；
 4. 在线程池内调用受限生成客户端；随后把 provider 事实追加到 ``llm_usage``；
+   本轮全部 attempt（改写、回答、失败与重试）共用调用前生成的 ``query_run_id`` 关联键，
+   该键随最终 ``query_run.id`` 落库，但本身不建外键、可能没有对应 run；
 5. 交付前再次复核来源；版本/删除/权限变化时最多重新检索一次，持续变化返回静态可重试状态；
 6. 在单个短事务内写入 query_run、用户消息、助手消息与引用快照。
 
@@ -405,6 +407,12 @@ async def answer_question(
     if conversation is None:
         raise ConversationNotFound("会话不存在")
 
+    # 调用前生成唯一关联键：本轮全部 provider attempt（改写、回答、失败与重试）共用它，
+    # 供账本按整轮归因。当前请求路径没有 request_id 幂等回放；每次实际调用都会生成新键。
+    # 它不建外键，
+    # 因为 answer 失败时可能永远没有对应的 query_run 行，且账本按 attempt 分次提交。
+    query_run_id = uuid.uuid4()
+
     # 改写前先重新核查历史权限：只有存在合法历史轮次才值得为指代消解付费调用改写模型。
     history = await _load_authorized_history(
         repository,
@@ -421,6 +429,7 @@ async def answer_question(
         standalone_question, rewrite_sequences = await _rewrite_standalone_question(
             repository,
             generator,
+            query_run_id=query_run_id,
             history=history,
             question=question,
             estimator=estimator,
@@ -499,6 +508,7 @@ async def answer_question(
                 status="REFUSED",
                 insufficient_evidence=True,
                 usage_id=None,
+                query_run_id=query_run_id,
                 outcome=None,
                 answer_text=REFUSAL_ANSWER,
                 drafts=(),
@@ -512,7 +522,13 @@ async def answer_question(
         outcome = await _generate(generator, plan, budget, model=answer_model, thinking=thinking)
         usage_id = uuid.uuid4()
         await repository.insert_llm_usage(
-            _usage_record(outcome, usage_id, answer_model, stage=ANSWER_STAGE)
+            _usage_record(
+                outcome,
+                usage_id,
+                answer_model,
+                stage=ANSWER_STAGE,
+                query_run_id=query_run_id,
+            )
         )
         await repository.commit()
 
@@ -559,6 +575,7 @@ async def answer_question(
                 status="REFUSED",
                 insufficient_evidence=True,
                 usage_id=usage_id,
+                query_run_id=query_run_id,
                 outcome=outcome,
                 answer_text=REFUSAL_ANSWER,
                 drafts=(),
@@ -580,6 +597,7 @@ async def answer_question(
             status="SUCCEEDED",
             insufficient_evidence=False,
             usage_id=usage_id,
+            query_run_id=query_run_id,
             outcome=outcome,
             answer_text=parsed.answer_text,
             drafts=drafts,
@@ -851,6 +869,7 @@ async def _rewrite_standalone_question(
     repository: ConversationRepository,
     generator: AnswerGenerator,
     *,
+    query_run_id: uuid.UUID,
     history: Sequence[HistoryTurn],
     question: str,
     estimator: PromptTokenEstimator,
@@ -862,6 +881,7 @@ async def _rewrite_standalone_question(
     返回 ``(独立问题, 实际入参的历史轮次 sequence)``：调用方据此在每次检索与交付前重新鉴权
     这些来源，任一失效即整轮失败。网络调用期间不持有数据库连接；每次真实 attempt 都追加一行
     ``llm_usage``（``stage='qa_rewrite'``），失败与超时同样落事实；不自动重试。
+    ``query_run_id`` 是调用前生成的整轮关联键，与回答账本共用同一值。
     """
 
     plan = _plan_rewrite(
@@ -877,7 +897,9 @@ async def _rewrite_standalone_question(
     )
     usage_id = uuid.uuid4()
     await repository.insert_llm_usage(
-        _usage_record(outcome, usage_id, model, stage=REWRITE_STAGE)
+        _usage_record(
+            outcome, usage_id, model, stage=REWRITE_STAGE, query_run_id=query_run_id
+        )
     )
     await repository.commit()
     if outcome.status != STATUS_SUCCEEDED or outcome.content is None:
@@ -942,10 +964,16 @@ def _generation_options(model: str, thinking: ThinkingChoice) -> dict[str, Any]:
 
 
 def _usage_record(
-    outcome: GenerationOutcome, usage_id: uuid.UUID, model: str, *, stage: str
+    outcome: GenerationOutcome,
+    usage_id: uuid.UUID,
+    model: str,
+    *,
+    stage: str,
+    query_run_id: uuid.UUID,
 ) -> LlmUsageRecord:
     return LlmUsageRecord(
         id=usage_id,
+        query_run_id=query_run_id,
         provider=PROVIDER,
         model=model,
         stage=stage,
@@ -1026,6 +1054,7 @@ async def _persist_turn(
     status: str,
     insufficient_evidence: bool,
     usage_id: uuid.UUID | None,
+    query_run_id: uuid.UUID,
     outcome: GenerationOutcome | None,
     answer_text: str,
     drafts: Sequence[_CitationDraft],
@@ -1037,7 +1066,8 @@ async def _persist_turn(
 
     ``scope_snapshot`` 是本次检索实际解析出的可检索 KB 子集；``degraded_stages`` 只含真实异常
     造成的降级。``question`` 是原始问题（回答提示用它），``standalone_question`` 是实际用于
-    查询编码与关键词检索的独立问题。
+    查询编码与关键词检索的独立问题。``query_run_id`` 由调用方在调用 provider 前生成，
+    本轮全部 attempt 共用同一值，这里不再内部重新 mint。
 
     写入前先取会话级 advisory 锁再重查会话（``deleted_at`` 过滤）：若会话在模型调用期间被
     删除则抛 :class:`ConversationNotFound`，绝不把回答复活成删除后的新消息。删除路径同样先取
@@ -1056,7 +1086,6 @@ async def _persist_turn(
             conversation_id=conversation_id, title=derive_conversation_title(question)
         )
 
-    query_run_id = uuid.uuid4()
     provider_prompt = outcome.prompt_tokens if outcome is not None else None
     provider_completion = outcome.completion_tokens if outcome is not None else None
     resolved_degraded = tuple(degraded_stages)

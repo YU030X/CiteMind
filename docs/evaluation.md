@@ -166,6 +166,10 @@ uv run python -m rag_backend.evaluation --results tests/evaluation/results/2026-
 
 事实与边界：`citationSourceValidity` 按引用条数统计，分子与分母都是 `results.json` 的 38 条最终回答引用；数据库 `citation` 表另有 2 条多轮历史轮次引用（共 40 行），**不进该指标分母**，且该指标**不等于句子级引用支持率**。无证据短路已实现（`not plan.evidence_ids` 时直接拒答、不调用模型），本轮 9 道拒答题的检索候选非空，因此仍调用 provider、由模型判定拒答。题集阶段实际 provider 请求 44 次（`qa_answer` 42 + `qa_rewrite` 2），权限验收再 +2，合计 46；tokens `prompt=15110`/`completion=1920`，价目与费用列全 NULL。预算公式为 `38×2 + 2×(2+3) = 86`，是成本上界而非实际计费次数。开发质量待办：`dev-single-023` 跨语言 PDF 误拒、`dev-cross-001` 跨文档覆盖缺口；未改 gold/答案。
 
+## 已实现：成本归因关联键（2026-09-29，迁移 `20260929_0016`）
+
+`llm_usage` 新增可空 UUID `query_run_id`（无外键）与普通 btree 索引 `ix_llm_usage_query_run_id`。`answer_question` 在调用任何 provider 之前生成一次该键，并透传给 `qa_rewrite` 与全部 `qa_answer` attempt（含失败与来源变化重试）；`_persist_turn` 用同一个值写 `query_run.id`，因此同轮全部账本行与运行行可互相归因。该键只在调用前存在、可能没有对应 `query_run`（例如生成失败），历史行保持 NULL，不是完整计费系统。本片**不做** runner usage artifact、价目快照/`Decimal` 成本、`conversation_id` 列、UI 与汇率；按题重算成本与独立 usage 产物仍属后续片。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。

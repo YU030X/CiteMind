@@ -10,7 +10,7 @@
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Integer, Numeric, Text, Uuid
+from sqlalchemy import CheckConstraint, Index, Integer, Numeric, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from rag_backend.models.base import Base, CreatedAtMixin
@@ -53,9 +53,13 @@ class LlmUsage(CreatedAtMixin, Base):
             "status = 'SUCCEEDED' OR error_code IS NOT NULL", name="failure_has_error_code"
         ),
         CheckConstraint(PRICE_CONSISTENCY_SQL, name="price_consistent"),
+        Index("ix_llm_usage_query_run_id", "query_run_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # 调用前生成的关联键，把一次提问的全部 attempt 归到一起；不建外键、可空，
+    # 历史行保持 NULL，且失败提问可能永远没有对应的 query_run 行。
+    query_run_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)
     stage: Mapped[str] = mapped_column(Text, nullable=False)
