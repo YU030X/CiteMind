@@ -15,6 +15,10 @@
 - 领取使用行锁 + 带全部守卫的原子 CAS，写入 ``lease_owner``/``lease_token``/``lease_until``
   与 ``heartbeat_at``，并把 ``status`` 置为 ``PARSING``；各阶段用短事务。长时间解析/编码期间
   由 :class:`LeaseHeartbeat` 用独立连接续租；失租约时绝不发布、也不覆盖他人结果。
+- 编码前按 ``model_input_hash`` 批量查增量缓存（复用既有 ``chunk_embedding`` 的向量，
+  不新增表/Redis/LRU）；命中不调用编码器，miss 只编码唯一的 ``model_input_hash`` 输入并
+  fan-out 到重复 chunk，输出顺序仍与 chunks 一致。缓存查询是独立短只读事务的优化：失败
+  只记静态 warning 并回退全量 miss，不污染主事务。
 - 暂存 generation 为 ``BUILDING``，并在同一暂存事务内把 ``ingest_job.generation_id`` 绑定
   到该 generation；chunk 与向量全部落库并核对数量后才进入发布事务。
 - 发布事务原子置 generation ``READY``、``document.active_version_id``、版本状态 ``READY``、
@@ -60,6 +64,10 @@ from rag_backend.ingestion.chunking import (
     chunk_markdown,
 )
 from rag_backend.ingestion.docx_parsing import DOCX_PARSER_VERSION
+from rag_backend.ingestion.embedding_cache import (
+    as_cache_vectors,
+    load_cached_embeddings,
+)
 from rag_backend.ingestion.embedding_client import (
     EmbeddingBusyError,
     EmbeddingClientError,
@@ -222,6 +230,22 @@ class DocumentEmbedder(Protocol):
     def embed_document_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     def close(self) -> None: ...
+
+
+class CacheLookup(Protocol):
+    """增量 embedding 缓存查询接口；``load_cached_embeddings`` 满足本协议。
+
+    调用方只把它当优化：返回值按 ``model_input_hash`` 给出可复用向量，缺项即 miss。
+    """
+
+    def __call__(
+        self,
+        session_factory: SyncSessionFactory,
+        *,
+        organization_id: uuid.UUID,
+        profile_id: uuid.UUID,
+        model_input_hashes: Sequence[str],
+    ) -> Mapping[str, Sequence[float]]: ...
 
 
 IdentityProvider = Callable[[], ResolvedIdentity]
@@ -1389,6 +1413,7 @@ class PipelineDependencies:
     parse_document: ParseDocument = parse_markdown_in_subprocess
     parse_pdf_document: ParseDocument = parse_pdf_in_subprocess
     parse_docx_document: ParseDocument = parse_docx_in_subprocess
+    cache_lookup: CacheLookup = load_cached_embeddings
 
 
 def process_ingest_event(
@@ -1627,46 +1652,92 @@ def process_ingest_event(
         if not advanced_to_embedding:
             return PROCESS_STATUS_LEASE_LOST
 
-        inputs = [build_model_input(chunk.heading_path, chunk.text) for chunk in chunks]
-        embedder: DocumentEmbedder | None = None
-        try:
-            try:
-                embedder = dependencies.embedder_factory(identity.token_counter)
-            except PipelineDependencyUnavailable:
-                return _fail(
-                    session_factory,
-                    heartbeat,
-                    job_id=job_id,
-                    lease_token=lease_token,
-                    error_code=ERROR_PIPELINE_EMBEDDING_FAILED,
-                )
-            try:
-                vectors = embed_chunk_inputs(
-                    embedder,
-                    inputs,
-                    max_attempts=max_embedding_attempts,
-                    sleep=sleep,
-                )
-            except EmbeddingClientError as error:
-                return _fail(
-                    session_factory,
-                    heartbeat,
-                    job_id=job_id,
-                    lease_token=lease_token,
-                    error_code=classify_embedding_error(error),
-                )
-        finally:
-            if embedder is not None:
-                embedder.close()
-
-        if len(vectors) != len(chunks):
-            return _fail(
-                session_factory,
-                heartbeat,
-                job_id=job_id,
-                lease_token=lease_token,
-                error_code=ERROR_PIPELINE_STAGING_INVALID,
+        # 按 model_input_hash 去重，命中缓存的 hash 不再编码；重复 chunk 只编码一次并 fan-out。
+        inputs_by_hash: dict[str, str] = {}
+        for chunk in chunks:
+            inputs_by_hash.setdefault(
+                chunk.model_input_hash, build_model_input(chunk.heading_path, chunk.text)
             )
+
+        # 缓存查询是纯优化：独立短只读连接，失败只记静态 warning 并回退为全量 miss 编码。
+        # 不吞 KeyboardInterrupt/SystemExit/MemoryError，只捕预期 SQLAlchemy/缓存解析类错误。
+        try:
+            raw_cached = dependencies.cache_lookup(
+                session_factory,
+                organization_id=claimed.organization_id,
+                profile_id=claimed.profile_id,
+                model_input_hashes=list(inputs_by_hash),
+            )
+        except SQLAlchemyError:
+            logger.warning(
+                "embedding cache lookup failed; encoding all chunks job_id=%s", job_id
+            )
+            cached_by_hash: dict[str, list[float]] = {}
+        else:
+            cached_by_hash = as_cache_vectors(raw_cached)
+
+        missing_inputs: dict[str, str] = {
+            model_input_hash: text
+            for model_input_hash, text in inputs_by_hash.items()
+            if model_input_hash not in cached_by_hash
+        }
+        vectors_by_hash = dict(cached_by_hash)
+        if missing_inputs:
+            embedder: DocumentEmbedder | None = None
+            try:
+                try:
+                    embedder = dependencies.embedder_factory(identity.token_counter)
+                except PipelineDependencyUnavailable:
+                    return _fail(
+                        session_factory,
+                        heartbeat,
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        error_code=ERROR_PIPELINE_EMBEDDING_FAILED,
+                    )
+                try:
+                    encoded = embed_chunk_inputs(
+                        embedder,
+                        list(missing_inputs.values()),
+                        max_attempts=max_embedding_attempts,
+                        sleep=sleep,
+                    )
+                except EmbeddingClientError as error:
+                    return _fail(
+                        session_factory,
+                        heartbeat,
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        error_code=classify_embedding_error(error),
+                    )
+            finally:
+                if embedder is not None:
+                    embedder.close()
+
+            if len(encoded) != len(missing_inputs):
+                return _fail(
+                    session_factory,
+                    heartbeat,
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    error_code=ERROR_PIPELINE_STAGING_INVALID,
+                )
+            for model_input_hash, encoded_vector in zip(missing_inputs, encoded):
+                vectors_by_hash[model_input_hash] = encoded_vector
+
+        # 输出顺序必须与 chunks 一致：命中与 miss 都按 chunk 的 hash 取回，绝不重排。
+        vectors: list[list[float]] = []
+        for chunk in chunks:
+            cached_vector = vectors_by_hash.get(chunk.model_input_hash)
+            if cached_vector is None:
+                return _fail(
+                    session_factory,
+                    heartbeat,
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    error_code=ERROR_PIPELINE_STAGING_INVALID,
+                )
+            vectors.append(cached_vector)
 
         try:
             advanced_to_indexing = advance_ingest_stage(
@@ -1802,6 +1873,7 @@ def _fail_needs_ocr(
 
 
 __all__ = [
+    "CacheLookup",
     "ClaimAction",
     "ClaimFacts",
     "ClaimResult",

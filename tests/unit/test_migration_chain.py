@@ -24,6 +24,7 @@ CONVERSATION_METADATA_REVISION = "20260927_0010"
 QUERY_RUN_OPTIONS_REVISION = "20260927_0011"
 DOCUMENT_ACL_REVISION = "20260928_0012"
 DOCUMENT_SOURCE_DOCX_REVISION = "20260929_0013"
+CHUNK_MODEL_INPUT_HASH_REVISION = "20260929_0014"
 
 CORE_TABLES = (
     "index_profile",
@@ -143,9 +144,10 @@ def script_directory() -> ScriptDirectory:
 
 
 def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirectory) -> None:
-    assert script_directory.get_heads() == [DOCUMENT_SOURCE_DOCX_REVISION]
+    assert script_directory.get_heads() == [CHUNK_MODEL_INPUT_HASH_REVISION]
     assert script_directory.get_bases() == [PGVECTOR_REVISION]
 
+    chunk_model_input_hash = script_directory.get_revision(CHUNK_MODEL_INPUT_HASH_REVISION)
     document_source_docx = script_directory.get_revision(DOCUMENT_SOURCE_DOCX_REVISION)
     document_acl = script_directory.get_revision(DOCUMENT_ACL_REVISION)
     query_run_options = script_directory.get_revision(QUERY_RUN_OPTIONS_REVISION)
@@ -167,7 +169,9 @@ def test_migration_chain_has_a_single_linear_head(script_directory: ScriptDirect
     assert document_acl.down_revision == QUERY_RUN_OPTIONS_REVISION
     assert document_acl.nextrev == {DOCUMENT_SOURCE_DOCX_REVISION}
     assert document_source_docx.down_revision == DOCUMENT_ACL_REVISION
-    assert document_source_docx.nextrev == set()
+    assert document_source_docx.nextrev == {CHUNK_MODEL_INPUT_HASH_REVISION}
+    assert chunk_model_input_hash.down_revision == DOCUMENT_SOURCE_DOCX_REVISION
+    assert chunk_model_input_hash.nextrev == set()
     assert conversation.down_revision == INGEST_JOB_REQUEST_TITLE_REVISION
     assert conversation.nextrev == {CONVERSATION_METADATA_REVISION}
     assert request_title.down_revision == WORKER_KB_PUBLISH_REVISION
@@ -609,6 +613,40 @@ def test_offline_downgrade_sql_removes_document_acl(
     assert "DROP TABLE document_acl;" in output
     assert "DROP CONSTRAINT ck_document_acl_mode" in output
     assert "DROP COLUMN acl_mode" in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_upgrade_sql_adds_chunk_model_input_hash_index(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.upgrade(
+        alembic_config(),
+        f"{DOCUMENT_SOURCE_DOCX_REVISION}:{CHUNK_MODEL_INPUT_HASH_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "CREATE INDEX ix_chunk_model_input_hash ON chunk (model_input_hash);" in output
+    # 只新增一个索引：不建表/列、不改授权、不 seed。
+    assert "ALTER TABLE" not in output
+    assert "GRANT " not in output
+    assert "REVOKE " not in output
+
+
+def test_offline_downgrade_sql_removes_only_chunk_model_input_hash_index(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    command.downgrade(
+        alembic_config(),
+        f"{CHUNK_MODEL_INPUT_HASH_REVISION}:{DOCUMENT_SOURCE_DOCX_REVISION}",
+        sql=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "DROP INDEX ix_chunk_model_input_hash;" in output
+    assert "DROP TABLE" not in output
+    assert "ALTER TABLE" not in output
     assert "GRANT " not in output
     assert "REVOKE " not in output
 

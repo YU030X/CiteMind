@@ -1,6 +1,6 @@
 # 数据模型与持久化约束
 
-> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）给 `ingest_job` 增加可空 `profile_id` 外键，且新 Markdown 上传写路径已在同一四表事务内登记默认全局 profile 并显式绑定该列（独立 tester 已在隔离 PostgreSQL 17 + Redis 上验收，详见下文）；问答四表 `conversation`/`message`/`query_run`/`citation` 已由迁移 `20260927_0009` 落地并由证据问答主流程实现与验收；文档 ACL（`document.acl_mode` 与 `document_acl`）已由迁移 `20260928_0012` 落地，读取收紧与原文下载已实现并在隔离 PostgreSQL 17 上聚焦验收（见下文）。缓存、`retrieval_hit`/`feedback` 与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
+> 第一切片业务表已由迁移 `20260922_0002` 落地：`index_profile`、`knowledge_base`、`document`、`document_version`、`ingest_job` 与 `outbox_event` 六张表，均不含向量列。第二片（`index_generation`、`chunk`、`chunk_embedding` 与 `chunk_embedding VECTOR(512)`）已由 `20260922_0003` 落地并在真实 PostgreSQL 上验收；第三片 append-only 用量账本 `llm_usage` 已由 `20260923_0004` 落地并在隔离专用测试库上通过真实迁移与授权验收，且已接收一次真实 DeepSeek 成功调用写入的 `SUCCEEDED`/`PROVIDER_REPORTED` 行（见 [开发约定](development.md)）。第四片身份与会话基础表 `user_account`、`auth_session` 与 `kb_member` 已由 `20260923_0005` 落地；登录、限流、会话签发/撤销已实现并验收，KB 成员授权（`GET/POST /knowledge-bases`、成员读取与全量替换、服务端 `require_kb_role`）已在本切片实现并验收；第五片（迁移 `20260925_0006`）给 `ingest_job` 增加可空 `profile_id` 外键，且新 Markdown 上传写路径已在同一四表事务内登记默认全局 profile 并显式绑定该列（独立 tester 已在隔离 PostgreSQL 17 + Redis 上验收，详见下文）；问答四表 `conversation`/`message`/`query_run`/`citation` 已由迁移 `20260927_0009` 落地并由证据问答主流程实现与验收；文档 ACL（`document.acl_mode` 与 `document_acl`）已由迁移 `20260928_0012` 落地，读取收紧与原文下载已实现并在隔离 PostgreSQL 17 上聚焦验收（见下文）。增量 embedding 缓存改为复用既有 `chunk_embedding`（不新增缓存表，见“已实现：增量 embedding 缓存”），`retrieval_hit`/`feedback` 与价目快照仍是计划内容，尚未实现或验收。主键 UUID 由应用 `uuid4` 生成、数据库不设 UUID server default；时间为 UTC `timestamptz` 且 `server_default=now()`；外部 URL、文件名和模型名都不是可信主键。MVP 保留单组织字段，不实现组织开通或计费。
 
 ## 已实现：第一切片（迁移 20260922_0002）
 
@@ -148,27 +148,32 @@ DOCX 解析器版本 `python-docx-1.2.0-v1` 随 `document_version.parser_version
 
 数据模型不强制“名单用户是同组织有效 KB 成员”与“`INHERIT` 时名单为空”：前者由写入事务核对，后者由应用校验并保证写入时清空；直接写库可以绕过，二者都由读取判定的权威链与服务端校验共同保障。真实迁移与授权验收由 `tests/integration/test_document_acl_migration.py` 承担（升级、精确授权、api 插入/删除与 UPDATE 拒绝、worker 拒绝、降级无残留）；权限、revision 与锁序由 `tests/integration/test_document_acl_flow.py` 承担。
 
+## 已实现：增量 embedding 缓存（迁移 20260929_0014）
+
+缓存**不新增表**，直接复用既有 `chunk_embedding`；原计划的 `embedding_cache` 表作废。worker 在编码前按 `chunk.model_input_hash` 批量查询可复用向量，命中必须经权威链 `chunk→index_generation→document_version→document→knowledge_base`，且同 `organization_id`、`g.status='READY'`、`g.profile_id=:profile_id`、`ce.profile_id=:profile_id`，并排除已删除文档（`deleted_at` 非空或 `DELETED`）；不信任 `chunk` 上冗余的 `organization_id`/`kb_id`/`document_id`/`version_id`。缓存只复用向量，不复用来源位置，允许同组织跨文档与旧版本复用，禁止跨组织。
+
+迁移 `20260929_0014` 只给 `chunk(model_input_hash)` 新增具名 btree 索引 `ix_chunk_model_input_hash`，使批量查找有索引支撑；降级只删除该索引，不动数据与授权。SQLAlchemy 模型 `Chunk` 同步声明同名索引。真实迁移与精确索引由 `tests/integration/test_chunk_model_input_hash_index_migration.py` 承担（无 Docker 守护进程时未跑并标注）。
+
 ## 计划中：后续切片
 
 以下实体与字段仍未实现。
 
 | 实体 | 主要字段 | 关键约束与用途 |
 | --- | --- | --- |
-| `embedding_cache` | cache_key, model_revision, dimension, vector_payload, last_used_at | 只在本组织内复用，不复用来源位置 |
 | `conversation` / `message` | owner_id, kb_scope；role, content, query_run_id, status | 会话属于用户；历史访问按当前 ACL 复核（已由 `20260927_0009` 落地，见上文） |
 | `query_run` / `retrieval_hit` | 问题、scope_snapshot、配置、版本、阶段耗时、tokens、cost；chunk_id、两路排名、RRF/rerank 分数 | 调试与复算；权限撤销后也需过滤（`query_run` 已落地；`retrieval_hit` 仍为计划） |
 | `citation` / `feedback` | message_id, chunk_id, version_id, locator_snapshot, quote_hash；评分与预期证据 | 引用不接受 LLM 自造 URI；反馈不直接在线训练（`citation` 已落地；`feedback` 仍为计划） |
 | `eval_dataset` / `eval_case` / `eval_run` / `eval_result` | 数据集版本、角色、gold spans、split；配置、模型 revision、逐题结果 | 保留历史运行，不覆盖；gold 使用源区间而非 chunk ID |
 | `audit_event` | actor_id, action, target_id, before_hash, after_hash, request_id, created_at | 记录授权、删除、索引切换等，默认不记正文 |
 
-`document_acl` 已于文档 ACL 切片（迁移 `20260928_0012`）落地，不再列入计划表。
+`document_acl` 已于文档 ACL 切片（迁移 `20260928_0012`）落地，不再列入计划表。增量 embedding 缓存改为复用既有 `chunk_embedding`，不新增 `embedding_cache` 表，也不再列入计划表（见“已实现：增量 embedding 缓存”）。
 第一切片已实现的 `ingest_job` 已在第二切片新增可空 `generation_id`；第一切片已实现的 `document` 已在文档 ACL 切片（`20260928_0012`）补加 `acl_mode`；`document_acl` 也已落地。完整主关系仍是 `knowledge_base → document → document_version → index_generation → chunk → chunk_embedding`；任务为 `ingest_job → outbox_event → Celery 消息`；问答为 `conversation → message → query_run / citation`，检索命中归 `query_run`。授权沿 `auth_session → user_account → kb_member → document_acl` 应用于资源读取与两路检索。
 
 ## 数据库约束和索引
 
 第一切片已实现的索引与唯一约束：`document(kb_id,lifecycle_status)`、`ingest_job(status,next_run_at)`、`outbox_event(status,next_send_at)` 三个二级索引，以及 `index_profile(config_hash)`、`document_version(document_id,version_no)`、`ingest_job(dedupe_key)` 三个唯一约束。所有表的主键都是 `pk_<table>`，全部具名 CHECK、外键与索引遵循同一命名规则。
 
-第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。其中部分唯一索引是并发发布的最后约束。第四切片已实现的唯一约束：`auth_session(token_hash)`、`user_account(organization_id, username)` 与 `kb_member(kb_id, user_id)`；这三张表都不建额外二级索引。以下仍是计划，尚未实现：面向“按用户列出可访问 KB”的 `kb_member(user_id,kb_id)` 二级索引和 `query_run(user_id,created_at)`。第三切片的 `llm_usage` 不建二级索引与唯一约束，只有主键与具名 CHECK。第五切片只增列与具名外键 `fk_ingest_job_profile_id_index_profile`，不新增任何二级索引、唯一约束或 ACL。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
+第二切片已实现的索引与唯一约束：`index_generation(version_id,profile_id,status)` 二级索引、`index_generation(version_id,profile_id) WHERE status='READY'` 部分唯一索引、`chunk(generation_id)` 二级索引、`chunk(generation_id,chunk_index)` 唯一约束与 `GIN(chunk.fts)`。迁移 `20260929_0014` 另给 `chunk(model_input_hash)` 建具名 btree 索引 `ix_chunk_model_input_hash`，服务增量 embedding 缓存。其中部分唯一索引是并发发布的最后约束。第四切片已实现的唯一约束：`auth_session(token_hash)`、`user_account(organization_id, username)` 与 `kb_member(kb_id, user_id)`；这三张表都不建额外二级索引。以下仍是计划，尚未实现：面向“按用户列出可访问 KB”的 `kb_member(user_id,kb_id)` 二级索引和 `query_run(user_id,created_at)`。第三切片的 `llm_usage` 不建二级索引与唯一约束，只有主键与具名 CHECK。第五切片只增列与具名外键 `fk_ingest_job_profile_id_index_profile`，不新增任何二级索引、唯一约束或 ACL。MVP 精确向量检索不建 ANN 索引；引入 HNSW 前测授权过滤下的召回。
 
 文件、向量、聊天与审计按用途分开保留，保留策略尚未实现。演示环境计划保留原文及最近 3 版索引、查询明细 30 天、脱敏汇总 90 天；删除文档先禁止访问，再按保留策略清理文件、chunk、向量缓存和引用正文。保留期限和清理作业须在实现时由配置与测试固定，不能仅靠本页文字生效。
 

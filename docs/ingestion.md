@@ -105,7 +105,7 @@ COMMIT;
 
 ## 更新、删除和 profile 变更
 
-原文件 checksum、index profile 与所有编码输入都不变时，可跳过解析和编码。embedding 缓存键包含规范化模型输入 hash、模型 revision、维度、pooling/normalize 设置、编码角色和预处理版本；缓存仅复用向量，不复用旧来源位置。可编辑展示标题不参与当前编码；若以后加入编码，需把它纳入输入指纹。
+原文件 checksum、index profile 与所有编码输入都不变时，可跳过解析和编码。已实现的增量 embedding 缓存**不新增表**，直接复用既有 `chunk_embedding`：编码前按 `chunk.model_input_hash` 批量查询同 `organization_id`、同 `profile_id`、`index_generation.status='READY'` 且 generation 与 embedding 双侧 profile 一致、文档未删除（`deleted_at IS NULL` 且 `lifecycle_status <> 'DELETED'`）的向量，并强制经权威链 `chunk→index_generation→document_version→document→knowledge_base` 校验，不信任 `chunk` 上冗余的 `organization_id`/`kb_id`/`document_id`/`version_id`。命中只复用向量、不复用来源位置，允许同组织跨文档与旧版本（发布切换前）复用，禁止跨组织。缓存键边界即不可变 `index_profile` 的 `profile_id` 与运行期身份预检：`model_revision`、维度、tokenizer/chunker 契约与 normalize 都随 profile 固定，编码请求固定 `kind='document'`；pooling/provider 不是当前可配置自由度，由冻结模型 revision 与 inference 契约约束，因此本切片不新增 profile 字段、不改 `config_hash`。每个 chunk 仍重建 FTS/locator 并写新 generation/embedding，发布 CAS、租约与重试语义不变。可编辑展示标题不参与当前编码；若以后加入编码，需把它纳入输入指纹。
 
 普通文档更新构建新版本并只切换该文档的有效指针。已实现的切片在发布事务锁定 document，核对 `expected_active_version`，发布新 generation 并切换指针；**不退役旧 READY generation**（检索按 `active_version_id` 过滤，旧 generation 自然不入候选），并发失败者回滚重读。删除先 tombstone 并递增知识库 revision，新检索与引用立即失效，随后异步回收文件和索引。**退役/重建 generation 属于未来 `POST /documents/{id}/reindex`（见 [API](api.md)）与 KB 级 profile 切换契约，不在本切片范围内**：本切片不删除也不退役任何 generation，该规划为后续重索引保留。
 
@@ -210,6 +210,16 @@ mypy（136 files）、`uv lock --check`、`git diff --check` 绿（**不称全 i
 问答主流程已实现（默认关闭，未对真实 provider 验收；授权检索首片见 [检索](retrieval.md)）。迁移 `20260925_0007` 只给 worker 增加
 `knowledge_base(active_index_profile_id, kb_revision)`
 列级 UPDATE，不授予全表 UPDATE。
+
+**本轮新增：增量 embedding 缓存（迁移 `20260929_0014`）**。缓存直接复用既有 `chunk_embedding`，不新增 `embedding_cache` 表、Redis 或进程内 LRU。worker 在解析/切分后、构造 embedder 与编码前，按 `chunk.model_input_hash` 去重并批量查询可复用向量；命中按 hash 填充，miss 只编码唯一的 `model_input_hash` 对应输入并 fan-out 到重复 chunk，输出顺序与 chunks 一致。所有 chunk 仍重建 FTS/locator、写新 generation/embedding，发布 CAS、租约与重试语义不变。
+
+缓存命中必须经权威链 `chunk→index_generation→document_version→document→knowledge_base` 校验，命中条件为同 `organization_id`、`g.status='READY'`、`g.profile_id=:profile_id`、`ce.profile_id=:profile_id`、`chunk.model_input_hash` 命中，并排除已删除文档（`deleted_at` 非空或 `DELETED`）；不要求缓存来源仍是文档 active version，允许同组织跨文档与旧版本复用。缓存键边界由不可变 `index_profile` 身份与运行期身份预检确定，编码请求固定 `kind='document'`（`embedding_client.REQUEST_KIND`），pooling/provider 不是当前可配置自由度、由冻结模型 revision 与 inference 契约约束，不新增 profile 字段、不改 `config_hash`。
+
+缓存查询使用独立短只读事务并在 `finally` 显式 `rollback` 结束，绝不影响主事务；查询/连接失败只记静态、不含正文与 DSN 的 warning 并回退全量 miss 编码，不吞 `KeyboardInterrupt`/`SystemExit`/`MemoryError`，只捕预期 `SQLAlchemyError`。缓存向量经严格 512 维与 finite 校验，畸形/维度错误按该 hash miss 处理，绝不写入无效向量，结果不泄露源 chunk id/text。
+
+迁移 `20260929_0014` 只新增具名 btree 索引 `ix_chunk_model_input_hash`（`chunk(model_input_hash)`），降级只删除该索引；SQLAlchemy 模型 `Chunk` 同步声明。
+
+**退出证据口径**：至少覆盖（1）全命中不调用编码器；（2）部分命中只编码 miss；（3）重复 hash 只编码一次并 fan-out；（4）缓存查询失败回退全量编码；（5）畸形/维度错误回退；（6）SQL 形状覆盖权威链、同组织、generation 与 embedding 双侧 profile、READY、排除删除；（7）整篇相同、局部更新、同组织跨文档命中、跨组织不命中、不同 profile/revision 不命中、旧版本复用与发布 CAS 不变，并量化编码器收到的文本数与最终向量数。真实 PostgreSQL 集成在无 Docker 守护进程时应明确标注未跑，不能以跳过冒充通过。
 
 **本轮新增：文本 PDF 最小兼容切片（未提交）**。在 Markdown 链路上按来源分派，复用同一
 `index_profile`、`config_hash=4af4c33d…57fa` 与 `CHUNKER_VERSION='heading-pack-v1'`，不新增迁移。

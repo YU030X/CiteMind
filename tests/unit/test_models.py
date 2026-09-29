@@ -204,7 +204,7 @@ EXPECTED_INDEXES = {
         "ix_index_generation_version_id_profile_id_status",
         "uq_index_generation_version_id_profile_id_ready",
     },
-    "chunk": {"ix_chunk_generation_id", "ix_chunk_fts"},
+    "chunk": {"ix_chunk_generation_id", "ix_chunk_model_input_hash", "ix_chunk_fts"},
 }
 
 

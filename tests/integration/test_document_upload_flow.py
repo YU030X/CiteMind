@@ -45,7 +45,7 @@ pytestmark = pytest.mark.integration
 # 上传事务的 ORM 写入 ``ingest_job.profile_id``（0006）、受理时刻的 ``request_title``
 # （0008），并依赖 ``document.acl_mode`` 的 server default（0012）；DOCX 上传还需 ``source_type``
 # 允许 ``docx``（0013），因此上传片建在当前 head。
-SCHEMA_REVISION = "20260929_0013"
+SCHEMA_REVISION = "20260929_0014"
 
 # 默认 index profile 契约与其规范 JSON 的 SHA-256；与 profile 契约/登记聚焦测试一致。
 GOLDEN_CONFIG_HASH = "4af4c33d4e8d5571cc513dc8c623b1fe66a5565683f95fc75a7b3f8a28dc57fa"

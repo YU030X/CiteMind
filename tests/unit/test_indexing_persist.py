@@ -103,6 +103,8 @@ def build_dependencies(
         embedder_factory=lambda counter: FakeEmbedder(),
         parse_document=resolved_parse,
         parse_pdf_document=parse_pdf_document or resolved_parse,
+        # 这些用例只关心数据库错误收敛；缓存作为纯优化注入空 miss，不打开业务会话。
+        cache_lookup=lambda *args, **kwargs: {},
     )
 
 

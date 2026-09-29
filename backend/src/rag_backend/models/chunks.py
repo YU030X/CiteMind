@@ -37,6 +37,7 @@ class Chunk(CreatedAtMixin, Base):
             "generation_id", "chunk_index", name="uq_chunk_generation_id_chunk_index"
         ),
         Index("ix_chunk_generation_id", "generation_id"),
+        Index("ix_chunk_model_input_hash", "model_input_hash"),
         Index("ix_chunk_fts", "fts", postgresql_using="gin"),
     )
 

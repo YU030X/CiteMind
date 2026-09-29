@@ -45,7 +45,7 @@ from pdf_samples import positive_samples as pdf_positive_samples  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
-SCHEMA_REVISION = "20260929_0013"
+SCHEMA_REVISION = "20260929_0014"
 
 PROFILE = IndexProfileContract(
     embedding_model="test/model",
@@ -117,6 +117,19 @@ class FakeEmbedder:
 
     def close(self) -> None:
         self.closed = True
+
+
+class RecordingEmbedder(FakeEmbedder):
+    """记录每次收到的文本，用于量化增量缓存减少的编码输入。"""
+
+    def __init__(self) -> None:
+        super().__init__("ok")
+        self.received: list[list[str]] = []
+
+    def embed_document_texts(self, texts: Any) -> list[list[float]]:
+        self.calls += 1
+        self.received.append(list(texts))
+        return [[0.01] * 512 for _ in texts]
 
 
 @dataclass
@@ -225,6 +238,7 @@ def seed_job(
     version_no: int = 1,
     content: bytes = MARKDOWN_BODY.encode(),
     kb_id: uuid.UUID | None = None,
+    organization_id: uuid.UUID | None = None,
     kb_active_profile_id: uuid.UUID | None = None,
     document_active_version: bool = False,
     profile_bound: bool = True,
@@ -235,6 +249,8 @@ def seed_job(
     profile_id = ensure_profile(engine, profile)
     if kb_id is None:
         kb_id = uuid.uuid4()
+    if organization_id is None:
+        organization_id = uuid.uuid4()
     document_id = uuid.uuid4()
     version_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -258,7 +274,7 @@ def seed_job(
             ),
             {
                 "id": kb_id,
-                "organization_id": uuid.uuid4(),
+                "organization_id": organization_id,
                 "active_profile": kb_active_profile_id,
             },
         )
@@ -324,6 +340,74 @@ def seed_job(
             {"id": uuid.uuid4(), "job_id": job_id},
         )
     return SeededJob(job_id, kb_id, document_id, version_id, profile_id, file_ref)
+
+
+def seed_update_job(
+    engine: Engine,
+    storage: DocumentBlobStore,
+    prior: SeededJob,
+    *,
+    content: bytes,
+    profile: IndexProfileContract = PROFILE,
+) -> SeededJob:
+    """为既有文档追加一个新版本 job；去重键携带可解析的 expected active 版本。"""
+
+    profile_id = ensure_profile(engine, profile)
+    version_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    file_hash = hashlib.sha256(content).hexdigest()
+    file_ref = storage.blob_ref(prior.kb_id, file_hash)
+    storage.publish(prior.kb_id, file_hash, content)
+    dedupe_key = f"ver1:{prior.document_id}:{'a' * 64}:{prior.version_id}"
+    with engine.begin() as connection:
+        next_version_no = int(
+            connection.scalar(
+                text(
+                    "SELECT coalesce(max(version_no), 0) + 1 FROM document_version "
+                    "WHERE document_id = :document_id"
+                ),
+                {"document_id": prior.document_id},
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO document_version (id, document_id, version_no, file_ref, "
+                "file_hash, mime, parser_version, status) "
+                "VALUES (:id, :document_id, :version_no, :file_ref, :file_hash, "
+                "'text/markdown', :parser_version, 'PENDING')"
+            ),
+            {
+                "id": version_id,
+                "document_id": prior.document_id,
+                "version_no": next_version_no,
+                "file_ref": file_ref,
+                "file_hash": file_hash,
+                "parser_version": MARKDOWN_PARSER_VERSION,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO ingest_job (id, document_id, version_id, profile_id, status, "
+                "attempt, next_run_at, dedupe_key) "
+                "VALUES (:id, :document_id, :version_id, :profile_id, 'QUEUED', 0, now(), "
+                ":dedupe_key)"
+            ),
+            {
+                "id": job_id,
+                "document_id": prior.document_id,
+                "version_id": version_id,
+                "profile_id": profile_id,
+                "dedupe_key": dedupe_key,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO outbox_event (id, job_id, event_type, status, dispatch_attempt, "
+                "next_send_at) VALUES (:id, :job_id, 'ingest.requested', 'PENDING', 0, now())"
+            ),
+            {"id": uuid.uuid4(), "job_id": job_id},
+        )
+    return SeededJob(job_id, prior.kb_id, prior.document_id, version_id, profile_id, file_ref)
 
 
 def make_dependencies(
@@ -1136,3 +1220,180 @@ def test_docx_pipeline_nested_table_fails_unsupported(
     assert job["status"] == "FAILED"
     assert job["error_code"] == iw.ERROR_PIPELINE_DOCX_UNSUPPORTED
     assert count_rows(pipeline_schema, "index_generation", "version_id", seeded.version_id) == 0
+
+
+# --- 增量 embedding 缓存 ------------------------------------------------------
+
+PARTIAL_V1 = b"# A\n\npara a\n\n# B\n\npara b\n"
+PARTIAL_V2 = b"# A\n\npara a\n\n# B\n\npara b two\n"
+
+
+def other_identity() -> FakeIdentity:
+    return FakeIdentity(
+        profile=OTHER_PROFILE,
+        parser_version=MARKDOWN_PARSER_VERSION,
+        pdf_parser_version=PDF_PARSER_VERSION,
+        docx_parser_version="python-docx-1.2.0-v1",
+        token_counter=FakeCounter(),
+        keyword_analyzer=FakeAnalyzer(),
+    )
+
+
+def count_generation_embeddings(engine: Engine, generation_id: Any) -> int:
+    with engine.connect() as connection:
+        return int(
+            connection.scalar(
+                text(
+                    "SELECT count(*) FROM chunk_embedding AS ce "
+                    "JOIN chunk AS c ON c.id = ce.chunk_id "
+                    "WHERE c.generation_id = :generation_id"
+                ),
+                {"generation_id": generation_id},
+            )
+        )
+
+
+def run_ready(
+    engine: Engine,
+    sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+    seeded: SeededJob,
+    *,
+    embedder: FakeEmbedder | None = None,
+    identity: FakeIdentity | None = None,
+) -> str:
+    return iw.process_ingest_event(
+        make_dependencies(sessions, storage, embedder=embedder, identity=identity),
+        job_id=seeded.job_id,
+        event_id=str(uuid.uuid4()),
+    )
+
+
+def test_embedding_cache_reuses_identical_content_across_documents_in_same_org(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    org_id = uuid.uuid4()
+    first = seed_job(pipeline_schema, storage, organization_id=org_id)
+    assert run_ready(pipeline_schema, worker_sessions, storage, first) == iw.PROCESS_STATUS_READY
+
+    recorder = RecordingEmbedder()
+    second = seed_job(pipeline_schema, storage, organization_id=org_id)
+    status = run_ready(
+        pipeline_schema, worker_sessions, storage, second, embedder=recorder
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    # 同组织、同 profile、内容相同：全部命中缓存，编码器一次都不调用。
+    assert recorder.calls == 0
+    job = read_job(pipeline_schema, second.job_id)
+    generation_id = job["generation_id"]
+    chunks = count_rows(pipeline_schema, "chunk", "generation_id", generation_id)
+    embeddings = count_generation_embeddings(pipeline_schema, generation_id)
+    assert chunks == embeddings == 1
+
+
+def test_embedding_cache_does_not_cross_organizations(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    first = seed_job(pipeline_schema, storage, organization_id=uuid.uuid4())
+    assert run_ready(pipeline_schema, worker_sessions, storage, first) == iw.PROCESS_STATUS_READY
+
+    recorder = RecordingEmbedder()
+    second = seed_job(pipeline_schema, storage, organization_id=uuid.uuid4())
+    status = run_ready(
+        pipeline_schema, worker_sessions, storage, second, embedder=recorder
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    # 不同组织即使内容、profile 相同也必须 miss 并重新编码。
+    assert recorder.calls == 1
+    assert recorder.received == [["标题\n\n这是正文内容。"]]
+
+
+def test_embedding_cache_does_not_cross_profiles(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    org_id = uuid.uuid4()
+    first = seed_job(pipeline_schema, storage, organization_id=org_id)
+    assert run_ready(pipeline_schema, worker_sessions, storage, first) == iw.PROCESS_STATUS_READY
+
+    recorder = RecordingEmbedder()
+    second = seed_job(
+        pipeline_schema, storage, organization_id=org_id, profile=OTHER_PROFILE
+    )
+    status = run_ready(
+        pipeline_schema,
+        worker_sessions,
+        storage,
+        second,
+        embedder=recorder,
+        identity=other_identity(),
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    # profile/revision 不同：不命中其它 profile 的向量，必须重新编码。
+    assert recorder.calls == 1
+    assert len(recorder.received[0]) == 1
+
+
+def test_embedding_cache_partial_update_reuses_unchanged_chunk(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    first = seed_job(
+        pipeline_schema, storage, organization_id=uuid.uuid4(), content=PARTIAL_V1
+    )
+    assert run_ready(pipeline_schema, worker_sessions, storage, first) == iw.PROCESS_STATUS_READY
+
+    recorder = RecordingEmbedder()
+    update = seed_update_job(pipeline_schema, storage, first, content=PARTIAL_V2)
+    status = run_ready(
+        pipeline_schema, worker_sessions, storage, update, embedder=recorder
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    # 未改动的 A 段命中，只有改动的 B 段进入编码；最终仍写满 2 条向量。
+    assert recorder.calls == 1
+    assert recorder.received == [["B\n\npara b two"]]
+    job = read_job(pipeline_schema, update.job_id)
+    generation_id = job["generation_id"]
+    assert count_rows(pipeline_schema, "chunk", "generation_id", generation_id) == 2
+    assert count_generation_embeddings(pipeline_schema, generation_id) == 2
+    # 发布 CAS 未被缓存改变：指针切到新版本。
+    document = read_document(pipeline_schema, first.document_id)
+    assert document["active_version_id"] == update.version_id
+
+
+def test_embedding_cache_reuses_old_version_after_update_publish(
+    pipeline_schema: Engine,
+    worker_sessions: SyncSessionFactory,
+    storage: DocumentBlobStore,
+) -> None:
+    org_id = uuid.uuid4()
+    first = seed_job(
+        pipeline_schema, storage, organization_id=org_id, content=PARTIAL_V1
+    )
+    assert run_ready(pipeline_schema, worker_sessions, storage, first) == iw.PROCESS_STATUS_READY
+    update = seed_update_job(pipeline_schema, storage, first, content=PARTIAL_V2)
+    assert run_ready(pipeline_schema, worker_sessions, storage, update) == iw.PROCESS_STATUS_READY
+
+    recorder = RecordingEmbedder()
+    third = seed_job(
+        pipeline_schema, storage, organization_id=org_id, content=PARTIAL_V1
+    )
+    status = run_ready(
+        pipeline_schema, worker_sessions, storage, third, embedder=recorder
+    )
+
+    assert status == iw.PROCESS_STATUS_READY
+    # 旧版本（已不是 active）的 READY generation 仍可被同组织复用。
+    assert recorder.calls == 0
+    document = read_document(pipeline_schema, first.document_id)
+    assert document["active_version_id"] == update.version_id
