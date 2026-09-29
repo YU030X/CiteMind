@@ -52,6 +52,7 @@ class UsageAttempt(_Model):
     created_at: datetime
     stage: UsageStage
     status: UsageStatus
+    provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     attempt: int = Field(ge=1, strict=True)
     error_code: str | None = None
@@ -228,6 +229,7 @@ def _to_attempt(row: UsageAttemptRow) -> UsageAttempt:
             created_at=row.created_at,
             stage=cast(UsageStage, row.stage),
             status=cast(UsageStatus, row.status),
+            provider=row.provider,
             model=row.model,
             attempt=row.attempt,
             error_code=row.error_code,

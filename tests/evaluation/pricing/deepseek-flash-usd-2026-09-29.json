@@ -1,0 +1,32 @@
+{
+  "snapshotVersion": "citemind-price-1",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "modelVersion": "DeepSeek-V4.1-Flash",
+  "observedAt": "2026-09-29T17:39:03Z",
+  "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "currency": "USD",
+  "perTokens": 1000000,
+  "bands": {
+    "offPeak": {
+      "inputCacheHit": "0.003",
+      "inputCacheMiss": "0.15",
+      "output": "0.6"
+    },
+    "peak": {
+      "inputCacheHit": "0.006",
+      "inputCacheMiss": "0.3",
+      "output": "1.2"
+    }
+  },
+  "selectionRule": {
+    "timezone": "UTC",
+    "peakWeekdayWindows": [
+      { "start": "01:00", "end": "04:00" },
+      { "start": "06:00", "end": "10:00" }
+    ],
+    "excludedHolidays": "China statutory holidays (中国法定节假日) are always off-peak; all other UTC times are off-peak.",
+    "defaultBand": "offPeak",
+    "note": "Operator selects the band explicitly. This snapshot records the official window structure; it does not auto-detect peak/off-peak and cannot judge China statutory holidays offline."
+  }
+}

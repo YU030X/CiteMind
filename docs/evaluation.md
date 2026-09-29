@@ -180,6 +180,26 @@ runner 侧：`AskOutcome` 新增必填 `query_run_id`，`_run_question` 把历�
 
 离线聚焦验证：`uv run --no-sync pytest tests/unit/test_evaluation_usage_artifact.py tests/unit/test_evaluation_runner.py -q -p no:cacheprovider` 为 **50 passed**（全为合成 fake，无网络、无真实数据库、无模型）；`uv run --no-sync ruff check`（5 文件）与 `uv run --no-sync mypy`（3 个源文件）均通过。**未运行**：真实 PostgreSQL（`usage_attempts_for` 的 `SELECT`）、真实 HTTP `queryRunId` 解析、真实 runner `--usage-out`、Docker、全量 pytest/mypy。
 
+## 已实现：固定价目快照与纯离线成本复算（2026-09-29，第 3 提交）
+
+本提交把成本片从「只有原始 usage」推进到「可按固定价目离线复算」，仍**不运行真实 100 题、不产生任何真实账单**。`tests/evaluation/pricing/deepseek-flash-usd-2026-09-29.json` 固定 DeepSeek 官方 `model=deepseek-flash`（`DeepSeek-V4.1-Flash`）的每 1M token USD 单价：`offPeak` 为 cacheHit 0.003 / cacheMiss 0.15 / output 0.6，`peak` 为 0.006 / 0.3 / 1.2；`observedAt` 只表示项目 2026-09-29 的核对时点，页面未给出 effective date，快照不伪造；`selectionRule` 以结构记录 UTC 工作日高峰窗口与中国法定节假日例外，但**band 由 operator 显式传入，不能自动判定**。
+
+`backend/src/rag_backend/evaluation/costs.py` 提供严格 Pydantic 价目 schema（价格只接受 `Decimal` 字符串，拒绝 float/int/bool 与额外字段）、`CostArtifact` 与纯函数 `build_cost_artifact(usage, snapshot, band)`。计算要求 attempt 的 provider/model 与快照精确匹配、`status=SUCCEEDED` 且 cacheHit/cacheMiss/completion 三个 token 都非空；失败、超时或任一必需 token 缺失时 `costAmount=None` 并给出静态 `reason`，**绝不按 0 计**。公式为 `Decimal` 的 `(hit*rateHit + miss*rateMiss + completion*rateOut) / perTokens`，单项 quantize 到 0.00000001 且 `ROUND_HALF_UP`；`knownCostAmount` 先对可计算 attempt 的原始 `Decimal` 求和再统一 quantize，避免逐项舍入误差。`promptTokens` 不参与公式。产物保留完整 `priceSnapshot` 身份、`selectedBand`、`currency`、逐 run/逐 attempt 的 token 事实与 `costAmount`/`reason`，并给出 `totals`、`finalQuestionOnly` 与 `perQuestion` 三组同结构汇总；金额对外 JSON 固定 8 位小数字符串。
+
+纯离线入口（不读环境/DB/网络，`--price-snapshot` 无默认值必须显式传入，`--out` 拒绝覆盖并原子落盘）：
+
+```text
+uv run python -m rag_backend.evaluation.costs --usage path/to/usage.json --price-snapshot tests/evaluation/pricing/deepseek-flash-usd-2026-09-29.json --band offPeak --out path/to/costs.json
+```
+
+聚焦单测（同样离线、全合成）：
+
+```text
+uv run pytest tests/unit/test_evaluation_costs.py -q
+```
+
+**边界**：这是**估算快照复算，不是账单**，不覆盖折扣/赠送额度/阶梯价与供应商结算差异，provider 可能改价；只支持 USD，不做汇率；`knownCostAmount` 只汇总可计算 attempt，未知 attempt 由 `unknownCostAttemptCount` 计数、不得当作 0；`llm_usage` 价目/费用列、`results.json` 契约与 API 均不变，离线产物不 `UPDATE` 账本。**本轮未运行**：真实 PostgreSQL 只读回读、真实 runner `--usage-out`、任何真实 100 题成本或账单核对、Docker 与全量 pytest/mypy。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。

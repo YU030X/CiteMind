@@ -45,6 +45,12 @@
 
 `query_run_id` 是**调用前生成的整轮关联键，不建外键**：一次提问在调用任何 provider 之前生成一次，本轮全部 attempt（`qa_rewrite`、`qa_answer`、失败与来源变化重试）共用同一值，失败提问可能永远没有对应的 `query_run` 行，且账本按 attempt 分次提交，因此普通或 deferred 外键都会失败。历史行保持 NULL，不回填、不伪造。它只用于把整轮 attempt 归到一起，不代表一定存在对应 `query_run`，也不是完整计费系统：价目快照与费用仍为 NULL。服务写入时业务调用必传非空值，独立探针 `rag_backend.llm_probe` 不归任何业务 run，省略该列。表级 `SELECT`/`INSERT` GRANT 已覆盖新列，api 授权不变，worker 仍无任何权限。降级先删索引再删列。SQLAlchemy 模型 `LlmUsage` 同步声明该列。runner 的 `--usage-out` 通过 `SqlEvaluationDatabase.usage_attempts_for` 只用参数化 expanding `SELECT` 按该列读回账本行，即 **runner 使用 usage 产物前要求目标库已部署 `20260929_0016`**；该路径不写库、不新增授权。真实 PostgreSQL 迁移与授权由 `tests/integration/test_llm_usage_query_run_id_migration.py` 承担（列可空 UUID、无外键、具名 btree 索引、历史行 NULL、api 可读写、worker 拒绝、降级恢复），未配置测试 DSN 时按守卫跳过。
 
+## 已实现：Phase 3 成本片固定价目快照与离线成本复算（不改表结构）
+
+本片不新增迁移、不改 `llm_usage` 列与授权：价目快照固定为仓库文件 `tests/evaluation/pricing/deepseek-flash-usd-2026-09-29.json`，成本是离线派生产物 `evaluation/costs.py` 的 `CostArtifact`，不写回数据库、不参与事务，也不 `UPDATE` 任何账本行。`llm_usage.provider` 列早在 `20260923_0004` 已存在（非空 Text），本片只把该事实接入 runner 只读路径：`UsageAttemptRow`/`UsageAttempt` 与 `usage_attempts_for` 的 `SELECT` 增加 `provider`，使成本计算能按账本事实校验来源而不是假设“一定来自 DeepSeek”。
+
+离线产物对外的资金只支持 `USD` 单币种（不做汇率），金额用固定 8 位小数字符串表示；`llm_usage` 的 `price_snapshot`/`price_source`/`price_currency`/`cost_amount` 四列仍为 NULL、仍保留将来显式快照写入的位置，但本片不写它们。该产物是估算快照复算而非账单事实源：无法计算的 attempt 费用为 `None` 并在产物中单独计数，不能当成 0 成本。
+
 ## 已实现：第四切片（迁移 20260923_0005）
 
 迁移 `20260923_0005_identity_and_kb_members` 紧接 `20260923_0004`，创建登录主体 `user_account`、服务端会话 `auth_session` 与 KB 成员授权 `kb_member`。三张表由迁移账号创建，逐表 `REVOKE ALL ... FROM PUBLIC` 后只给 api 角色 SELECT+INSERT+UPDATE；worker 在本切片没有身份写路径，不获任何权限；不授权 DELETE/TRUNCATE/REFERENCES/TRIGGER 或 sequence，也不使用 PostgreSQL ENUM、serial/identity 与 `ALTER DEFAULT PRIVILEGES`。迁移 `20260923_0005` 自身只建立持久化结构，不包含登录、会话签发/撤销、登录限流或权限判定逻辑，也不创建凭据、种子用户或默认管理员；这些 auth 与 KB 成员 API 已在其后的应用层实现并验收（见 [安全](security.md) 与 [API 契约](api.md)）。

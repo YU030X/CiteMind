@@ -368,6 +368,7 @@ class UsageAttemptRow:
     created_at: datetime
     stage: str
     status: str
+    provider: str
     model: str
     attempt: int
     error_code: str | None
@@ -393,7 +394,7 @@ class SqlEvaluationDatabase:
     # 需要已部署迁移 20260929_0016（``llm_usage.query_run_id``）；只 SELECT，复用同一 engine。
     _USAGE_QUERY = text(
         """
-        SELECT id, query_run_id, created_at, stage, status, model, attempt, error_code,
+        SELECT id, query_run_id, provider, created_at, stage, status, model, attempt, error_code,
                prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
                prompt_cache_miss_tokens, latency_ms
         FROM llm_usage
@@ -443,17 +444,18 @@ class SqlEvaluationDatabase:
             UsageAttemptRow(
                 usage_id=_coerce_uuid(row[0]),
                 query_run_id=_coerce_uuid(row[1]),
-                created_at=row[2],
-                stage=row[3],
-                status=row[4],
-                model=row[5],
-                attempt=row[6],
-                error_code=row[7],
-                prompt_tokens=row[8],
-                completion_tokens=row[9],
-                prompt_cache_hit_tokens=row[10],
-                prompt_cache_miss_tokens=row[11],
-                latency_ms=row[12],
+                created_at=row[3],
+                stage=row[4],
+                status=row[5],
+                provider=row[2],
+                model=row[6],
+                attempt=row[7],
+                error_code=row[8],
+                prompt_tokens=row[9],
+                completion_tokens=row[10],
+                prompt_cache_hit_tokens=row[11],
+                prompt_cache_miss_tokens=row[12],
+                latency_ms=row[13],
             )
             for row in rows
         )
