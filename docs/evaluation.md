@@ -122,6 +122,23 @@ uv run pytest tests/unit/test_ranking_metrics.py tests/unit/test_calibration.py 
 
 **本轮未运行**：真实 PostgreSQL/inference 连接、真实 A/B/C 探针与任何 `Recall@10`/`nDCG@10`/标定/时延数值。dry-run 与全部 adapter/CLI 单测使用 fake 运行时，不建 engine、不联网。
 
+## 已实现：Phase 3 离线拒答标定消费链（纯离线）
+
+`python -m rag_backend.evaluation.analysis` 新增可选 `--calibration`，把第 2 片的纯离线标定扫描接到既有分析入口；不提供时行为与 stdout 输出完全不变，不新增输出文件 schema，只在 stdout 追加一行中文摘要。
+
+- **严格解析与覆盖。** 用既有严格 `CalibrationArtifact` 解析，`datasetKind`/`datasetVersion` 必须与题集一致，`records.questionId` 集合必须恰好覆盖题集全部题目（缺题或多题静态失败）。
+- **开发集只选点。** 传入 `--calibration` 且 `datasetKind=dev` 时禁止传 `--refusal-threshold`；只用 `scan_refusal_thresholds` + `select_dev_threshold` 选点，并输出该点的 `threshold`、`refusalAccuracy`、`falseRefusalRate`、`balancedAccuracy` 及各自分子/分母。没有可观测有限分数（或指标分母为空）导致无选点时静态失败，不伪造阈值。
+- **留出集只报告。** `datasetKind=holdout` 时必须显式给出有限 `--refusal-threshold`，只用 `evaluate_refusal_threshold` 报告该固定点，不扫描不选点；缺失阈值或非有限数静态失败。
+- **边界。** 未提供 `--calibration` 却传 `--refusal-threshold` 静态失败；成功通过 argparse 语法解析后的标定输入错误退出码为 1、输出静态中文原因且不打印 traceback，`CalibrationInputError` 被捕获。argparse 自身的缺参或未知参数仍使用标准退出码 2。
+
+单行示例（在仓库根目录）：
+
+```text
+uv run python -m rag_backend.evaluation.analysis --dataset holdout.json --a a.json --b b.json --c c.json --calibration calibration.json --refusal-threshold 0.5
+```
+
+本轮未新增真实探针运行，也没有任何真实标定数值；真实留出标定仍属后续片。
+
 ## 已实现：开发集最小结果 producer（runner）
 
 `rag_backend.evaluation.runner` 把开发集或留出集接到**真实 API** 上，产出恰好覆盖题集全部 id 的 results 文件供既有 `--results` 指标消费；它不建评估平台、不建新数据库、不引入 LLM 裁判，也不改业务 API 或公开 `Citation` 字段。

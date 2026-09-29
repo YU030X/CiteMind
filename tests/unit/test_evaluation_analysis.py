@@ -59,9 +59,10 @@ def _artifact(
     candidates: list[dict[str, object]],
     *,
     degraded: bool = False,
+    dataset_kind: str = "dev",
 ) -> dict[str, object]:
     return {
-        "datasetKind": "dev",
+        "datasetKind": dataset_kind,
         "datasetVersion": "v1",
         "variant": variant,
         "config": {},
@@ -105,6 +106,65 @@ def _write(path: Path, payload: object) -> Path:
     return path
 
 
+def _calibration(
+    *,
+    dataset_kind: str = "dev",
+    dataset_version: str = "v1",
+    records: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    if records is None:
+        records = [
+            {
+                "questionId": "q1",
+                "expectedBehavior": "answer",
+                "topScore": 0.9,
+                "candidateCount": 1,
+            },
+            {
+                "questionId": "q2",
+                "expectedBehavior": "refuse",
+                "topScore": 0.1,
+                "candidateCount": 1,
+            },
+        ]
+    return {
+        "datasetKind": dataset_kind,
+        "datasetVersion": dataset_version,
+        "createdAt": "2026-09-29T00:00:00Z",
+        "records": records,
+    }
+
+
+def _write_triplet(tmp_path: Path, dataset_kind: str = "dev") -> tuple[Path, Path, Path]:
+    a = _write(
+        tmp_path / "a.json",
+        _artifact("A_VECTOR", [_candidate("c1", 1)], dataset_kind=dataset_kind),
+    )
+    b = _write(
+        tmp_path / "b.json",
+        _artifact(
+            "B_RRF",
+            [_candidate("c1", 1, fusionRank=1, fusionScore=1.0)],
+            dataset_kind=dataset_kind,
+        ),
+    )
+    c = _write(
+        tmp_path / "c.json",
+        _artifact(
+            "C_RERANK",
+            [_candidate("c1", 1, fusionRank=1, fusionScore=1.0, rerankScore=0.9)],
+            dataset_kind=dataset_kind,
+        ),
+    )
+    return a, b, c
+
+
+def _holdout_dataset() -> dict[str, object]:
+    payload = _dataset()
+    payload["datasetKind"] = "holdout"
+    return payload
+
+
 def test_analysis_cli_prints_metrics(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     dataset = _write(tmp_path / "dataset.json", _dataset())
     a = _write(tmp_path / "a.json", _artifact("A_VECTOR", [_candidate("c1", 1)]))
@@ -127,6 +187,7 @@ def test_analysis_cli_prints_metrics(tmp_path: Path, capsys: pytest.CaptureFixtu
     assert "三元组校验通过" in out
     assert "A_VECTOR" in out and "C_RERANK" in out
     assert "excluded=1" in out
+    assert "标定" not in out
 
 
 def test_analysis_cli_rejects_dataset_metadata_drift(
@@ -189,3 +250,257 @@ def test_analysis_cli_rejects_degraded_order_drift(
     )
     assert code == 1
     assert "离线分析失败" in capsys.readouterr().err
+
+
+def test_analysis_cli_dev_calibration_selects_point(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    calibration = _write(tmp_path / "calibration.json", _calibration())
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "标定（dev 选点）" in out
+    assert "refuseCorrect=" in out and "falseRefusal=" in out
+    assert "balancedAccuracy=1.0" in out
+
+
+def test_analysis_cli_dev_rejects_refusal_threshold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    calibration = _write(tmp_path / "calibration.json", _calibration())
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+            "--refusal-threshold",
+            "0.5",
+        ]
+    )
+    assert code == 1
+    assert "开发集标定不得传入" in capsys.readouterr().err
+
+
+def test_analysis_cli_holdout_requires_refusal_threshold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _holdout_dataset())
+    a, b, c = _write_triplet(tmp_path, dataset_kind="holdout")
+    calibration = _write(tmp_path / "calibration.json", _calibration(dataset_kind="holdout"))
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+        ]
+    )
+    assert code == 1
+    assert "留出集标定必须显式传入" in capsys.readouterr().err
+
+
+def test_analysis_cli_holdout_reports_fixed_point(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _holdout_dataset())
+    a, b, c = _write_triplet(tmp_path, dataset_kind="holdout")
+    calibration = _write(tmp_path / "calibration.json", _calibration(dataset_kind="holdout"))
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+            "--refusal-threshold",
+            "0.5",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "标定（holdout 固定点）：threshold=0.5" in out
+    assert "refuseCorrect=1/1" in out and "falseRefusal=0/1" in out
+
+
+def test_analysis_cli_rejects_threshold_without_calibration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--refusal-threshold",
+            "0.5",
+        ]
+    )
+    assert code == 1
+    assert "只在提供 --calibration 时可用" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["abc", "nan", "inf", "-inf"])
+def test_analysis_cli_rejects_non_finite_threshold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _holdout_dataset())
+    a, b, c = _write_triplet(tmp_path, dataset_kind="holdout")
+    calibration = _write(tmp_path / "calibration.json", _calibration(dataset_kind="holdout"))
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+            f"--refusal-threshold={bad}",
+        ]
+    )
+    assert code == 1
+    assert "--refusal-threshold 必须是有限数" in capsys.readouterr().err
+
+
+def test_analysis_cli_rejects_calibration_coverage_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    records: list[dict[str, object]] = [
+        {
+            "questionId": "q1",
+            "expectedBehavior": "answer",
+            "topScore": 0.9,
+            "candidateCount": 1,
+        }
+    ]
+    calibration = _write(
+        tmp_path / "calibration.json", _calibration(records=records)
+    )
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+        ]
+    )
+    assert code == 1
+    assert "标定产物缺少题目 id：q2" in capsys.readouterr().err
+
+
+def test_analysis_cli_rejects_calibration_metadata_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    calibration = _write(
+        tmp_path / "calibration.json", _calibration(dataset_version="v2")
+    )
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+        ]
+    )
+    assert code == 1
+    assert "datasetKind/datasetVersion 与题集不一致" in capsys.readouterr().err
+
+
+def test_analysis_cli_dev_rejects_no_observable_scores(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _write(tmp_path / "dataset.json", _dataset())
+    a, b, c = _write_triplet(tmp_path)
+    records: list[dict[str, object]] = [
+        {
+            "questionId": "q1",
+            "expectedBehavior": "answer",
+            "topScore": None,
+            "candidateCount": 0,
+        },
+        {
+            "questionId": "q2",
+            "expectedBehavior": "refuse",
+            "topScore": None,
+            "candidateCount": 0,
+        },
+    ]
+    calibration = _write(
+        tmp_path / "calibration.json", _calibration(records=records)
+    )
+    code = analysis_main(
+        [
+            "--dataset",
+            str(dataset),
+            "--a",
+            str(a),
+            "--b",
+            str(b),
+            "--c",
+            str(c),
+            "--calibration",
+            str(calibration),
+        ]
+    )
+    assert code == 1
+    assert "没有可用的拒答阈值选点" in capsys.readouterr().err
