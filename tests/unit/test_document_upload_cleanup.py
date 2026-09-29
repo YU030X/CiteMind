@@ -33,8 +33,14 @@ class FakeEngine:
     def __init__(self, *, database_name: str) -> None:
         self.database_name = database_name
         self.disposed = False
+        self.executed: list[str] = []
 
     def connect(self) -> "FakeConnection":
+        return FakeConnection(self)
+
+    def begin(self) -> "FakeConnection":
+        # 与 SQLAlchemy 一致：``begin()`` 也是 yield 连接的上下文管理器。复用 FakeConnection
+        # 的 ``__enter__``/``__exit__``（异常不被吞掉），写入语句经 execute 记录以便断言。
         return FakeConnection(self)
 
     def dispose(self) -> None:
@@ -55,6 +61,10 @@ class FakeConnection:
         # 只有 current_database() 会直接走 engine；其余查询由被替换的 helper 处理。
         assert "current_database" in str(statement), f"意外的直接查询: {statement}"
         return self._engine.database_name
+
+    def execute(self, statement: Any, parameters: Any = None) -> None:
+        # 清理路径的 TRUNCATE 经 engine.begin() 的连接执行；记录以便断言其确实发生。
+        self._engine.executed.append(str(statement))
 
 
 class CommandRecorder:
@@ -115,6 +125,7 @@ def test_dirty_precondition_never_downgrades(monkeypatch: pytest.MonkeyPatch) ->
         next(generator)
 
     assert recorder.calls == []
+    assert engine.executed == []
     assert engine.disposed is True
 
 
@@ -141,4 +152,6 @@ def test_owned_schema_failure_still_downgrades_to_base_and_disposes(
         f"upgrade:{upload_flow.SCHEMA_REVISION}",
         "downgrade:base",
     ]
+    # 升级失败后必须先清空 document 再降级，TRUNCATE 清理路径确实被执行。
+    assert engine.executed == ["TRUNCATE document CASCADE"]
     assert engine.disposed is True
