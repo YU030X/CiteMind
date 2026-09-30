@@ -285,6 +285,39 @@ uv run python -m rag_backend.evaluation.rewrite_inspect --dataset tests/evaluati
 
 **本轮未测**：真实 runner `--rewrite-out` 产物、真实留出集改写观测与任何真实重合计数；`normalizedMatch`/`different` 只是字符串结构分类，不是语义改写质量的度量。
 
+## 已实现：Phase 4 最小受限资源 overlay 与手动性能入口（未真实运行）
+
+本片落地一个受限资源 Compose overlay 与一个最小性能手动采集入口，用于后续真实 2 vCPU/4 GB 验收，但**本轮没有运行真实服务、真实 HTTP、真实 Docker 或任何压测**，不产生任何真实性能数值，也不宣称资源达标。
+
+**受限资源 overlay。** `deploy/compose/phase4-limits.yml` 与 base `deploy/compose/compose.yml` 叠加使用，只写 Compose 官方字段 `deploy.resources.limits.{cpus,memory}`，不修改 base compose、Dockerfile 或安全解析代码。六服务上限之和恰为 `2.00` vCPU 与 `4096M`：postgres `0.50`/`1536M`、redis `0.10`/`256M`、inference `0.70`/`1024M`、api `0.35`/`512M`、worker `0.25`/`640M`、frontend-gateway `0.10`/`128M`。Docker 的 `M` 后缀是二进制 MiB，因此 `4096M == 4096 MiB == 4 GiB`（不是十进制 4 GB）。这些是**部署限额而不是已实测性能**，只覆盖六个容器本身，不含宿主操作系统与 Docker Desktop 虚拟机整体、镜像磁盘层、构建期资源与其它项目；不得据此声称虚拟机或宿主机只需 2 vCPU/4 GiB。overlay 保持 base 的单进程有界并发（uvicorn worker 1、Celery concurrency 1、inference 单进程）与 rerank 默认关闭，不给生成 API 加新功能。本轮只做静态 YAML 结构断言（解析 overlay 的每服务上限、断言求和为 2.00 vCPU/4096 MiB），**没有运行 `docker compose`**，因此“字段兼容”只是静态检查结论，未由真实渲染或容器启动验证。
+
+**最小性能手动入口。** `backend/src/rag_backend/evaluation/performance.py`（`python -m rag_backend.evaluation.performance`）默认 **dry-run**：只校验参数并打印计划，**不联网、不读环境变量、不执行 Docker、不写文件**。真实采集必须显式 `--execute`；`--mode retrieval` 只调用既有 `POST /api/v1/retrieval/search`，`--mode qa` 可能产生付费 LLM 调用，因此另外必须显式 `--allow-paid-llm`，不会静默触发模型下载或 LLM 调用。本入口不是通用压测平台：只实现最小串行并发 1（`--concurrency` 非 1 直接拒绝），不做并发 3 或通用负载引擎。
+
+- **指标口径。** 延迟是每请求客户端端到端墙钟时间（毫秒，含请求发送与响应读取）；失败与超时**计入成功率分母与延迟样本**，不剔除。`p50`/`p95` 复用既有评估的 nearest-rank 定义（`ceil(p*n)-1`，0-based，不插值），`mean` 用既有 `math.fsum` 汇总。吞吐是时间窗口吞吐 `count / elapsedSeconds`（从首个请求开始到最后一个请求结束），是窗口观察值而不是稳态容量结论。报告仍由用户显式指定路径、原子写出、拒绝覆盖，字段含 mode/count/成功失败数/p50/p95/elapsed/吞吐定义与资源范围。
+- **登录与秘密。** 用户名、密码、问题/查询只从显式命名的环境变量读取；Cookie 与 CSRF 令牌来自登录响应而非环境变量；上述都不写入报告、不回显（报告断言不含这些文本）。HTTP 客户端固定 `trust_env=False`（不读代理/证书环境变量，避免把凭据或 Cookie 经代理环境外发）且不关闭证书校验。真实目标默认只接受回环地址，非回环必须显式 `--allow-non-loopback-api`，避免误压线上。`--api-base-url` 只接受 origin：拒绝内嵌凭据、路径前缀、query 与 fragment；IPv6 主机在 Origin 中补方括号。
+- **内存观察。** 给定 `--compose-project` 时按该 Compose project 的容器采集实际观察（默认采样器只读 `docker ps`/`docker inspect`/`docker stats`，`ps`/`stats` 统一 `--no-trunc` 以让 64 位容器 ID 与 `inspect` 直接匹配）：登录成功后取一次窗口前样本，再在 HTTP 窗口内用单个有界后台线程按 `--memory-sample-interval-seconds`（默认 1 秒）采样；该间隔是两次采样间的配置等待，Docker 采集本身耗时会拉长实际周期。记录各服务的采样峰值与 Docker 实际报告的容器内存/CPU 上限，区分采样峰值与观察上限。线程在 `finally` 中 stop+join；默认采样器拿到 stop 信号后在各只读命令之间检查、不再发新命令，单条命令仍由 `subprocess.run(timeout=8s)` 严格限时（超时 kill+wait），因此停止后最多只余下一条命令；join 限额内仍未停止时明确失败、不写后置长采样也不把迟到样本写入结果。HTTP 延迟与 elapsed 只用 `clock` 计量、不含 Docker 统计墙钟；dry-run 与未指定 project 时绝不启动线程。缺值一律记为 `null`（未知）而非 0；命令失败、project 无容器、inspect/stats 失败或容器 ID 错配都在现有 `errors` 字段显式记错，报告不自动给出性能 pass 结论。采样峰值是有界间隔观察值，不是精确宿主 RSS，也不保证容器内真实峰值。
+- **离线测试。** `tests/unit/test_performance.py` 只用合成 `httpx.MockTransport`、fake 内存采样器与纯函数，**不实际调用 subprocess Docker、不发真 HTTP、不启动容器**。
+
+单行入口（dry-run，不联网、不读环境变量、不执行 Docker、不写文件）：
+
+```text
+uv run python -m rag_backend.evaluation.performance --mode retrieval --count 1
+```
+
+`--help` 与 dry-run 可直接运行；真实 execute 必须受上述 guard 限制，示例不携带任何真实凭据：
+
+```text
+uv run python -m rag_backend.evaluation.performance --execute --count 1 --api-base-url http://127.0.0.1:58080 --kb-id 00000000-0000-0000-0000-000000000000 --out perf-report.json
+```
+
+聚焦单测（离线）：
+
+```text
+uv run --no-sync pytest tests/unit/test_performance.py -q
+```
+
+本轮实测：聚焦 `47 passed`；`uv run --no-sync ruff check` 与 `uv run --no-sync mypy` 覆盖 `performance.py` 与 `tests/unit/test_performance.py` 通过。**本轮未运行**：真实 Compose 启动/`docker compose config`、真实 HTTP 检索、真实 Docker 内存采样与任何真实性能数值。真实 BGE/完整问答 p95 仍需在真实 inference 与显式付费授权下另行测量；本片只提供离线可测的纯函数与 fake 运行时，不代表 2 vCPU/4 GiB 达标。
+
 ## 消融与计分
 
 在同一语料、权限、模型 revision、Prompt、chunk、上下文预算和硬件下比较 A 向量、B 向量+关键词+RRF、C B+reranker。记录逐题候选、回答、时延、费用与失败原因；重排收益不足或延迟过高可关闭。开发集调参，留出集只做最终比较。下文 `Recall@10`/`nDCG@10` 是计划目标表述；本片已实现的离线定义见“Phase 3 第 2 片离线排序、拒答标定与消融契约”，以相交二值增益为准。

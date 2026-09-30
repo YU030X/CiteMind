@@ -1,0 +1,65 @@
+# CiteMind Phase 4 受限资源 override：给六服务设置运行期 CPU/内存上限。
+#
+# 用法（从仓库根目录，单行；与 base compose 叠加，不修改 base 文件与 Dockerfile）：
+#   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/phase4-limits.yml config --quiet
+#   docker compose --env-file .env -f deploy/compose/compose.yml -f deploy/compose/phase4-limits.yml up -d --build --wait
+#
+# 口径（必须与 docs/evaluation.md 的性能小节一致，不能当成已实测性能）：
+# - 这里只写 Compose 官方字段 deploy.resources.limits.{cpus,memory}（非 swarm 的 docker compose
+#   v2 会把它映射为容器的 CPU/内存硬上限；字段兼容性只做静态检查，未在本仓运行 docker compose）。
+# - 六服务上限之和恰为 2.00 vCPU 与 4096M 内存；Docker 的 `M` 后缀是二进制 MiB，因此
+#   4096M == 4096 MiB == 4 GiB（不是十进制的 4 GB）。这是部署限额，不是已测得性能。
+# - 该预算只覆盖六个容器本身，不含 Docker Desktop 虚拟机内核、宿主操作系统、镜像层、
+#   构建期资源与页缓存；不得据此声称虚拟机或宿主机只需 2 vCPU/4 GiB。
+# - 内存是上限而非预留；进程峰值、RSS 与整项目峰值仍须在真实运行中观测，观察缺失记为未知而非 0。
+# - 保持 base compose 的单进程有界并发（uvicorn worker 1、Celery concurrency 1、
+#   inference 单进程）与 rerank 默认关闭，不新增生成功能；构建期资源不计入本预算。
+services:
+  postgres:
+    deploy:
+      resources:
+        limits:
+          # 数据库是版本与向量的事实来源，给最大内存份额；CPU 上限覆盖迁移与查询峰值。
+          cpus: "0.50"
+          memory: 1536M
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          # 仅作 broker 与短期限流；base compose 已设 maxmemory 128mb + noeviction。
+          cpus: "0.10"
+          memory: 256M
+
+  inference:
+    deploy:
+      resources:
+        limits:
+          # 单进程加载一份 BGE 权重；内存给足模型与运行期，CPU 上限低于代码默认
+          # EMBEDDING_TORCH_THREADS=2，高负载时会受 cgroup 节流，属预期上限行为。
+          cpus: "0.70"
+          memory: 1024M
+
+  api:
+    deploy:
+      resources:
+        limits:
+          # 单 uvicorn worker；请求主要在等 inference/LLM，CPU 份额较小。
+          cpus: "0.35"
+          memory: 512M
+
+  worker:
+    deploy:
+      resources:
+        limits:
+          # Celery concurrency 1；解析在受控子进程中执行，内含 PDF 解压等瞬时内存峰值。
+          cpus: "0.25"
+          memory: 640M
+
+  frontend-gateway:
+    deploy:
+      resources:
+        limits:
+          # 非 root nginx 提供静态资源并代理 /api，占用最小。
+          cpus: "0.10"
+          memory: 128M
