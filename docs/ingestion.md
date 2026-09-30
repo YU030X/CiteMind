@@ -20,7 +20,7 @@
 | Markdown（纯解析/切分已实现，未落库） | markdown-it-py 4.2.0，保留标题、段落、列表与 fence 代码块；原始 HTML 不渲染且不进正文，图片只取 alt | 解析器版本、heading_path、所跨块的 1-based 块级起止行、`source_sha256`（原始 bytes）、块 ordinal 与块内规范化正文的字符区间 | token.map 起点 0-based、结束不含边界，统一转 1-based 闭区间；行号是块级粗粒度而非精确片段行；展示层必须转义，不能当 HTML |
 | 文本 PDF（解析/切分与默认关闭管线已实现） | `pypdf` 做加密/页数/结构预检，`pdfplumber` 逐页抽取文本层；每个非空页一个块，`heading_path` 为空元组，`start_line`/`end_line` 为 `None`（不伪造行号），部分空白页只被忽略 | `locator_version=2`：`source_type="pdf"`、`parser_version`（含 pypdf 与 pdfplumber 两个固定版本）、`source_sha256`（原始 bytes）、页号列表与每段所在 `page`；chunk 按页强制切分，绝不跨页 | 只保证页定位；零可提取文本落 `document_version.status='NEEDS_OCR'` + job `FAILED`/`PIPELINE_NEEDS_OCR`，不把空提取当成功；任何加密标志（含空口令可解密）/损坏/超过 200 页分别静态失败；复杂版面不承诺准确表格推理 |
 | DOCX（解析/切分与默认关闭管线已实现） | `python-docx==1.2.0` 按 XML 原顺序遍历 `w:p` 与 `w:tbl`；正文段落 1-based 编号（空段也计索引、不产出块），标题样式复用 Markdown 的标题栈；表格逐行一个块，横向合并只记真实 origin 一次，纵向合并 continue 不复制上一行文字，`gridBefore` 计入网格列 | `locator_version=3`：`source_type="docx"`、`parser_version`、`source_sha256`（原始 bytes）、`block_ordinals`，以及每段的 `block_char_start/end` 与所在 `paragraph_index` 或 `table_index`/`row_index`、`cells`（1-based 网格列、`grid_span`、规范化行文字内的字符区间）；不推测 Word 页码 | 只支持收窄子集且仅索引 `word/document.xml` 正文（页眉、页脚、脚注、尾注、批注与文本框不索引）：嵌套表、`w:sdt`、`w:altChunk`/`w:customXml`、宏部件、实体声明等收窄外结构落 `PIPELINE_DOCX_UNSUPPORTED`，坏 ZIP/CRC/XML 与实际解压/资源超限落 `PIPELINE_DOCX_INVALID`；不处理宏、不访问外链、不做 Word 分页/复杂版面推理 |
-| 静态网页（网页切片已实现） | 受限 HTTPX 抓取原 HTML，worker 用 BeautifulSoup4/lxml 清洗静态正文：先整体移除 script/style/template/noscript/nav/aside/header/footer，再在 main/article/body 中按确定块（p/li/pre/blockquote）抽取，h1–h6 只维护 heading_path，不执行脚本、不抓外链 | `locator_version=4`：`source_type="web"`、`parser_version`（`beautifulsoup4-4.15.0+lxml-6.1.3-v1`）、`source_sha256`（原 HTML bytes）、`source_url`/`final_url`/`fetched_at`，以及 segments 的 block ordinal 与块内字符区间 | 只支持静态 HTML；不执行 JS、不登录、不递归、不下载资源、不读 Cookie/代理；允许主机为精确列表且默认空即禁用；DNS 校验与连接间有竞态窗口，不声称抗 DNS rebinding（完整 SSRF 属 Phase 4） |
+| 静态网页（网页切片已实现） | 受限 HTTPX 抓取原 HTML，worker 用 BeautifulSoup4/lxml 清洗静态正文：先整体移除 script/style/template/noscript/nav/aside/header/footer，再在 main/article/body 中按确定块（p/li/pre/blockquote）抽取，h1–h6 只维护 heading_path，不执行脚本、不抓外链 | `locator_version=4`：`source_type="web"`、`parser_version`（`beautifulsoup4-4.15.0+lxml-6.1.3-v1`）、`source_sha256`（原 HTML bytes）、`source_url`/`final_url`/`fetched_at`，以及 segments 的 block ordinal 与块内字符区间 | 只支持静态 HTML；不执行 JS、不登录、不递归、不下载资源、不读 Cookie/代理；允许主机为精确列表且默认空即禁用；每跳把已校验公网 IP 列表保序固定到实际 TCP 连接、Host/TLS SNI/证书校验保留原 hostname（应用层 DNS rebinding 窗口已关闭，完整 SSRF 属 Phase 4） |
 
 网页切片已实现（迁移 `20260929_0015`）：`POST /api/v1/knowledge-bases/{id}/documents/web`（JSON `{url,title}`）与 `POST /api/v1/documents/{id}/versions/web`（JSON `{url,title,expectedVersionId}`）沿用 KB `EDITOR`、`Origin`、CSRF 与 `Idempotency-Key`，成功返回 `202` 与同一 `DocumentUploadResponse`。顺序冻结：先规范化 URL 与校验允许主机，再按去重键查已有请求；命中时只比对规范化 URL 与标题，**不联网**（同 URL+标题复用原 ids，不同则 409 `IDEMPOTENCY_KEY_REUSED`），只有新请求才在 API 返回 `202` 前抓取原 HTML 并写入既有内容寻址 blob；抓取成功后仍走既有 profile 预检、blob 发布与四表事务/CAS。允许主机由 `WEB_FETCH_ALLOWED_HOSTS` 配置（逗号分隔精确 host，不做后缀/通配符，默认空即禁用）；worker 只读 blob 离线解析，不需要抓取配置。worker 侧按 `source_type=web` 分派 `parse_web_in_subprocess`，解析后用 `dataclasses.replace` 注入 `document_version` 的 `source_url`/`final_url`/`fetched_at`，再切分为 `locator_version=4`；空正文落 `PIPELINE_CONTENT_EMPTY`，不新增状态。本片已由 `tests/unit/test_web_fetch.py`（MockTransport+假解析器）、`tests/unit/test_web_parsing.py`（5 份自制 HTML 正样本、子进程一致性与 locator v4）与 `tests/unit/test_web_import.py`（免联网幂等/路由）覆盖；真实抓取、真实 PostgreSQL 事务与端到端 READY 未在本片验收。
 
@@ -165,8 +165,12 @@ worker 侧真实 tokenizer 四件与关键词分析器的启动校验由**可供
   随后在父进程用 `chunk_markdown` 与注入的真实 `LocalTokenizerCounter` 切分；PDF 在页边界强制
   切分、不跨页且不带上一页重叠；`source_sha256` 必须等于登记 `file_hash`，空正文/超预算分别静态
   失败。读 blob、解析、摘要失败都映射为静态 `FAILED`，不 DELETE、不碰共享 blob，也不让心跳无限期
-  掩盖挂起的解析。**子进程是解析硬时限与有界返回体，不声称内存隔离**（未配置 rlimit/cgroup 级
-  内存硬限）。
+  掩盖挂起的解析。**Linux 子进程入口在读取输入前对自身设 `RLIMIT_AS` 虚拟地址空间上限（默认
+  1 GiB）**，只作用于该子进程，父 worker 与其它线程不受影响；上限设置失败在解析前静态失败，设置
+  成功后分配超过地址空间才 `MemoryError`。该 1 GiB 值未在真实 Linux 上测量合法输入峰值余量，不保证
+  覆盖所有合法最大输入，也不是 RSS/父侧缓冲/cgroup 完整隔离；Phase 4 overlay 的 640 MiB 是整容器内存限额（不等同进程 RSS，包含父子进程
+  及其它 cgroup 记账内存），可能先 cgroup OOM 杀 worker 而非让 child 受控失败。Windows 及其它非 Linux 平台本实现不应用
+  上限，只有 60 秒硬时限与返回体上限。
 - **数据库异常收敛**：领取任务后若 `load_stored_profile`/阶段推进/暂存/发布或失败标记抛出
   `SQLAlchemyError`，在连接回滚释放后用独立短事务重读 job：已是 `READY`（commit 结果未知）则
   保留成功不误改 `FAILED`；仍持未过期租约且处于活动阶段才用 CAS 落 `FAILED`；数据库持续不可用
@@ -264,7 +268,7 @@ worker 侧再用同一策略逐条有界流式实际读取、累计实际字节�
 纵向合并 continue 不复制上一行文字，`gridBefore` 计入 1-based 网格列；单元格内嵌套表、`w:sdt`、
 `w:altChunk`/`w:customXml`、宏部件与实体声明等收窄外结构一律静态失败并落
 `PIPELINE_DOCX_UNSUPPORTED`，坏 ZIP/CRC/XML 与实际解压/资源超限落 `PIPELINE_DOCX_INVALID`。
-**未配置 rlimit/cgroup 级内存硬限，因此不声称内存隔离**；只有 60 秒子进程硬时限与返回体上限。
+Linux 子进程入口用 `RLIMIT_AS` 设虚拟地址空间上限（默认 1 GiB，设置失败在解析前静态失败，设置成功后超限才 `MemoryError`），只约束该子进程且未在真实 Linux 上测量合法输入峰值余量；Windows 及其它非 Linux 平台本实现不应用上限，只有 60 秒子进程硬时限与返回体上限；不声称 RSS/cgroup 级内存隔离。
 
 **本轮实际运行**：`tests/unit/test_docx_parsing.py` **18 passed**，聚焦受影响的 13 个 unit 文件
 **512 passed / 1 skipped**；`uv run ruff check backend/src migrations tests`、`uv run mypy`（206 files）

@@ -8,11 +8,19 @@
 - 子进程只接收**原始文档字节**（stdin），只返回结构化的解析块（stdout JSON），不读
   ``.env``、不接收数据库 DSN 或 inference 凭据；父进程用白名单环境变量启动子进程，剥离
   ``DATABASE_URL``/``REDIS_URL``/``INFERENCE_TOKEN``/``LLM_API_KEY`` 等键。
+- Linux 上子进程入口在读取输入前对**自身**设 ``RLIMIT_AS``（虚拟地址空间）上限（见
+  ``PARSE_MEMORY_LIMIT_BYTES``）；只在 child 设置，父 API/worker 进程与其它线程不受影响。上限
+  设置失败时子进程在解析前以静态 ``EXIT_MEMORY_LIMIT_UNAVAILABLE`` 失败；设置成功后若分配
+  超过地址空间才以 ``MemoryError`` 失败（子进程边界收敛为静态非零退出），**不是**解析前失败。
+  这是仅 Linux、仅单个子进程的虚拟地址空间上限，**不是** RSS 上限、不是父进程 ``communicate``
+  缓冲上限，也不是 cgroup 级完整隔离；固定 1 GiB 值未在真实 Linux 上测过合法输入峰值余量，
+  不保证覆盖所有合法最大输入。Windows 及其它非 Linux 平台**本实现不应用**该上限，只保留
+  60 秒硬时限与返回体上限。
 - 返回体有界：子进程在单次写出前检查 ``MAX_PARSE_RESULT_BYTES``，超限直接以
   ``EXIT_RESULT_TOO_LARGE`` 失败、不写出任何字节，因此父进程 ``communicate`` 缓冲最多该上限，
-  并在收到后再次校验。父子管道本身没有独立的流式硬限：若子进程逻辑失效绕过检查，父进程仍会先
-  缓冲再校验（已知残余，未为此引入通用超时/限流框架）。子进程 stderr 丢弃，避免未捕获 traceback
-  泄露路径并限制内存。
+  并在收到后再次校验。父子管道本身没有独立的流式硬限：若子进程逻辑失效绕过检查（或 Linux
+  内存上限未生效），父进程仍会先缓冲再校验（已知残余，不为此引入通用超时/限流框架）。子进程
+  stderr 丢弃，避免未捕获 traceback 泄露路径并限制内存。
 - 不依赖 ``multiprocessing``：Celery daemon 进程不能安全创建 multiprocessing 子进程，这里使用
   受控 ``subprocess`` 入口，因此 Windows spawn 与 Linux prefork 行为一致。管道、进程与描述符都在
   ``finally`` 中显式回收。
@@ -61,6 +69,13 @@ SUPPORTED_PARSE_SOURCE_TYPES: Final = frozenset(
 PARSE_TIMEOUT_SECONDS: Final = 60.0
 MAX_PARSE_RESULT_BYTES: Final = 4 * MAX_DOCUMENT_BYTES
 
+# Linux 子进程自身的虚拟地址空间（RLIMIT_AS，soft=hard）上限。这是 1 GiB 固定值，尚未在真实
+# Linux 上测量 pdfplumber/python-docx/bs4 的虚拟内存基线与合法输入峰值余量；它只是一个有限上界，
+# 不保证覆盖所有合法最大输入，也不是 RSS、父侧缓冲或 cgroup 级隔离。Phase 4 overlay 给 worker
+# 容器的 640 MiB 是整容器内存限额（不等同进程 RSS，包含父子进程及其它 cgroup 记账内存），可能先于
+# 本上限由 cgroup OOM 杀掉 worker，而不是让 child 受控失败，二者不可互相替代。非 Linux 本实现不应用。
+PARSE_MEMORY_LIMIT_BYTES: Final = 1024 * 1024 * 1024
+
 EXIT_OK: Final = 0
 EXIT_INPUT_TOO_LARGE: Final = 2
 EXIT_INVALID_INPUT: Final = 3
@@ -73,6 +88,8 @@ EXIT_PDF_INVALID: Final = 7
 # DOCX 具名退出码：收窄子集外的结构与无效/超限包分开，父进程映射为可区分静态失败。
 EXIT_DOCX_UNSUPPORTED: Final = 8
 EXIT_DOCX_INVALID: Final = 9
+# Linux 内存硬上限无法应用时静态失败，绝不在无界内存下继续解析。
+EXIT_MEMORY_LIMIT_UNAVAILABLE: Final = 10
 
 # 子进程环境白名单：只保留解释器与临时目录所需键，剥离任何业务凭据。
 _SAFE_ENV_KEYS: Final = (
@@ -130,6 +147,10 @@ class DocxUnsupportedSubprocessError(DocxSubprocessError):
 
 class DocxInvalidSubprocessError(DocxSubprocessError):
     """子进程判定 DOCX 无效、超限或 CRC/XML 损坏。"""
+
+
+class ParseMemoryLimitSubprocessError(ParseSubprocessError):
+    """子进程无法应用 Linux 内存硬上限；静态失败，不无界解析。"""
 
 
 def sanitized_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -323,6 +344,28 @@ class _ExitWithCode(Exception):
         self.code = code
 
 
+def _apply_child_memory_limit() -> int | None:
+    """在 Linux 子进程内设有限虚拟地址空间（RLIMIT_AS）上限；失败返回静态退出码。
+
+    必须在子进程入口调用而**不能**在父进程调用，因为 ``RLIMIT_AS`` 会影响整个进程及其
+    线程；在子进程里设置只约束本次解析。非 Linux 平台本实现不应用该上限，返回 ``None``、
+    保留既有 60 秒硬时限与返回体上限。
+    """
+
+    if not sys.platform.startswith("linux"):
+        return None
+    import resource
+
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (PARSE_MEMORY_LIMIT_BYTES, PARSE_MEMORY_LIMIT_BYTES),
+        )
+    except (OSError, ValueError):
+        return EXIT_MEMORY_LIMIT_UNAVAILABLE
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """子进程入口：读取原始字节，按 argv 指定的来源解析，输出有界 JSON。
 
@@ -334,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
     source_type = arguments[0] if arguments else SOURCE_TYPE_MARKDOWN
     if source_type not in SUPPORTED_PARSE_SOURCE_TYPES:
         return EXIT_INVALID_INPUT
+    limit_failure = _apply_child_memory_limit()
+    if limit_failure is not None:
+        return limit_failure
     try:
         data = _read_bounded_stdin()
     except OSError:
@@ -528,6 +574,8 @@ def _map_nonzero_exit(returncode: int) -> ParseSubprocessError:
         return DocxUnsupportedSubprocessError("DOCX 属于不收窄支持的结构")
     if returncode == EXIT_DOCX_INVALID:
         return DocxInvalidSubprocessError("DOCX 无效或损坏")
+    if returncode == EXIT_MEMORY_LIMIT_UNAVAILABLE:
+        return ParseMemoryLimitSubprocessError("解析子进程无法应用内存硬上限")
     return ParseSubprocessFailed("解析子进程以非零状态退出")
 
 

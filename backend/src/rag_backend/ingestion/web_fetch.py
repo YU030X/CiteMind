@@ -12,8 +12,11 @@
   ``Accept-Encoding: identity``、只接受 200、Content-Type 必须是 ``text/html`` 或
   ``application/xhtml+xml``、拒绝任意 ``Content-Encoding``、``Content-Length`` 早拒并
   对 ``iter_raw`` 累计硬上限 2 MiB、显式 connect/read/write/pool 超时。
-- 用 hostname 正常连接，不做 IP pin 或 ``getpeername`` 校验；DNS 解析校验与实际连接之间
-  仍存在竞态窗口，完整 SSRF/网络策略属 Phase 4，本模块**不声称**抗 DNS rebinding。
+- 每跳把刚校验出的全部公网 IP 保序去重后固定到实际 TCP 连接（``web_fetch_transport`` 的
+  httpcore ``network_backend``）：依次尝试这些已校验 IP，任一连接失败只在列表内回退，绝不回落
+  hostname DNS 或未校验 IP，且共享该跳的 connect 超时预算。请求 URL 仍是原 hostname，``Host``
+  头、TLS SNI 与证书校验都保留原 hostname，连接阶段不再重新解析 hostname DNS，因此关闭了
+  “校验后用 hostname 连接”的 DNS rebinding 竞态窗口。完整 SSRF/网络策略仍属 Phase 4。
 - 所有失败都收敛为静态脱敏错误码，不携带 URL、主机、地址或底层异常文本。
 """
 
@@ -21,13 +24,14 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from rag_backend.ingestion.web_fetch_transport import build_pinned_client
 from rag_backend.web_hosts import normalize_web_host, parse_allowed_web_hosts
 
 # 静态错误码；HTTP 路由按码映射为具名错误体，消息不含 URL 或地址。
@@ -137,11 +141,11 @@ def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -
     return address.is_global
 
 
-def resolve_public_addresses(host: str, port: int) -> None:
+def resolve_public_addresses(host: str, port: int) -> tuple[str, ...]:
     """用标准库解析器解析 A/AAAA，任一地址非公网即抛 NOT_ALLOWED。
 
-    解析失败或没有记录抛 FETCH_FAILED。这里只校验解析结果，实际连接仍用 hostname，因此
-    校验与连接之间存在 DNS 竞态窗口（见模块 docstring）。
+    解析失败或没有记录抛 FETCH_FAILED；成功时返回全部已校验公网地址字面量（保序去重），调用
+    方用它们固定实际 TCP 连接，使连接阶段不再重新解析 hostname。
     """
 
     try:
@@ -150,6 +154,7 @@ def resolve_public_addresses(host: str, port: int) -> None:
         raise WebFetchError(CODE_FETCH_FAILED) from error
     if not infos:
         raise WebFetchError(CODE_FETCH_FAILED)
+    addresses: list[str] = []
     for info in infos:
         raw_address = info[4][0]
         try:
@@ -158,10 +163,16 @@ def resolve_public_addresses(host: str, port: int) -> None:
             raise WebFetchError(CODE_FETCH_FAILED) from error
         if not _is_public_address(address):
             raise WebFetchError(CODE_NOT_ALLOWED)
+        literal = str(address)
+        if literal not in addresses:
+            addresses.append(literal)
+    if not addresses:
+        raise WebFetchError(CODE_FETCH_FAILED)
+    return tuple(addresses)
 
 
 Fetcher = Callable[[str], FetchedWebDocument]
-Resolver = Callable[[str, int], None]
+Resolver = Callable[[str, int], Sequence[str]]
 
 
 def _read_bounded_body(response: httpx.Response) -> bytes:
@@ -209,59 +220,56 @@ def fetch_web_html(
 ) -> FetchedWebDocument:
     """按冻结策略抓取单个静态 HTML 页面，返回原始字节与最终 URL。
 
-    允许主机为空集合时任何请求都 NOT_ALLOWED（fail closed）。``client`` 与 ``resolver``
-    仅用于测试注入；生产路径自行构造不跟随重定向、``trust_env=False`` 的 httpx 客户端。
+    允许主机为空集合时任何请求都 NOT_ALLOWED（fail closed）。每跳用 ``resolver`` 校验并取得
+    全部公网 IP，再把该列表固定到实际 TCP 连接（保序回退）；``client`` 与 ``resolver`` 仅用于
+    测试注入，注入 ``client`` 时不再构造固定连接。
     """
 
-    owns_client = client is None
-    effective_client = client or httpx.Client(
-        timeout=WEB_FETCH_TIMEOUT,
-        trust_env=False,
-        follow_redirects=False,
-        cookies=None,
-        headers={"Accept-Encoding": "identity"},
-    )
-    try:
-        current = normalize_web_url(url)
-        redirects = 0
-        while True:
-            if current.host not in allowed_hosts:
-                raise WebFetchError(CODE_NOT_ALLOWED)
-            resolver(current.host, current.port)
-            try:
-                with effective_client.stream(
-                    "GET",
-                    current.url,
-                    headers={"Accept-Encoding": "identity"},
-                    timeout=WEB_FETCH_TIMEOUT,
-                ) as response:
-                    if response.status_code == 200:
-                        _validate_content(response)
-                        return FetchedWebDocument(
-                            content=_read_bounded_body(response),
-                            final_url=current.url,
-                        )
-                    if 300 <= response.status_code < 400:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise WebFetchError(CODE_FETCH_FAILED)
-                        if redirects >= MAX_WEB_REDIRECTS:
-                            raise WebFetchError(CODE_TOO_MANY_REDIRECTS)
-                        target = normalize_web_url(urljoin(current.url, location))
-                        if current.scheme == "https" and target.scheme == "http":
-                            # 拒绝安全降级。
-                            raise WebFetchError(CODE_NOT_ALLOWED)
-                        current = target
-                        redirects += 1
-                        continue
-                    raise WebFetchError(CODE_FETCH_FAILED)
-            except httpx.TimeoutException as error:
-                raise WebFetchError(CODE_FETCH_TIMEOUT) from error
-            except httpx.HTTPError as error:
-                raise WebFetchError(CODE_FETCH_FAILED) from error
-    finally:
-        if owns_client:
-            effective_client.close()
+    current = normalize_web_url(url)
+    redirects = 0
+    while True:
+        if current.host not in allowed_hosts:
+            raise WebFetchError(CODE_NOT_ALLOWED)
+        pinned_ips = resolver(current.host, current.port)
+        owns_client = client is None
+        if client is None:
+            effective_client = build_pinned_client(current.host, pinned_ips)
+        else:
+            effective_client = client
+        try:
+            with effective_client.stream(
+                "GET",
+                current.url,
+                headers={"Accept-Encoding": "identity"},
+                timeout=WEB_FETCH_TIMEOUT,
+            ) as response:
+                if response.status_code == 200:
+                    _validate_content(response)
+                    return FetchedWebDocument(
+                        content=_read_bounded_body(response),
+                        final_url=current.url,
+                    )
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise WebFetchError(CODE_FETCH_FAILED)
+                    if redirects >= MAX_WEB_REDIRECTS:
+                        raise WebFetchError(CODE_TOO_MANY_REDIRECTS)
+                    target = normalize_web_url(urljoin(current.url, location))
+                    if current.scheme == "https" and target.scheme == "http":
+                        # 拒绝安全降级。
+                        raise WebFetchError(CODE_NOT_ALLOWED)
+                    current = target
+                    redirects += 1
+                    continue
+                raise WebFetchError(CODE_FETCH_FAILED)
+        except httpx.TimeoutException as error:
+            raise WebFetchError(CODE_FETCH_TIMEOUT) from error
+        except httpx.HTTPError as error:
+            raise WebFetchError(CODE_FETCH_FAILED) from error
+        finally:
+            if owns_client:
+                effective_client.close()
 
 
 __all__ = [

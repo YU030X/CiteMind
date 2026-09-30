@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
+import types
 from typing import Any
 
 import pytest
@@ -301,3 +303,81 @@ def test_docx_oversized_input_is_rejected_before_spawn(
 
     with pytest.raises(ps.ParseSubprocessFailed):
         ps.parse_docx_in_subprocess(b"x" * (MAX_DOCUMENT_BYTES + 1))
+
+
+def test_child_memory_limit_is_noop_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert ps._apply_child_memory_limit() is None
+
+
+def test_child_memory_limit_sets_finite_hard_limit_on_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, tuple[int, int]]] = []
+    fake_resource = types.SimpleNamespace(
+        RLIMIT_AS=9,
+        setrlimit=lambda which, limits: calls.append((which, limits)),
+    )
+    monkeypatch.setitem(sys.modules, "resource", fake_resource)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert ps._apply_child_memory_limit() is None
+    assert calls == [(9, (ps.PARSE_MEMORY_LIMIT_BYTES, ps.PARSE_MEMORY_LIMIT_BYTES))]
+
+
+def test_child_memory_limit_setting_failure_is_static(monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(_which: int, _limits: tuple[int, int]) -> None:
+        raise OSError("setrlimit denied")
+
+    fake_resource = types.SimpleNamespace(RLIMIT_AS=9, setrlimit=denied)
+    monkeypatch.setitem(sys.modules, "resource", fake_resource)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert ps._apply_child_memory_limit() == ps.EXIT_MEMORY_LIMIT_UNAVAILABLE
+
+
+def test_main_fails_statically_when_memory_limit_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ps, "_apply_child_memory_limit", lambda: ps.EXIT_MEMORY_LIMIT_UNAVAILABLE
+    )
+
+    assert ps.main([ps.SOURCE_TYPE_MARKDOWN]) == ps.EXIT_MEMORY_LIMIT_UNAVAILABLE
+
+
+def test_memory_limit_exit_code_maps_to_static_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(returncode=ps.EXIT_MEMORY_LIMIT_UNAVAILABLE)
+    _install_fake_popen(monkeypatch, process)
+
+    with pytest.raises(ps.ParseMemoryLimitSubprocessError):
+        ps.parse_markdown_in_subprocess(b"# T\n\nbody\n")
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="RLIMIT_AS 硬内存上限仅 Linux 可用"
+)
+def test_linux_child_enforces_finite_address_space_limit() -> None:
+    """真实 Linux 子进程应用上限后无法再分配超过上限的地址空间。"""
+
+    code = (
+        "import resource\n"
+        "from rag_backend.ingestion import parse_subprocess as ps\n"
+        "assert ps._apply_child_memory_limit() is None\n"
+        "soft, hard = resource.getrlimit(resource.RLIMIT_AS)\n"
+        "assert soft == ps.PARSE_MEMORY_LIMIT_BYTES == hard\n"
+        "try:\n"
+        "    bytearray(ps.PARSE_MEMORY_LIMIT_BYTES * 2)\n"
+        "except MemoryError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(3)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, timeout=60
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")

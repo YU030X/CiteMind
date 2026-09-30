@@ -9,6 +9,8 @@ dependencies = [
   "argon2-cffi>=23,<26",
   "celery[redis]>=5.6,<6",
   "fastapi>=0.116,<1",
+  # 抓取固定 IP 直接使用 httpcore 的公开 network_backend/ConnectionPool 接口。
+  "httpcore>=1.0,<2",
   "httpx>=0.28,<1",
   # 中文关键词检索固定使用 jieba 0.42.1：检索切分契约的一部分，不与 PG 分词解耦。
   "jieba==0.42.1",
