@@ -614,6 +614,68 @@ async def test_retrieval_and_evidence_respect_acl(
     assert restored[0].is_authorized() is True
 
 
+@pytest.mark.anyio
+async def test_adjacent_evidence_respects_document_acl(
+    acl_schema: Engine, role_test_databases: RoleTestDatabases
+) -> None:
+    """相邻证据与直接证据一样受文档 ACL 收紧：RESTRICTED 名单外成员拿不到邻居。
+
+    真实 SQL 负例：定义后由具备守卫 DSN 的环境运行；未运行不声称已实测。
+    """
+
+    allowed_id = insert_user(acl_schema, organization_id=ORGANIZATION_ID)
+    denied_id = insert_user(acl_schema, organization_id=ORGANIZATION_ID)
+    profile_id = insert_profile(acl_schema, revision="rev-acl-adjacent")
+    kb_id = insert_kb(
+        acl_schema, organization_id=ORGANIZATION_ID, active_profile_id=profile_id
+    )
+    insert_member(acl_schema, kb_id=kb_id, user_id=allowed_id, role="OWNER")
+    insert_member(acl_schema, kb_id=kb_id, user_id=denied_id, role="READER")
+    document_id = seed_searchable(acl_schema, kb_id=kb_id, profile_id=profile_id)
+    seed_chunk = first_chunk_id(acl_schema, document_id)
+    with acl_schema.connect() as connection:
+        row = connection.execute(
+            text("SELECT generation_id, version_id, kb_id FROM chunk WHERE id = :id"),
+            {"id": seed_chunk},
+        ).mappings().one()
+    neighbor = insert_chunk(
+        acl_schema,
+        generation_id=row["generation_id"],
+        document_id=document_id,
+        version_id=row["version_id"],
+        organization_id=ORGANIZATION_ID,
+        kb_id=row["kb_id"],
+        chunk_index=1,
+        fts_terms="hello neighbor",
+    )
+    insert_embedding(
+        acl_schema, chunk_id=neighbor, profile_id=profile_id, embedding=_vector(1.0, 0.0)
+    )
+    await replace(
+        role_test_databases.api_url,
+        document_id=document_id,
+        actor_user_id=allowed_id,
+        mode=DocumentAclMode.RESTRICTED,
+        member_ids=[allowed_id],
+    )
+
+    async with api_session(role_test_databases.api_url) as session:
+        repository = SqlRetrievalRepository(session)
+        allowed = await repository.load_adjacent_evidence_chunks(
+            user_id=allowed_id, organization_id=ORGANIZATION_ID, chunk_ids=[seed_chunk]
+        )
+        await repository.release()
+    assert [item.chunk.chunk_id for item in allowed] == [neighbor]
+
+    async with api_session(role_test_databases.api_url) as session:
+        repository = SqlRetrievalRepository(session)
+        denied = await repository.load_adjacent_evidence_chunks(
+            user_id=denied_id, organization_id=ORGANIZATION_ID, chunk_ids=[seed_chunk]
+        )
+        await repository.release()
+    assert denied == []
+
+
 # --- 下载目标与 blob ------------------------------------------------------------
 
 

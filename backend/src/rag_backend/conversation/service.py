@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -98,11 +99,19 @@ from rag_backend.generation.query_rewrite import (
     parse_standalone_question,
     plan_rewrite_context,
 )
-from rag_backend.retrieval.repository import EvidenceChunkRow, EvidenceRepository
+from rag_backend.retrieval.repository import (
+    AdjacentEvidenceChunk,
+    EvidenceChunkRow,
+    EvidenceRepository,
+)
 from rag_backend.retrieval.service import RetrievalResult
 
 # 引用短引文的上限；quote_hash 始终是完整 chunk 文本的 SHA-256，不受该截断影响。
 QUOTE_MAX_CHARS = 500
+
+# 相邻上下文只给最多 6 个已入选 seed 各取前后 1 块；它只是查询与排序上限，
+# 谁最终进入提示仍由同一 plan 的 max_evidence 与每文档上限决定。
+MAX_ADJACENT_SEEDS = 6
 
 # ``query_run.degraded_stages`` 的静态阶段标识。只记录真实异常造成的降级：
 # 低信任正文被本地渲染器拒绝而剔除，以及来源在交付前变化触发的重检索；
@@ -482,6 +491,33 @@ async def answer_question(
             organization_id=organization_id,
         )
 
+        # 先用既有 plan 按原融合序选择直接证据：只有确实有入选直接证据、且未占满
+        # ``max_evidence`` 时，才为入选 chunk 补前后各 1 块。直接候选永远排在邻居之前，
+        # 因此这次对直接证据的取舍与加入邻居后的最终取舍一致，相邻上下文不会抢走直接命中
+        # 的名次或同文档份额。
+        direct_plan = _plan_context(
+            question=question,
+            evidence_rows=evidence_rows,
+            history=history,
+            estimator=estimator,
+            budget=budget,
+            thinking=thinking,
+        )
+        if direct_plan.evidence_ids and len(direct_plan.evidence_ids) < budget.max_evidence:
+            evidence_rows, source_changed = await _augment_with_adjacent(
+                evidence_repository,
+                user_id=user_id,
+                organization_id=organization_id,
+                direct_rows=evidence_rows,
+                selected_ids=direct_plan.evidence_ids,
+                max_per_document=budget.max_evidence_per_document,
+            )
+            if source_changed:
+                if retried:
+                    raise ConversationSourcesChanged("证据来源持续变化")
+                retried = True
+                continue
+
         plan = _plan_context(
             question=question,
             evidence_rows=evidence_rows,
@@ -815,6 +851,122 @@ async def _load_evidence(
     return ordered, len(ordered) != len(unique)
 
 
+def _ordered_adjacent_chunks(
+    direct_rows: Sequence[EvidenceChunkRow],
+    seeds: Sequence[EvidenceChunkRow],
+    adjacent: Sequence[AdjacentEvidenceChunk],
+) -> list[EvidenceChunkRow]:
+    """按 seed 原顺序、先前块后后块排列邻居，并与直接证据及彼此按 ``chunkId`` 保序去重。"""
+
+    seen = {row.chunk_id for row in direct_rows}
+    adjacent_by_seed: dict[uuid.UUID, list[AdjacentEvidenceChunk]] = {}
+    for item in adjacent:
+        adjacent_by_seed.setdefault(item.seed_chunk_id, []).append(item)
+
+    ordered: list[EvidenceChunkRow] = []
+    for seed in seeds:
+        items = adjacent_by_seed.get(seed.chunk_id, ())
+        before = sorted(
+            (item for item in items if item.chunk_index == item.seed_chunk_index - 1),
+            key=lambda item: item.chunk_index,
+        )
+        after = sorted(
+            (item for item in items if item.chunk_index == item.seed_chunk_index + 1),
+            key=lambda item: item.chunk_index,
+        )
+        for item in (*before, *after):
+            chunk_id = item.chunk.chunk_id
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            ordered.append(item.chunk)
+    return ordered
+
+
+async def _reload_evidence(
+    evidence_repository: EvidenceRepository,
+    *,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    expected: Sequence[EvidenceChunkRow],
+) -> tuple[list[EvidenceChunkRow], bool]:
+    """重读整批预期候选（直接候选 + 相邻候选，含预算/上限未入选者）并交还连接。
+
+    返回 ``(fresh 顺序行, 是否变化)``。变化定义为：任一预期候选不再受权/不存在，或其
+    ``version_id`` 与预期不一致；未入选候选的变化同样算变化，因此也可能触发一次重检索
+    （持续变化由调用方返回 409）。无论成功还是失败都 ``release``，调用方随后可在不持连接的
+    状态下调用模型。
+    """
+
+    unique = _unique([row.chunk_id for row in expected])
+    if not unique:
+        await evidence_repository.release()
+        return [], False
+    try:
+        rows = await evidence_repository.load_evidence_chunks(
+            user_id=user_id, organization_id=organization_id, chunk_ids=unique
+        )
+    finally:
+        await evidence_repository.release()
+    by_id = {row.chunk_id: row for row in rows}
+    fresh = [by_id[chunk_id] for chunk_id in unique if chunk_id in by_id]
+    changed = len(by_id) != len(unique) or any(
+        by_id[row.chunk_id].version_id != row.version_id for row in expected
+    )
+    return fresh, changed
+
+
+async def _augment_with_adjacent(
+    evidence_repository: EvidenceRepository,
+    *,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    direct_rows: Sequence[EvidenceChunkRow],
+    selected_ids: Sequence[str],
+    max_per_document: int,
+) -> tuple[list[EvidenceChunkRow], bool]:
+    """为已入选直接证据补前后各 1 块，并在生成前重读整批候选。
+
+    先做一次批量邻居查询，再把整批直接候选与相邻候选（含预算/上限未入选者）重读一遍：两次
+    只读查询无论成功/失败都 ``release``，调用方随后在不持连接的状态下调用模型。返回
+    ``(整批候选行, 是否发生来源变化)``：重读时任一预期候选（含未入选者）被撤权/删除或换版本即
+    ``True``，由调用方按既有语义最多重检索一次，持续变化返回 409。邻居查询失败直接上抛，
+    绝不降级成“没有邻居”继续成功。
+    """
+
+    evidence_by_id = {
+        f"E{index}": row for index, row in enumerate(direct_rows, start=1)
+    }
+    seeds = [evidence_by_id[evidence_id] for evidence_id in selected_ids]
+    # 同一文档已达每文档上限时，其邻居必然被 plan 排除，不再为它做无谓查询。
+    per_document: Counter[uuid.UUID] = Counter(row.document_id for row in seeds)
+    seed_ids = _unique(
+        [
+            row.chunk_id
+            for row in seeds
+            if per_document[row.document_id] < max_per_document
+        ]
+    )[:MAX_ADJACENT_SEEDS]
+    if not seed_ids:
+        return list(direct_rows), False
+
+    try:
+        adjacent = await evidence_repository.load_adjacent_evidence_chunks(
+            user_id=user_id, organization_id=organization_id, chunk_ids=seed_ids
+        )
+    finally:
+        await evidence_repository.release()
+
+    neighbors = _ordered_adjacent_chunks(direct_rows, seeds, adjacent)
+    combined = [*direct_rows, *neighbors]
+    return await _reload_evidence(
+        evidence_repository,
+        user_id=user_id,
+        organization_id=organization_id,
+        expected=combined,
+    )
+
+
 async def _evidence_changed(
     evidence_repository: EvidenceRepository,
     *,
@@ -822,19 +974,17 @@ async def _evidence_changed(
     organization_id: uuid.UUID,
     expected: Sequence[EvidenceChunkRow],
 ) -> bool:
-    """交付前复核：来源是否仍受权且版本未变化。"""
+    """交付前复核整批候选（含未入选者）是否仍受权且版本未变化。"""
 
     if not expected:
         return False
-    chunk_ids = _unique([row.chunk_id for row in expected])
-    rows = await evidence_repository.load_evidence_chunks(
-        user_id=user_id, organization_id=organization_id, chunk_ids=chunk_ids
+    _fresh, changed = await _reload_evidence(
+        evidence_repository,
+        user_id=user_id,
+        organization_id=organization_id,
+        expected=expected,
     )
-    await evidence_repository.release()
-    by_id = {row.chunk_id: row for row in rows}
-    if len(by_id) != len(chunk_ids):
-        return True
-    return any(by_id[row.chunk_id].version_id != row.version_id for row in expected)
+    return changed
 
 
 def _plan_context(

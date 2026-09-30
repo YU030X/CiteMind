@@ -1229,3 +1229,130 @@ async def test_mixed_markdown_and_pdf_same_kb_are_both_recalled(
     assert stored_locator["source_type"] == "pdf"
     assert stored_locator["pages"] == [1]
     assert "start_line" not in stored_locator
+
+
+# --- 相邻证据 ----------------------------------------------------------------
+
+
+def _add_chunk(
+    engine: Engine,
+    *,
+    seeded: Seeded,
+    organization_id: uuid.UUID,
+    chunk_index: int,
+    text_value: str,
+) -> uuid.UUID:
+    chunk_id = insert_chunk(
+        engine,
+        generation_id=seeded.generation_id,
+        document_id=seeded.document_id,
+        version_id=seeded.version_id,
+        organization_id=organization_id,
+        kb_id=seeded.kb_id,
+        chunk_index=chunk_index,
+        text_value=text_value,
+        fts_terms=text_value,
+    )
+    insert_embedding(engine, chunk_id=chunk_id, profile_id=seeded.profile_id)
+    return chunk_id
+
+
+@pytest.mark.anyio
+async def test_adjacent_evidence_reauthorizes_full_chain(
+    retrieval_schema: Engine, role_test_databases: RoleTestDatabases
+) -> None:
+    """相邻证据与直接证据一样经完整授权链：同 generation 命中，非成员/跨组织/旧版本拒绝。
+
+    真实 SQL 负例：本用例定义后由具备守卫 DSN 的环境运行；未运行不声称已实测 SQL 行为。
+    """
+
+    organization_id = uuid.uuid4()
+    user_id = insert_user(retrieval_schema, organization_id=organization_id)
+    profile_id = insert_profile(retrieval_schema, revision="rev-adjacent")
+    kb_id = insert_kb(
+        retrieval_schema, organization_id=organization_id, active_profile_id=profile_id
+    )
+    insert_member(retrieval_schema, kb_id=kb_id, user_id=user_id)
+    seeded = seed_ready_chain(
+        retrieval_schema,
+        organization_id=organization_id,
+        kb_id=kb_id,
+        profile_id=profile_id,
+    )
+    middle = _add_chunk(
+        retrieval_schema,
+        seeded=seeded,
+        organization_id=organization_id,
+        chunk_index=1,
+        text_value="middle",
+    )
+    last = _add_chunk(
+        retrieval_schema,
+        seeded=seeded,
+        organization_id=organization_id,
+        chunk_index=2,
+        text_value="last",
+    )
+    outsider_id = insert_user(retrieval_schema, organization_id=uuid.uuid4())
+
+    async with api_session(role_test_databases.api_url) as session:
+        repository = SqlRetrievalRepository(session)
+        rows = await repository.load_adjacent_evidence_chunks(
+            user_id=user_id, organization_id=organization_id, chunk_ids=[middle]
+        )
+        await repository.release()
+    by_chunk = {row.chunk.chunk_id: row for row in rows}
+    assert set(by_chunk) == {seeded.chunk_id, last}
+    assert by_chunk[seeded.chunk_id].chunk_index == 0
+    assert by_chunk[last].chunk_index == 2
+    assert all(row.seed_chunk_id == middle and row.seed_chunk_index == 1 for row in rows)
+
+    # 非本 KB 成员即使同组织也读不到邻居。
+    async with api_session(role_test_databases.api_url) as session:
+        repository = SqlRetrievalRepository(session)
+        denied = await repository.load_adjacent_evidence_chunks(
+            user_id=outsider_id, organization_id=organization_id, chunk_ids=[middle]
+        )
+        await repository.release()
+    assert denied == []
+
+    # 邻居所在 generation 属于非 active version 时一律拒绝。
+    document_id = insert_document(retrieval_schema, kb_id=kb_id)
+    old_version = insert_version(retrieval_schema, document_id=document_id, version_no=1)
+    old_generation = insert_generation(
+        retrieval_schema, version_id=old_version, profile_id=profile_id
+    )
+    old_seed = insert_chunk(
+        retrieval_schema,
+        generation_id=old_generation,
+        document_id=document_id,
+        version_id=old_version,
+        organization_id=organization_id,
+        kb_id=kb_id,
+        chunk_index=0,
+        text_value="old-0",
+    )
+    old_neighbor = insert_chunk(
+        retrieval_schema,
+        generation_id=old_generation,
+        document_id=document_id,
+        version_id=old_version,
+        organization_id=organization_id,
+        kb_id=kb_id,
+        chunk_index=1,
+        text_value="old-1",
+    )
+    insert_embedding(retrieval_schema, chunk_id=old_seed, profile_id=profile_id)
+    insert_embedding(retrieval_schema, chunk_id=old_neighbor, profile_id=profile_id)
+    active_version = insert_version(
+        retrieval_schema, document_id=document_id, version_no=2, status="READY"
+    )
+    activate_version(retrieval_schema, document_id=document_id, version_id=active_version)
+
+    async with api_session(role_test_databases.api_url) as session:
+        repository = SqlRetrievalRepository(session)
+        stale = await repository.load_adjacent_evidence_chunks(
+            user_id=user_id, organization_id=organization_id, chunk_ids=[old_seed]
+        )
+        await repository.release()
+    assert stale == []

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -55,7 +56,9 @@ from rag_backend.generation.deepseek_client import (
     GenerationOutcome,
 )
 from rag_backend.generation.query_rewrite import REWRITE_STAGE, REWRITE_SYSTEM_PROMPT
+from rag_backend.retrieval.fusion import FusedCandidate
 from rag_backend.retrieval.repository import SqlRetrievalRepository
+from rag_backend.retrieval.service import RetrievalResult
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from test_core_migration import alembic_config, alembic_revision, business_tables
@@ -63,6 +66,8 @@ from test_retrieval_flow import (
     FakeAnalyzer,
     FakeEmbedder,
     _vector,
+    insert_chunk,
+    insert_embedding,
     insert_kb,
     insert_member,
     insert_profile,
@@ -475,6 +480,107 @@ async def test_full_http_flow_maps_citations_and_records_usage(
     assert row[2] == "hello"
     assert row[3] == 1
     assert row[4] == 11
+
+
+@pytest.mark.anyio
+async def test_sparse_hit_answer_cites_adjacent_chunk(
+    conversation_schema: Engine,
+    role_test_databases: RoleTestDatabases,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """受控稀疏检索 + 真实 SQL 邻接/授权：只有原 seed 一个直接候选时，回答可引用相邻块。
+
+    本用例把检索函数局部替换为只返回原 seed 一个 candidate，以确定性地复现“稀疏命中”，
+    避免同分、同词命中带来的随机排名；证据正文与相邻块仍走真实
+    ``SqlRetrievalRepository`` 的授权 SQL。它只验证受控稀疏检索下的相邻扩展与独立引用，
+    不声称完整真实 hybrid 端到端。定义后由具备守卫 DSN 的环境运行；未运行不声称已实测。
+    """
+
+    organization_id = uuid.uuid4()
+    kb_id, user_id, chunk_id = _seed_searchable(
+        conversation_schema, organization_id=organization_id
+    )
+    profile_id = _active_profile_id(conversation_schema, kb_id)
+    with conversation_schema.connect() as connection:
+        row = connection.execute(
+            text("SELECT generation_id, version_id, document_id FROM chunk WHERE id = :id"),
+            {"id": chunk_id},
+        ).mappings().one()
+    neighbor_locator = json.dumps({"locator_version": 1, "start_line": 9, "end_line": 10})
+    neighbor_text = "相邻补充原文。"
+    neighbor = insert_chunk(
+        conversation_schema,
+        generation_id=row["generation_id"],
+        document_id=row["document_id"],
+        version_id=row["version_id"],
+        organization_id=organization_id,
+        kb_id=kb_id,
+        chunk_index=1,
+        text_value=neighbor_text,
+        fts_terms="hello neighbor",
+        source_locator=neighbor_locator,
+    )
+    insert_embedding(
+        conversation_schema, chunk_id=neighbor, profile_id=profile_id, embedding=_vector(1.0, 0.0)
+    )
+
+    searched: list[tuple[uuid.UUID, ...]] = []
+
+    async def controlled_search(search_repository: Any, **kwargs: Any) -> RetrievalResult:
+        # 只返回原 seed 一个直接候选项；邻居只能经相邻扩展进入提示。
+        searched.append((chunk_id,))
+        return RetrievalResult(
+            kb_ids=tuple(kwargs["kb_ids"]),
+            candidates=(
+                FusedCandidate(
+                    chunk_id=chunk_id,
+                    document_id=row["document_id"],
+                    kb_id=kb_id,
+                    version_id=row["version_id"],
+                    vector_rank=1,
+                    vector_score=1.0,
+                    keyword_rank=1,
+                    keyword_score=1.0,
+                    fusion_rank=1,
+                    fusion_score=0.0328,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "rag_backend.api.conversations.search_authorized_chunks", controlled_search
+    )
+    generator = FakeGenerator([_outcome(content=_answer_json(("E2",)))])
+
+    async with qa_client(
+        make_settings(role_test_databases.api_url),
+        context=_context(user_id, organization_id),
+        generator=generator,
+    ) as client:
+        conversation_id = await _create_conversation(client, kb_id)
+        response = await _ask(client, conversation_id, "hello")
+
+    assert response.status_code == 200, response.text
+    assert searched == [(chunk_id,)]
+    body = response.json()
+    assert body["insufficientEvidence"] is False
+    assert body["answer"] == "制度规定。[2]"
+    assert len(body["citations"]) == 1
+    citation = body["citations"][0]
+    assert citation["displayLabel"] == "2"
+    assert citation["quote"] == neighbor_text
+    # 相邻 E2 引用真实邻居的独立 locator 与 quote_hash，而不是 seed 或随机候选。
+    assert citation["locator"] == json.loads(neighbor_locator)
+    assert citation["locator"] != json.loads(LOCATOR)
+    assert generator.calls == 1
+    with conversation_schema.connect() as connection:
+        evidence_count = connection.scalar(text("SELECT evidence_count FROM query_run"))
+        stored_quote, stored_hash = connection.execute(
+            text("SELECT quote, quote_hash FROM citation")
+        ).one()
+    assert evidence_count == 2
+    assert stored_quote == neighbor_text
+    assert stored_hash == hashlib.sha256(neighbor_text.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.anyio

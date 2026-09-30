@@ -127,6 +127,30 @@ _KEYWORD_SQL = text(
     """
 ).bindparams(bindparam("kb_ids", expanding=True))
 
+# 证据原文本与相邻证据共用的授权 JOIN 与谓词：``chunk -> index_generation -> document_version
+# -> document -> knowledge_base`` 权威链，加上未撤销成员、active profile、READY generation、
+# 匹配 profile 的 embedding 与文档 ACL。固定为同一片段，避免两处授权条件随时间漂移；这里不做
+# 通用查询 builder，只复用这一段冻结 SQL。
+_EVIDENCE_JOINS = """
+    JOIN chunk_embedding AS ce ON ce.chunk_id = c.id
+    JOIN index_generation AS g ON g.id = c.generation_id
+    JOIN document_version AS dv ON dv.id = g.version_id
+    JOIN document AS d ON d.id = dv.document_id
+    JOIN knowledge_base AS kb ON kb.id = d.kb_id
+    JOIN kb_member AS m ON m.kb_id = kb.id
+"""
+
+_AUTHORIZED_EVIDENCE_PREDICATES = f"""m.user_id = :user_id
+      AND m.revoked_at IS NULL
+      AND kb.organization_id = :organization_id
+      AND kb.active_index_profile_id = g.profile_id
+      AND g.status = 'READY'
+      AND ce.profile_id = g.profile_id
+      AND d.deleted_at IS NULL
+      AND d.active_version_id = dv.id
+      AND dv.status = 'READY'
+      AND {_ACL_ALLOWED_SQL}"""
+
 # 证据正文读取：与两条候选路复用同一授权 JOIN，按 chunk id 取回原文、版本号与 locator。
 _EVIDENCE_SQL = text(
     f"""
@@ -140,23 +164,35 @@ _EVIDENCE_SQL = text(
         c.text AS text,
         c.source_locator AS source_locator
     FROM chunk AS c
-    JOIN chunk_embedding AS ce ON ce.chunk_id = c.id
-    JOIN index_generation AS g ON g.id = c.generation_id
-    JOIN document_version AS dv ON dv.id = g.version_id
-    JOIN document AS d ON d.id = dv.document_id
-    JOIN knowledge_base AS kb ON kb.id = d.kb_id
-    JOIN kb_member AS m ON m.kb_id = kb.id
-    WHERE m.user_id = :user_id
-      AND m.revoked_at IS NULL
-      AND kb.organization_id = :organization_id
-      AND kb.active_index_profile_id = g.profile_id
-      AND g.status = 'READY'
-      AND ce.profile_id = g.profile_id
-      AND d.deleted_at IS NULL
-      AND d.active_version_id = dv.id
-      AND dv.status = 'READY'
-      AND {_ACL_ALLOWED_SQL}
+    {_EVIDENCE_JOINS}
+    WHERE {_AUTHORIZED_EVIDENCE_PREDICATES}
       AND c.id IN :chunk_ids
+    """
+).bindparams(bindparam("chunk_ids", expanding=True))
+
+# 相邻证据查询：seed 与其同 generation 的 ``chunk_index ± 1`` 配对，并对候选邻居复用同一授权
+# 谓词与 ACL。SQL 只带回 seed 关系与相对位置，顺序由服务端按 seed 原顺序、先前块后后块重排。
+_ADJACENT_SQL = text(
+    f"""
+    SELECT
+        seed.id AS seed_chunk_id,
+        seed.chunk_index AS seed_chunk_index,
+        c.chunk_index AS chunk_index,
+        c.id AS chunk_id,
+        d.id AS document_id,
+        d.kb_id AS kb_id,
+        dv.id AS version_id,
+        dv.version_no AS version_no,
+        d.title AS document_title,
+        c.text AS text,
+        c.source_locator AS source_locator
+    FROM chunk AS seed
+    JOIN chunk AS c
+      ON c.generation_id = seed.generation_id
+     AND c.chunk_index IN (seed.chunk_index - 1, seed.chunk_index + 1)
+    {_EVIDENCE_JOINS}
+    WHERE seed.id IN :chunk_ids
+      AND {_AUTHORIZED_EVIDENCE_PREDICATES}
     """
 ).bindparams(bindparam("chunk_ids", expanding=True))
 
@@ -211,6 +247,21 @@ class EvidenceChunkRow:
     document_title: str
     text: str
     source_locator: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AdjacentEvidenceChunk:
+    """一条受权的相邻证据及其相对 seed 的位置。
+
+    邻居查询按 ``seed.chunk_index ± 1`` 在同 generation 内配对；SQL 为每对返回 seed 关系，
+    服务端据此按 seed 原顺序、先前块后后块排序，并在 ``chunkId`` 上保序去重。包装既有
+    :class:`EvidenceChunkRow`，不新增一套正文/定位字段。
+    """
+
+    seed_chunk_id: uuid.UUID
+    seed_chunk_index: int
+    chunk_index: int
+    chunk: EvidenceChunkRow
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -304,6 +355,14 @@ class EvidenceRepository(Protocol):
         organization_id: uuid.UUID,
         chunk_ids: Sequence[uuid.UUID],
     ) -> list[EvidenceChunkRow]: ...
+
+    async def load_adjacent_evidence_chunks(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+    ) -> list[AdjacentEvidenceChunk]: ...
 
     async def load_chunk_source_states(
         self,
@@ -443,6 +502,42 @@ class SqlRetrievalRepository:
             for row in result.mappings().all()
         ]
 
+    async def load_adjacent_evidence_chunks(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+    ) -> list[AdjacentEvidenceChunk]:
+        if not chunk_ids:
+            return []
+        result = await self._session.execute(
+            _ADJACENT_SQL,
+            {
+                "user_id": user_id,
+                "organization_id": organization_id,
+                "chunk_ids": list(chunk_ids),
+            },
+        )
+        return [
+            AdjacentEvidenceChunk(
+                seed_chunk_id=row["seed_chunk_id"],
+                seed_chunk_index=int(row["seed_chunk_index"]),
+                chunk_index=int(row["chunk_index"]),
+                chunk=EvidenceChunkRow(
+                    chunk_id=row["chunk_id"],
+                    document_id=row["document_id"],
+                    kb_id=row["kb_id"],
+                    version_id=row["version_id"],
+                    version_no=int(row["version_no"]),
+                    document_title=str(row["document_title"]),
+                    text=str(row["text"]),
+                    source_locator=dict(row["source_locator"]),
+                ),
+            )
+            for row in result.mappings().all()
+        ]
+
     async def load_chunk_source_states(
         self,
         *,
@@ -473,6 +568,7 @@ class SqlRetrievalRepository:
 
 
 __all__ = [
+    "AdjacentEvidenceChunk",
     "ChunkSourceState",
     "EvidenceChunkRow",
     "EvidenceRepository",

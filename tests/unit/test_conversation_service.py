@@ -41,7 +41,7 @@ from rag_backend.conversation.service import (
     load_citation_detail,
     load_conversation_history,
 )
-from rag_backend.generation.context_budget import ContextBudget
+from rag_backend.generation.context_budget import ContextBudget, plan_chat_context
 from rag_backend.generation.deepseek_client import (
     STATUS_FAILED,
     STATUS_SUCCEEDED,
@@ -56,7 +56,11 @@ from rag_backend.generation.deepseek_prompt import (
 )
 from rag_backend.generation.query_rewrite import REWRITE_STAGE, REWRITE_SYSTEM_PROMPT
 from rag_backend.retrieval.fusion import FusedCandidate
-from rag_backend.retrieval.repository import ChunkSourceState, EvidenceChunkRow
+from rag_backend.retrieval.repository import (
+    AdjacentEvidenceChunk,
+    ChunkSourceState,
+    EvidenceChunkRow,
+)
 from rag_backend.retrieval.service import RetrievalDegradedStage, RetrievalResult
 
 USER_ID = uuid.uuid4()
@@ -319,13 +323,19 @@ class FakeEvidenceRepository:
         *,
         states: Sequence[ChunkSourceState] = (),
         empty_load_numbers: Sequence[int] = (),
+        adjacent: Sequence[AdjacentEvidenceChunk] = (),
+        adjacent_error: Exception | None = None,
     ) -> None:
         self.rows = list(rows)
         self.states = {state.chunk_id: state for state in states}
         self.empty_load_numbers = set(empty_load_numbers)
+        self.adjacent = list(adjacent)
+        self.adjacent_error = adjacent_error
         self.loads = 0
         self.state_loads = 0
         self.releases = 0
+        self.adjacent_loads = 0
+        self.adjacent_requests: list[tuple[uuid.UUID, ...]] = []
 
     async def load_evidence_chunks(
         self, *, user_id: uuid.UUID, organization_id: uuid.UUID, chunk_ids: Sequence[uuid.UUID]
@@ -334,7 +344,25 @@ class FakeEvidenceRepository:
         if self.loads in self.empty_load_numbers:
             return []
         wanted = set(chunk_ids)
-        return [row for row in self.rows if row.chunk_id in wanted]
+        # 邻居与直接证据都来自同一受权正文读取；这里按 chunkId 保序去重。
+        candidates = [*self.rows, *(item.chunk for item in self.adjacent)]
+        ordered: list[EvidenceChunkRow] = []
+        seen: set[uuid.UUID] = set()
+        for row in candidates:
+            if row.chunk_id in wanted and row.chunk_id not in seen:
+                seen.add(row.chunk_id)
+                ordered.append(row)
+        return ordered
+
+    async def load_adjacent_evidence_chunks(
+        self, *, user_id: uuid.UUID, organization_id: uuid.UUID, chunk_ids: Sequence[uuid.UUID]
+    ) -> list[AdjacentEvidenceChunk]:
+        self.adjacent_loads += 1
+        self.adjacent_requests.append(tuple(chunk_ids))
+        if self.adjacent_error is not None:
+            raise self.adjacent_error
+        wanted = set(chunk_ids)
+        return [item for item in self.adjacent if item.seed_chunk_id in wanted]
 
     async def load_chunk_source_states(
         self, *, user_id: uuid.UUID, organization_id: uuid.UUID, chunk_ids: Sequence[uuid.UUID]
@@ -923,8 +951,8 @@ async def test_persistent_stale_evidence_returns_retryable_failure() -> None:
 @pytest.mark.anyio
 async def test_version_change_after_model_retrieves_once_then_succeeds() -> None:
     repository = FakeConversationRepository(_conversation())
-    # 第 1 次（模型前）正常，第 2 次（交付前）为空，触发一次重检索。
-    evidence = FakeEvidenceRepository([_evidence_row()], empty_load_numbers=[2])
+    # 补邻居后的生成前重读正常；生成后的第 3 次（交付前）为空，触发一次重检索。
+    evidence = FakeEvidenceRepository([_evidence_row()], empty_load_numbers=[3])
     retrieval = FakeRetrieval([[_candidate()], [_candidate()]])
     generator = FakeGenerator([_outcome(content=_answer_json())])
 
@@ -945,7 +973,7 @@ async def test_version_change_after_model_retrieves_once_then_succeeds() -> None
 @pytest.mark.anyio
 async def test_version_change_after_model_twice_returns_retryable_failure() -> None:
     repository = FakeConversationRepository(_conversation())
-    evidence = FakeEvidenceRepository([_evidence_row()], empty_load_numbers=[2, 4])
+    evidence = FakeEvidenceRepository([_evidence_row()], empty_load_numbers=[3, 6])
 
     with pytest.raises(ConversationSourcesChanged):
         await _run(repository=repository, evidence=evidence)
@@ -1191,8 +1219,8 @@ async def test_history_revoked_before_retry_fails_without_second_retrieval() -> 
     evidence = RevokingEvidenceRepository(
         [_evidence_row()],
         states=[_state(CHUNK_ID, version_id=VERSION_ID)],
-        # 第 2 次证据读取（交付前复核）为空，触发一次重检索。
-        empty_load_numbers=[2],
+        # 生成后的第 3 次证据读取（交付前复核）为空，触发一次重检索。
+        empty_load_numbers=[3],
         # 第 4 次历史核查（交付前复核）仍受权；重检索前的第 5 次核查发现已撤权。
         revoke_after=4,
     )
@@ -1577,8 +1605,8 @@ async def test_version_retry_reuses_single_rewrite() -> None:
     evidence = FakeEvidenceRepository(
         [_evidence_row()],
         states=[_state(CHUNK_ID, version_id=VERSION_ID)],
-        # 第 2 次证据读取（交付前复核）为空，触发一次重检索。
-        empty_load_numbers=[2],
+        # 生成后的第 3 次证据读取（交付前复核）为空，触发一次重检索。
+        empty_load_numbers=[3],
     )
     retrieval = FakeRetrieval([[_candidate()], [_candidate()]])
     generator = FakeGenerator([_outcome(content=_answer_json())])
@@ -1689,3 +1717,351 @@ async def test_usage_model_records_the_requested_answer_model() -> None:
 
     assert [row.model for row in repository.usage] == ["deepseek-flash"]
     assert repository.query_runs[0].generation_options["model"] == "deepseek-flash"
+
+
+# --- 相邻上下文 --------------------------------------------------------------
+
+
+def _adjacent(
+    *,
+    seed_chunk_id: uuid.UUID,
+    seed_chunk_index: int,
+    chunk_index: int,
+    chunk_id: uuid.UUID,
+    document_id: uuid.UUID,
+    text: str,
+    locator: dict[str, Any] | None = None,
+) -> AdjacentEvidenceChunk:
+    return AdjacentEvidenceChunk(
+        seed_chunk_id=seed_chunk_id,
+        seed_chunk_index=seed_chunk_index,
+        chunk_index=chunk_index,
+        chunk=_evidence_row(
+            text=text, chunk_id=chunk_id, document_id=document_id, locator=locator
+        ),
+    )
+
+
+class MutatingEvidenceRepository(FakeEvidenceRepository):
+    """在第 ``mutate_load`` 次证据读取时把指定 chunk 换成新版本，复现交付前邻居换版。"""
+
+    def __init__(
+        self,
+        rows: Sequence[EvidenceChunkRow],
+        *,
+        mutate_load: int,
+        mutate_chunk_id: uuid.UUID,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(rows, **kwargs)
+        self.mutate_load = mutate_load
+        self.mutate_chunk_id = mutate_chunk_id
+
+    async def load_evidence_chunks(
+        self, *, user_id: uuid.UUID, organization_id: uuid.UUID, chunk_ids: Sequence[uuid.UUID]
+    ) -> list[EvidenceChunkRow]:
+        rows = await super().load_evidence_chunks(
+            user_id=user_id, organization_id=organization_id, chunk_ids=chunk_ids
+        )
+        if self.loads == self.mutate_load:
+            return [
+                replace(row, version_id=uuid.uuid4())
+                if row.chunk_id == self.mutate_chunk_id
+                else row
+                for row in rows
+            ]
+        return rows
+
+
+@pytest.mark.anyio
+async def test_sparse_direct_hit_supplements_adjacent_context() -> None:
+    """稀疏命中只有 1 块时，相邻块作为补充证据进入同一提示并可被独立引用。"""
+
+    neighbor = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row(text="主命中片段。", locator={"page": 5})],
+        adjacent=[
+            _adjacent(
+                seed_chunk_id=CHUNK_ID,
+                seed_chunk_index=5,
+                chunk_index=6,
+                chunk_id=neighbor,
+                document_id=DOC_ID,
+                text="相邻补充片段。",
+                locator={"page": 6},
+            )
+        ],
+    )
+    generator = FakeGenerator([_outcome(content=_answer_json(("E2",)))])
+
+    result, repository, evidence, generator = await _run(
+        repository=repository, evidence=evidence, generator=generator
+    )
+
+    assert result.insufficient_evidence is False
+    # 单次批量邻居查询，seed 就是入选的直接证据。
+    assert evidence.adjacent_loads == 1
+    assert evidence.adjacent_requests == [(CHUNK_ID,)]
+    # 邻居有自己的 E 编号、locator、引文与 hash，不与直接证据拼接。
+    assert [view.quote for view in result.citations] == ["相邻补充片段。"]
+    assert result.citations[0].locator == {"page": 6}
+    assert repository.query_runs[0].evidence_count == 2
+    prompt = "\n".join(message.content for message in generator.answer_messages[0])
+    assert "主命中片段。" in prompt
+    assert "相邻补充片段。" in prompt
+    assert '"evidence_id": "E2"' in prompt
+
+
+@pytest.mark.anyio
+async def test_multiple_seeds_query_adjacent_in_one_batch_with_stable_order() -> None:
+    """多 seed 时只发一次批量查询，邻居按 seed 原顺序、前块后后块排列并按 chunkId 去重。"""
+
+    seed_one = uuid.uuid4()
+    seed_two = uuid.uuid4()
+    doc_a = uuid.uuid4()
+    doc_b = uuid.uuid4()
+    before_one = uuid.uuid4()
+    after_one = uuid.uuid4()
+    before_two = uuid.uuid4()
+    after_two = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [
+            _evidence_row(text="seed-one", chunk_id=seed_one, document_id=doc_a),
+            _evidence_row(text="seed-two", chunk_id=seed_two, document_id=doc_b),
+        ],
+        adjacent=[
+            # 故意打乱返回顺序，服务端必须自行按 seed 顺序与前后方向重排。
+            _adjacent(
+                seed_chunk_id=seed_two, seed_chunk_index=2, chunk_index=3,
+                chunk_id=after_two, document_id=doc_b, text="b-after",
+            ),
+            _adjacent(
+                seed_chunk_id=seed_one, seed_chunk_index=5, chunk_index=6,
+                chunk_id=after_one, document_id=doc_a, text="a-after",
+            ),
+            _adjacent(
+                seed_chunk_id=seed_two, seed_chunk_index=2, chunk_index=1,
+                chunk_id=before_two, document_id=doc_b, text="b-before",
+            ),
+            _adjacent(
+                seed_chunk_id=seed_one, seed_chunk_index=5, chunk_index=4,
+                chunk_id=before_one, document_id=doc_a, text="a-before",
+            ),
+        ],
+    )
+    retrieval = FakeRetrieval(
+        [[_candidate(seed_one, doc_a), _candidate(seed_two, doc_b)]]
+    )
+    generator = FakeGenerator(
+        [_outcome(content=_answer_json(("E1", "E2", "E3", "E4", "E5", "E6")))]
+    )
+
+    result, repository, evidence, generator = await _run(
+        repository=repository, evidence=evidence, retrieval=retrieval, generator=generator
+    )
+
+    assert evidence.adjacent_loads == 1
+    assert evidence.adjacent_requests == [(seed_one, seed_two)]
+    assert result.insufficient_evidence is False
+    assert repository.query_runs[0].evidence_count == 6
+    by_label = {view.display_label: view.quote for view in result.citations}
+    assert by_label == {
+        "1": "seed-one",
+        "2": "seed-two",
+        "3": "a-before",
+        "4": "a-after",
+        "5": "b-before",
+        "6": "b-after",
+    }
+
+
+@pytest.mark.anyio
+async def test_full_direct_evidence_skips_adjacent_query() -> None:
+    """直接证据已占满 max_evidence 时完全不查邻居，邻居不得抢排名。"""
+
+    chunks = [uuid.uuid4() for _ in range(6)]
+    docs = [uuid.uuid4() for _ in range(6)]
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row(chunk_id=cid, document_id=did) for cid, did in zip(chunks, docs)]
+    )
+    retrieval = FakeRetrieval([[_candidate(cid, did) for cid, did in zip(chunks, docs)]])
+    generator = FakeGenerator([_outcome(content=_answer_json(("E1",)))])
+
+    _result, repository, evidence, _generator = await _run(
+        repository=repository, evidence=evidence, retrieval=retrieval, generator=generator
+    )
+
+    assert evidence.adjacent_loads == 0
+    assert repository.query_runs[0].evidence_count == 6
+
+
+@pytest.mark.anyio
+async def test_document_at_per_document_limit_skips_its_seed() -> None:
+    """同一文档已入选 3 块时，其邻居必然被 plan 排除，不再发无谓的邻接查询。"""
+
+    chunks = [uuid.uuid4() for _ in range(3)]
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row(chunk_id=cid, document_id=DOC_ID) for cid in chunks]
+    )
+    retrieval = FakeRetrieval([[_candidate(cid, DOC_ID) for cid in chunks]])
+
+    _result, repository, evidence, _generator = await _run(
+        repository=repository, evidence=evidence, retrieval=retrieval
+    )
+
+    assert evidence.adjacent_loads == 0
+    assert repository.query_runs[0].evidence_count == 3
+
+
+@pytest.mark.anyio
+async def test_no_evidence_never_queries_adjacent_or_calls_model() -> None:
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository([])
+    generator = FakeGenerator([_outcome(content=_answer_json())])
+
+    result, repository, evidence, generator = await _run(
+        repository=repository,
+        evidence=evidence,
+        retrieval=FakeRetrieval([[]], kb_ids=()),
+        generator=generator,
+    )
+
+    assert evidence.adjacent_loads == 0
+    assert generator.calls == 0
+    assert result.insufficient_evidence is True
+
+
+@pytest.mark.anyio
+async def test_neighbor_revoked_before_generation_retries_once_then_succeeds() -> None:
+    """补邻居期间 seed/邻居被撤权：生成前重读发现变化，最多重检索 1 次。"""
+
+    neighbor = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row(text="主命中。")],
+        adjacent=[
+            _adjacent(
+                seed_chunk_id=CHUNK_ID,
+                seed_chunk_index=5,
+                chunk_index=6,
+                chunk_id=neighbor,
+                document_id=DOC_ID,
+                text="相邻补充。",
+            )
+        ],
+        #
+        # 第 2 次证据读取（补邻居后的生成前重读）为空，模拟撤权。
+        empty_load_numbers=[2],
+    )
+    retrieval = FakeRetrieval([[_candidate()], [_candidate()]])
+    generator = FakeGenerator([_outcome(content=_answer_json(("E2",)))])
+
+    result, repository, evidence, generator = await _run(
+        repository=repository, evidence=evidence, retrieval=retrieval, generator=generator
+    )
+
+    assert result.insufficient_evidence is False
+    assert retrieval.calls == 2
+    assert evidence.adjacent_loads == 2
+    assert [view.quote for view in result.citations] == ["相邻补充。"]
+    assert repository.query_runs[0].degraded_stages == ("source_retry",)
+
+
+@pytest.mark.anyio
+async def test_neighbor_version_change_after_generation_retries_once_then_succeeds() -> None:
+    """生成后交付前邻居换版本：不得交付旧引用，重检索一次。"""
+
+    neighbor = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = MutatingEvidenceRepository(
+        [_evidence_row(text="主命中。")],
+        adjacent=[
+            _adjacent(
+                seed_chunk_id=CHUNK_ID,
+                seed_chunk_index=5,
+                chunk_index=6,
+                chunk_id=neighbor,
+                document_id=DOC_ID,
+                text="相邻补充。",
+            )
+        ],
+        # 第 3 次证据读取（生成后的交付前复核）把邻居换成新版本。
+        mutate_load=3,
+        mutate_chunk_id=neighbor,
+    )
+    retrieval = FakeRetrieval([[_candidate()], [_candidate()]])
+    generator = FakeGenerator([_outcome(content=_answer_json(("E2",)))])
+
+    result, repository, _evidence, generator = await _run(
+        repository=repository, evidence=evidence, retrieval=retrieval, generator=generator
+    )
+
+    assert result.insufficient_evidence is False
+    assert generator.answer_calls == 2
+    assert repository.query_runs[0].degraded_stages == ("source_retry",)
+    assert [view.quote for view in result.citations] == ["相邻补充。"]
+
+
+@pytest.mark.anyio
+async def test_adjacent_failure_propagates_without_answering_and_releases() -> None:
+    """邻居查询失败不得降级成“无邻居”继续成功，且只读事务已交还。"""
+
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row()], adjacent_error=RuntimeError("adjacent boom")
+    )
+    generator = FakeGenerator([_outcome(content=_answer_json())])
+
+    with pytest.raises(RuntimeError, match="adjacent boom"):
+        await _run(repository=repository, evidence=evidence, generator=generator)
+
+    assert generator.calls == 0
+    assert evidence.releases >= 1
+    assert repository.query_runs == []
+
+
+@pytest.mark.anyio
+async def test_neighbor_exceeding_token_budget_is_excluded_without_degraded() -> None:
+    """邻居与直接证据共用同一提示预算；预算装不下的邻居被排除，正常裁剪不算降级。"""
+
+    question = "制度怎么规定？"
+    mandatory = plan_chat_context(
+        system_prompt=SYSTEM_PROMPT,
+        question=question,
+        estimator=RecordingEstimator(),
+    ).input_tokens
+    budget = ContextBudget(input_token_budget=mandatory + 200, output_token_budget=800)
+    neighbor = uuid.uuid4()
+    repository = FakeConversationRepository(_conversation())
+    evidence = FakeEvidenceRepository(
+        [_evidence_row(text="短直接证据。")],
+        adjacent=[
+            _adjacent(
+                seed_chunk_id=CHUNK_ID,
+                seed_chunk_index=5,
+                chunk_index=6,
+                chunk_id=neighbor,
+                document_id=DOC_ID,
+                text="超长邻居。" * 2_000,
+            )
+        ],
+    )
+    generator = FakeGenerator([_outcome(content=_answer_json(("E1",)))])
+
+    result, repository, _evidence, generator = await _run(
+        repository=repository,
+        evidence=evidence,
+        generator=generator,
+        question=question,
+        budget=budget,
+    )
+
+    assert result.insufficient_evidence is False
+    assert repository.query_runs[0].evidence_count == 1
+    assert result.degraded_stages == ()
+    prompt = "\n".join(message.content for message in generator.answer_messages[0])
+    assert "超长邻居。" not in prompt
