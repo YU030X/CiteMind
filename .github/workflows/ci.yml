@@ -1,8 +1,9 @@
 name: CI
 
-# 触发范围：任意分支 push、PR、手动。permissions 只读仓储内容，不申请任何写权限。
+# 触发范围：仅 main 分支 push、任意 PR、手动。permissions 只读仓储内容，不申请任何写权限。
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -15,6 +16,56 @@ permissions:
   contents: read
 
 jobs:
+  # 只判断 inference 相关改动，不用 path filter 跳过整个 workflow（否则必需检查会一直 pending）。
+  # 手动触发必须运行 inference；PR 用 merge-base 三点 diff；push 用 before..sha，零 before SHA 保守全量。
+  changes:
+    name: changes (inference path gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      inference: ${{ steps.detect.outputs.inference }}
+    steps:
+      - name: Checkout
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect inference-related changes
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "inference=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # 三点 diff 以 merge-base 为基准，只算本 PR 引入的改动。
+            range="origin/$BASE_REF...HEAD"
+          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # 新分支或首次推送没有可比较的 before，保守地视为有改动。
+            echo "inference=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            range="$BEFORE_SHA..$SHA"
+          fi
+          # --no-renames 让改名同时保留旧/新路径，避免 inference/ 下的文件被移出时漏判。
+          if ! changed="$(git diff --no-renames --name-only "$range" 2>/dev/null)"; then
+            # 无法解析 diff 范围（如 force push 后 before 已不可达）时，保守地运行 inference。
+            echo "inference=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Eq '^(inference/|\.github/workflows/ci\.yml$)' <<< "$changed"; then
+            echo "inference=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "inference=false" >> "$GITHUB_OUTPUT"
+          fi
+
   backend:
     name: backend (ruff / mypy / pytest)
     runs-on: ubuntu-24.04
@@ -48,6 +99,8 @@ jobs:
 
   inference:
     name: inference (ruff / mypy / pytest)
+    needs: changes
+    if: needs.changes.outputs.inference == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     defaults:
