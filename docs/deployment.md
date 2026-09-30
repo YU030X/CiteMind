@@ -30,7 +30,31 @@ CiteMind 必须使用独占的 PostgreSQL database，不能与其他应用共享
 
 JSON 结构化日志记录 requestId、queryRunId、ingestJobId、阶段耗时、候选数、版本、模型修订和失败类型，默认不记正文。生产诊断不要打印 `Settings.model_dump()`/`model_dump_json()`，它会输出未脱敏的 `database_url`/`redis_url` 等连接串；需要排查配置时只核对存在性与一致性，不回显。`/metrics` 记录检索、模型、队列、用量和资源指标；低配 profile 不常驻完整 Grafana 栈。模型超时、broker 不可用、磁盘或 Redis 内存压力应有显式降级/拒绝新导入状态。Redis 可采用 `noeviction` 和 AOF，但仍由 PostgreSQL outbox 与 job 承担恢复事实。
 
-CI 已在 `.github/workflows/ci.yml` 落地静态与单元门禁：`push`（仅 main 分支）、`pull_request` 与 `workflow_dispatch` 触发，只申请 `contents: read`，按 workflow+ref 并发取消；`changes` 判断 job 用 `git diff` 判断 inference 相关改动（PR 用 `origin/<base>...HEAD` merge-base 三点 diff，push 用 `before..sha`，零 `before` SHA 保守视为全量，`--no-renames` 保留改名两侧路径），命中 `inference/` 或 `.github/workflows/ci.yml` 才运行 inference job，手动触发恒运行，backend/frontend 恒跑；`changes` 判断 job 之外，backend/inference/frontend 三个 ubuntu-24.04 检查 job 分别覆盖 backend（Python 3.12 + uv 0.12.4，`uv lock --check`、`uv sync --frozen`、Ruff、mypy、非集成 pytest）、inference（`working-directory: inference` 与独立锁/缓存，`uv lock --check`、`uv sync --frozen --group dev`、`ruff`、`mypy`、`pytest -m "not model"`，并设 `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1`/`RUN_MODEL_TESTS=0`）与 frontend（Node 24 + pnpm 11.22.0，`pnpm install --frozen-lockfile`、`pnpm test:jev`、前端测试与构建；其中 `pnpm --dir frontend test` 会经 `uv run python -c` 调用后端模块，故该 job 另装 uv 0.12.4 + Python 3.12、先显式 `uv sync --frozen`，并在测试 step 设 `UV_NO_SYNC=1` 禁止嵌套 `uv run` 隐式安装）。该 workflow 不注入 secrets、不读 `.env`、不连数据库/Redis/broker/真实模型、不构建镜像或部署；backend 单测在 runner 存在 `docker` 时会调用 `docker compose config --format json` 做静态渲染，不启动容器（本仓不声称 CI 完全不执行 Docker CLI）；它**尚未在 GitHub 上真实运行**，仓库内只做过 YAML 与 Actions 引用的静态解析。`pip-audit`、SBOM 生成、为 API/worker/inference 构建最小依赖镜像并推送 GHCR 仍是后续计划；手动发布与备份恢复需独立运行验收。六服务 Compose 本地切片已建成并完成一次真实启动与网关验收，确切单行命令与静态检查见 [开发约定](development.md)；分角色生产镜像、查询侧 embedding、worker 写入事务、备份恢复与 GHCR 发布仍未建成。
+CI 已在 `.github/workflows/ci.yml` 落地静态与单元门禁：`push`（仅 main 分支）、`pull_request` 与 `workflow_dispatch` 触发，只申请 `contents: read`，按 workflow+ref 并发取消；`changes` 判断 job 用 `git diff` 判断 inference 相关改动（PR 用 `origin/<base>...HEAD` merge-base 三点 diff，push 用 `before..sha`，零 `before` SHA 保守视为全量，`--no-renames` 保留改名两侧路径），命中 `inference/` 或 `.github/workflows/ci.yml` 才运行 inference job，手动触发恒运行，backend/frontend 恒跑；`changes` 判断 job 之外，backend/inference/frontend 三个 ubuntu-24.04 检查 job 分别覆盖 backend（Python 3.12 + uv 0.12.4，`uv lock --check`、`uv sync --frozen`、Ruff、mypy、非集成 pytest）、inference（`working-directory: inference` 与独立锁/缓存，`uv lock --check`、`uv sync --frozen --group dev`、`ruff`、`mypy`、`pytest -m "not model"`，并设 `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1`/`RUN_MODEL_TESTS=0`）与 frontend（Node 24 + pnpm 11.22.0，`pnpm install --frozen-lockfile`、`pnpm test:jev`、前端测试与构建；其中 `pnpm --dir frontend test` 会经 `uv run python -c` 调用后端模块，故该 job 另装 uv 0.12.4 + Python 3.12、先显式 `uv sync --frozen`，并在测试 step 设 `UV_NO_SYNC=1` 禁止嵌套 `uv run` 隐式安装）。该 workflow 不注入 secrets、不读 `.env`、不连数据库/Redis/broker/真实模型、不构建镜像或部署；backend 单测在 runner 存在 `docker` 时会调用 `docker compose config --format json` 做静态渲染，不启动容器（本仓不声称 CI 完全不执行 Docker CLI）；它**尚未在 GitHub 上真实运行**，仓库内只做过 YAML 与 Actions 引用的静态解析。`pip-audit`、SBOM 生成、为 API/worker/inference 构建最小依赖镜像并推送 GHCR 仍是后续计划；手动发布与备份恢复需独立运行验收。六服务 Compose 本地切片已建成并完成一次真实启动与网关验收，确切单行命令与静态检查见 [开发约定](development.md)；分角色生产镜像与 GHCR 发布仍未建成；本片备份恢复入口已实现但尚未真实执行验收。
+
+### 数据库与原文件备份/隔离恢复（已实现入口，未真实执行验收）
+
+入口为 `uv run python -m rag_backend.operations.backup`，只使用标准库与既有 Compose 中运行中的 `postgres` 容器内的 `pg_dump`/`pg_restore`/`psql`（`docker exec`，走容器内本地 socket，不传 DSN/password），并可从容器镜像复用 `tar` 导出/导入只装原文件的 `api-documents` 命名卷；不依赖宿主 `pg` 客户端，也不新增依赖或第二套实现。
+
+备份用 `pg_dump --format=custom` 生成二进制 `database.dump`，只复制内容寻址原文件，写入同目录自建临时目录后原子改名；目标目录已存在时拒绝覆盖，失败只清理本次临时资源；`manifest.json` 记录 `database.dump` 与每个 blob 的 SHA-256/大小、`alembic_version`、关键表计数与 `document_version.file_ref` 关联事实，不记录 DSN/password/cookie/密钥。
+
+数据库与文件是顺序分拷贝、不是原子快照：执行备份前必须暂停 API/worker 写入并用 `--quiesced` 声明，拷贝后按 `document_version.file_ref` 与快照 blob 交叉核对，缺任何一个即整体失败。命令默认 dry-run，不连接任何服务；真实操作必须 `--execute`，并用与写入对象完全一致的 `--confirm` 二次确认。
+
+恢复只接受与源 project 不同、库名严格以 `_test` 结尾的隔离目标（拒绝 `test`/`mytest`/`test_db` 这类宽松匹配），要求目标库已由隔离项目 initdb 建好且不含业务表、目标 `api-documents` 卷已存在且为空，否则拒绝；不同 project 中同名 `_test` 库是允许的隔离演练场景，同 project 内恢复一律拒绝。实现不使用 `--clean`/DROP，不覆盖开发/生产库，不重置用户数据。恢复后由固定脚本把空 target 卷的卷根与 KB/blob 目录归运行时用户 `10001:10001` 并给 owner 写权限，使 API 能继续写入新 blob；该步骤只对本次显式恢复的空 target 卷执行，不改源卷，真实 owner/chmod 行为仍需 Docker 真验。恢复角色与权限沿 init/migrator/api/worker 约定（`pg_restore` 以 `citemind_migrator` 运行并 `--no-owner`，保留 GRANT，兼容 pgvector），不备份外部角色密码。
+
+恢复半途失败时不要自动 drop/clean 或对任何共享/开发数据卷执行 `down -v`：只有隔离 target 项目可能留下未完成的库或 partial 卷；先手工核对 target 项目（示例隔离名 `myrag-restore`），确认确属本次隔离演练后，再用本文已建成的 Docker Compose 命令重建自己的空 target，然后重试。`down -v` 会删除该 project 的数据卷，仅在明确指定隔离 project 且有单独确认后使用，不得用于 dev/生产。
+
+只读校验入口 `verify` 先离线重算清单 SHA-256 并校验内容寻址不变量（拒绝符号链接与非普通文件），有目标时还核对目标库的 `alembic_version`/`document.active_version_id`/`ingest_job.generation_id` 引用、READY 版本与生成及 chunk 计数，并把目标 `api-documents` 卷只读导出后逐文件校验实际 SHA-256、确认目标库引用的文件都在目标卷中且与快照一致；`--expected-head` 无目标时核对快照记录的 `alembicRevision`，有目标时还核对目标库 revision。它只证明 schema 与引用级一致性，**不证明**全表字节完全同一、向量数值等价、pgvector ANN 索引重建或 WAL/跨文件原子性。
+
+本轮未真实执行 `pg_dump`/`pg_restore`/卷导出：容器内本地 socket 认证、`pg_restore --single-transaction` 行为、跨 project 具名卷命名与大 dump/大卷流式内存都仍需真实验收。以下为单行命令示例，真实执行前请先备份好并暂停写入；示例 `verify` 不传 `--expected-head`，若要核对具体版本请填 `manifest.json` 里 `alembicRevision` 的实际值。
+
+```
+uv run python -m rag_backend.operations.backup backup --project citemind --database citemind --output D:/backups/2026-09-30
+uv run python -m rag_backend.operations.backup backup --project citemind --database citemind --output D:/backups/2026-09-30 --execute --confirm D:/backups/2026-09-30 --quiesced
+uv run python -m rag_backend.operations.backup verify --snapshot D:/backups/2026-09-30 --execute
+uv run python -m rag_backend.operations.backup restore --snapshot D:/backups/2026-09-30 --source-project citemind --target-project myrag-restore --target-database citemind_test --execute --confirm citemind_test
+uv run python -m rag_backend.operations.backup verify --snapshot D:/backups/2026-09-30 --target-project myrag-restore --target-database citemind_test --execute
+```
 
 ## 部署顺序与迁移依赖
 

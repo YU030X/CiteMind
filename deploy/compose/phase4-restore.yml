@@ -1,0 +1,19 @@
+# Phase 4 隔离恢复专用 override：只把 api/worker 的 DATABASE_URL 指向恢复目标库 citemind_test。
+#
+# 仅用于显式隔离的 restore project（例如 -p myrag-phase4-restore）；绝不能用于 dev 或生产：
+# 它会覆盖运行库名，误用会让应用读到测试库。
+#
+# 用法（从仓库根目录，单行；与 base compose 叠加，仅用于隔离 restore project）：
+#   docker compose --env-file $restoreEnvFile -p myrag-phase4-restore -f deploy/compose/compose.yml -f deploy/compose/phase4-restore.yml up -d --wait
+#
+# 只覆盖 api 与 worker 的 environment.DATABASE_URL：driver（postgresql+psycopg）、角色
+# （citemind_api/citemind_worker）与必填 PASSWORD 表达式完全复制 base compose，只把最后的
+# 库名 citemind 改成 citemind_test；不改 base/initdb/端口/卷/其它服务/其它环境变量。
+services:
+  api:
+    environment:
+      DATABASE_URL: postgresql+psycopg://citemind_api:${API_DB_PASSWORD:?必须设置 API_DB_PASSWORD}@postgres:5432/citemind_test
+
+  worker:
+    environment:
+      DATABASE_URL: postgresql+psycopg://citemind_worker:${WORKER_DB_PASSWORD:?必须设置 WORKER_DB_PASSWORD}@postgres:5432/citemind_test
