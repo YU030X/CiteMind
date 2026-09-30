@@ -12,7 +12,7 @@
 
 ## 本目录索引
 
-当前列出的文档除 [personal-demo.md](personal-demo.md) 这一份手工演示脚本外均为技术参考文档，计划与已实现状态在各文档内分别标注。
+当前列出的文档中 [personal-demo.md](personal-demo.md) 与 [phase4-acceptance.md](phase4-acceptance.md) 是手工执行指引，其余为技术参考文档，计划与已实现状态在各文档内分别标注。
 
 | 文档 | 负责的主题 |
 | --- | --- |
@@ -28,6 +28,7 @@
 | [evaluation.md](evaluation.md) | 题集、指标、故障、性能与端到端验收 |
 | [deployment.md](deployment.md) | 服务、资源配置、观测与恢复 |
 | [personal-demo.md](personal-demo.md) | 个人工作台的手工演示流程（2026-09-28 隔离真实验收第 1–5 节；第 6 节权限对比与思考模式未跑） |
+| [phase4-acceptance.md](phase4-acceptance.md) | Phase 4 手动验收的命令与判据（阶段待验收） |
 
 ## 写作与检查
 
