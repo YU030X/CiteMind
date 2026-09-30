@@ -1,0 +1,134 @@
+name: CI
+
+# 触发范围：任意分支 push、PR、手动。permissions 只读仓储内容，不申请任何写权限。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 同一 workflow 的同一 ref（PR 用编号）只保留最新一次运行，新的运行取消旧的。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (ruff / mypy / pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup uv (0.12.4) and Python 3.12
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Sync frozen dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run --no-sync ruff check backend/src migrations tests
+
+      - name: Mypy
+        run: uv run --no-sync mypy
+
+      - name: Pytest (unit, no integration)
+        run: uv run --no-sync pytest -m "not integration" -q -p no:cacheprovider
+
+  inference:
+    name: inference (ruff / mypy / pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: inference
+    env:
+      # 模型离线与模型测试显式关闭：CI 不下载权重、不跑真实模型用例。
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      RUN_MODEL_TESTS: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup uv (0.12.4) and Python 3.12
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "inference/uv.lock"
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Sync frozen dependencies (dev group)
+        run: uv sync --frozen --group dev
+
+      - name: Ruff
+        run: uv run --no-sync ruff check
+
+      - name: Mypy
+        run: uv run --no-sync mypy
+
+      - name: Pytest (no model tests)
+        run: uv run --no-sync pytest -m "not model" -q -p no:cacheprovider
+
+  frontend:
+    name: frontend (jev / test / build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm (11.22.0)
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "11.22.0"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Jev tooling test (local fake)
+        run: pnpm test:jev
+
+      # frontend/tests/markdown.test.ts 会通过 `uv run python -c` 调用后端
+      # rag_backend.generation.answer_schema，因此前端 job 也需要根 Python 环境。
+      - name: Setup uv (0.12.4) and Python 3.12
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Sync frozen backend dependencies
+        run: uv sync --frozen
+
+      - name: Frontend tests
+        # 嵌套的 `uv run` 只使用上面显式 sync 的环境，不再隐式安装或解锁。
+        env:
+          UV_NO_SYNC: "1"
+        run: pnpm --dir frontend test
+
+      - name: Frontend build
+        run: pnpm --dir frontend build
