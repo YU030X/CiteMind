@@ -25,11 +25,18 @@ import { Textarea } from "@/components/ui/textarea";
 import CitationPanel from "@/components/CitationPanel.vue";
 import ConversationList from "@/components/ConversationList.vue";
 import KnowledgeBaseSelect from "@/components/KnowledgeBaseSelect.vue";
-import { kbRoleLabel, citationVersionLabel, formatTime } from "@/labels";
+import {
+  kbRoleLabel,
+  citationVersionLabel,
+  degradedStageLabel,
+  formatTime,
+  INSUFFICIENT_EVIDENCE_NOTICE,
+} from "@/labels";
 import { citationIdMap, renderMarkdown } from "@/lib/markdown";
 import type { ConversationMessage, ReasoningEffort } from "@/api/types";
 import {
   activeKnowledgeBase,
+  answerNoticeFor,
   ask,
   closeCitation,
   conversationsForActiveKb,
@@ -152,6 +159,17 @@ const renderedMessages = computed(
 
 const citationVisible = computed(
   () => state.citation !== null || state.citationLoading || state.citationError !== "",
+);
+
+/** 当轮拒答/降级提示按确切 messageId 取；找不到或不适用时为 null，不贴到旧回答。 */
+const answerNotices = computed(
+  () =>
+    new Map(
+      messages.value.map((message) => [
+        message.messageId,
+        answerNoticeFor(message.messageId),
+      ]),
+    ),
 );
 
 watch(citationVisible, (visible) => {
@@ -289,6 +307,29 @@ function onMessageClick(event: MouseEvent): void {
                 v-html="renderedMessages.get(message.messageId)"
                 @click="onMessageClick"
               />
+
+              <Alert
+                v-if="answerNotices.get(message.messageId)?.insufficientEvidence === true"
+                class="border-dashed"
+              >
+                <AlertTitle>未找到足够依据</AlertTitle>
+                <AlertDescription>{{ INSUFFICIENT_EVIDENCE_NOTICE }}</AlertDescription>
+              </Alert>
+
+              <div
+                v-if="(answerNotices.get(message.messageId)?.degradedStages.length ?? 0) > 0"
+                class="flex flex-wrap items-center gap-2"
+              >
+                <span class="text-xs text-muted-foreground">本次回答降级：</span>
+                <Badge
+                  v-for="stage in answerNotices.get(message.messageId)?.degradedStages ?? []"
+                  :key="stage"
+                  variant="outline"
+                  :title="stage"
+                >
+                  {{ degradedStageLabel(stage) }}
+                </Badge>
+              </div>
 
               <div v-if="message.citations.length > 0" class="flex flex-wrap gap-2">
                 <button

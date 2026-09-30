@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "test": "node --test tests/markdown.test.ts tests/labels.test.ts"
+    "test": "node --test tests/markdown.test.ts tests/labels.test.ts tests/answer-notice.test.ts"
   },
   "dependencies": {
     "@lucide/vue": "^1.48.0",

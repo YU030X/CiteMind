@@ -107,6 +107,25 @@ export function jobErrorLabel(errorCode: string | null): string {
   return known !== undefined ? known : `诊断码 ${errorCode}`;
 }
 
+/** `AnswerResponse.degradedStages` 的静态中文映射；未知码原样展示并标注“降级阶段”，不猜测语义。 */
+const DEGRADED_STAGE_LABELS: Record<string, string> = {
+  unsupported_text: "部分资料片段无法安全处理，已跳过",
+  source_retry: "资料变化，已重新检索",
+  rerank_unavailable: "语义重排不可用，已按原融合排序继续",
+};
+
+export function degradedStageLabel(stage: string): string {
+  const known = DEGRADED_STAGE_LABELS[stage];
+  return known !== undefined ? known : `降级阶段 ${stage}`;
+}
+
+/**
+ * 拒答说明：只说明当前可访问资料不足以回答，不暗示存在未授权或隐藏文档。
+ * 历史 `GET /conversations/{id}/messages` 不返回拒答字段，因此只在当轮回答后展示。
+ */
+export const INSUFFICIENT_EVIDENCE_NOTICE =
+  "基于当前知识库中你有权访问的资料，没有找到足以回答这个问题的内容。";
+
 export function isTerminalJobStatus(status: JobStatus): boolean {
   return TERMINAL_JOB_STATUSES.has(status);
 }

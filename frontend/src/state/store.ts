@@ -32,6 +32,17 @@ interface Session {
   csrfToken: string;
 }
 
+/**
+ * 当轮回答的拒答与降级提示。只绑定发起时的会话与确切的助手 `messageId`，
+ * 因为历史 `GET /conversations/{id}/messages` 不返回这两个字段，重新打开后无法还原。
+ */
+export interface AnswerNotice {
+  conversationId: string;
+  messageId: string;
+  insufficientEvidence: boolean;
+  degradedStages: string[];
+}
+
 export const state = reactive({
   booting: true,
   bootError: "",
@@ -80,6 +91,8 @@ export const state = reactive({
   citationError: "",
 
   lastFollowUp: "",
+  // 当轮回答提示；只在发起会话仍活跃时写入，并按确切消息绑定渲染。
+  answerNotice: null as AnswerNotice | null,
 });
 
 let documentsTimer: number | null = null;
@@ -125,6 +138,7 @@ function resetConversationSelection(): void {
   state.citationLoading = false;
   state.citationError = "";
   state.lastFollowUp = "";
+  state.answerNotice = null;
 }
 
 function resetSession(): void {
@@ -457,6 +471,7 @@ export async function openConversation(conversationId: string): Promise<void> {
   state.messagesError = "";
   state.askError = "";
   state.lastFollowUp = "";
+  state.answerNotice = null;
   await loadMessages(conversationId);
 }
 
@@ -500,6 +515,7 @@ export async function ask(question: string): Promise<boolean> {
   }
   state.asking = true;
   state.askError = "";
+  state.answerNotice = null;
   try {
     // 思考强度只在开启时随请求提交；关闭时服务端默认组合就是非思考。
     const options: AskGenerationOptions = {
@@ -511,7 +527,15 @@ export async function ask(question: string): Promise<boolean> {
     };
     // requestId 只用于服务端关联本次调用；前端不按它去重，也不自动重试付费消息。
     const answer = await api.ask(conversationId, question, crypto.randomUUID(), options);
+    // 结果只属于发起时的会话；用户已切换时丢弃本轮结果，不改写追问、旧会话历史或新会话错误。
+    if (state.activeConversationId !== conversationId) return true;
     state.lastFollowUp = answer.followUp ?? "";
+    state.answerNotice = {
+      conversationId,
+      messageId: answer.messageId,
+      insufficientEvidence: answer.insufficientEvidence,
+      degradedStages: answer.degradedStages,
+    };
     const refreshed = await loadMessages(conversationId, true);
     if (!refreshed) {
       state.askError = "回答已生成，但历史刷新失败；请重新打开该会话查看结果。";
@@ -519,11 +543,27 @@ export async function ask(question: string): Promise<boolean> {
     void loadConversations(true);
     return true;
   } catch (error) {
-    state.askError = describeError(error);
+    // 失败提示也只写回发起会话；已在别处的失败不污染当前会话界面。
+    if (state.activeConversationId === conversationId) {
+      state.askError = describeError(error);
+    }
     return false;
   } finally {
     state.asking = false;
   }
+}
+
+/**
+ * 取指定助手消息应展示的当轮提示：只匹配当前会话与确切 `messageId`；
+ * 非拒答且无降级阶段时返回 null，因此正常回答完全不出提示。
+ */
+export function answerNoticeFor(messageId: string): AnswerNotice | null {
+  const notice = state.answerNotice;
+  if (notice === null) return null;
+  if (notice.conversationId !== state.activeConversationId) return null;
+  if (notice.messageId !== messageId) return null;
+  if (!notice.insufficientEvidence && notice.degradedStages.length === 0) return null;
+  return notice;
 }
 
 // --- 引用 ---------------------------------------------------------------------
