@@ -282,10 +282,17 @@ def test_timeout_is_static_failure() -> None:
 def test_settings_default_disables_web_and_rejects_wildcard() -> None:
     from rag_backend.config import Settings
 
-    assert Settings(_env_file=None).web_fetch_allowed_host_set == frozenset()
-    settings = Settings(_env_file=None, web_fetch_allowed_hosts="Example.com., api.example.com")
+    # ``_env_file`` 用 kwargs 字典传，显式不读仓库根 .env 且避免 mypy 误报。
+    values: dict[str, Any] = {"_env_file": None}
+    assert Settings(**values).web_fetch_allowed_host_set == frozenset()
+    values = {
+        "_env_file": None,
+        "web_fetch_allowed_hosts": "Example.com., api.example.com",
+    }
+    settings = Settings(**values)
     assert settings.web_fetch_allowed_host_set == frozenset(
         {"example.com", "api.example.com"}
     )
+    values = {"_env_file": None, "web_fetch_allowed_hosts": "*.example.com"}
     with pytest.raises(ValueError):
-        Settings(_env_file=None, web_fetch_allowed_hosts="*.example.com")
+        Settings(**values)

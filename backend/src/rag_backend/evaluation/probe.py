@@ -33,8 +33,11 @@ from rag_backend.evaluation.ablation import (
     AblationArtifact,
     AblationQuestion,
     AblationTripletReport,
+    AblationVariant,
+    DegradedStage,
     validate_ablation_triplet,
 )
+from rag_backend.evaluation.analysis import build_ranking_questions
 from rag_backend.evaluation.calibration import RefusalProbeRecord
 from rag_backend.evaluation.dataset import EvaluationDataset, EvaluationQuestion
 from rag_backend.evaluation.ranking_metrics import (
@@ -42,12 +45,11 @@ from rag_backend.evaluation.ranking_metrics import (
     RankingReport,
     aggregate_ranking_metrics,
 )
-from rag_backend.evaluation.analysis import build_ranking_questions
 from rag_backend.evaluation.runner import AssetRegistry, DatasetRunError, LogicalRef
 from rag_backend.retrieval.errors import KnowledgeBaseNotAccessible
 from rag_backend.retrieval.fusion import FusedCandidate, RankedChunk
-from rag_backend.retrieval.repository import EvidenceChunkRow, RetrievalRepository
 from rag_backend.retrieval.query_embedding_client import EmbeddedQuery
+from rag_backend.retrieval.repository import EvidenceChunkRow, RetrievalRepository
 from rag_backend.retrieval.rerank_client import (
     RerankInput,
     RerankScore,
@@ -55,8 +57,8 @@ from rag_backend.retrieval.rerank_client import (
 )
 from rag_backend.retrieval.service import (
     RERANK_TOP_K,
-    QueryEmbedder,
     KeywordAnalyzerLike,
+    QueryEmbedder,
     Reranker,
     RetrievalResult,
     apply_rerank_scores,
@@ -65,7 +67,7 @@ from rag_backend.retrieval.service import (
     search_authorized_chunks,
 )
 
-STAGE_RERANK_UNAVAILABLE = "rerank_unavailable"
+STAGE_RERANK_UNAVAILABLE: DegradedStage = "rerank_unavailable"
 
 
 class ProbeError(Exception):
@@ -351,7 +353,7 @@ async def _vector_only(
     requested: Sequence[uuid.UUID],
     identity: ProbeIdentity,
     query: str,
-) -> tuple[list[RankingCandidate], tuple[str, ...]]:
+) -> tuple[list[RankingCandidate], tuple[DegradedStage, ...]]:
     inputs = work.inputs
     repository = inputs.repository_factory(question.scope.role, question)
     rows = await repository.load_kb_scope(
@@ -388,7 +390,7 @@ async def _rrf(
     requested: Sequence[uuid.UUID],
     identity: ProbeIdentity,
     query: str,
-) -> tuple[tuple[FusedCandidate, ...], list[RankingCandidate], tuple[str, ...]]:
+) -> tuple[tuple[FusedCandidate, ...], list[RankingCandidate], tuple[DegradedStage, ...]]:
     inputs = work.inputs
     repository = inputs.repository_factory(question.scope.role, question)
     result: RetrievalResult = await search_authorized_chunks(
@@ -414,7 +416,7 @@ async def _rerank(
     query: str,
     b_raw: tuple[FusedCandidate, ...],
     b_mapped: list[RankingCandidate],
-) -> tuple[list[RankingCandidate], tuple[str, ...]]:
+) -> tuple[list[RankingCandidate], tuple[DegradedStage, ...]]:
     inputs = work.inputs
     if not b_raw:
         return list(b_mapped), ()
@@ -449,7 +451,10 @@ async def _rerank(
         raise ProbeError("重排分数与候选不一致")
 
     score_by_id = {score.candidate_id: score.score for score in scores}
-    rank_by_id = {str(candidate.chunk_id): position for position, candidate in enumerate(ordered, start=1)}
+    rank_by_id = {
+        str(candidate.chunk_id): position
+        for position, candidate in enumerate(ordered, start=1)
+    }
     mapped_by_id: dict[str, RankingCandidate] = {}
     for candidate in b_mapped:
         if candidate.candidate_id in mapped_by_id:
@@ -574,14 +579,14 @@ def _scope_id(question: EvaluationQuestion) -> str:
 
 def _artifact(
     dataset: EvaluationDataset,
-    variant: str,
+    variant: AblationVariant,
     questions: Sequence[AblationQuestion],
     inputs: ProbeInputs,
 ) -> AblationArtifact:
     return AblationArtifact(
         dataset_kind=dataset.dataset_kind,
         dataset_version=dataset.dataset_version,
-        variant=variant,  # type: ignore[arg-type] - 只有三个冻结字面量
+        variant=variant,
         config=dict(inputs.config),
         model_identities=dict(inputs.model_identities),
         created_at=inputs.created_at,

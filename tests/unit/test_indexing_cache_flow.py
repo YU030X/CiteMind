@@ -17,6 +17,7 @@ from rag_backend.ingestion.chunking import Chunk
 from rag_backend.ingestion.identity_preflight import ProfileIdentityDecision
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION, ParsedDocument
 from rag_backend.ingestion.storage import DocumentBlobStore
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -49,6 +50,7 @@ class FakeIdentity:
     parser_version = MARKDOWN_PARSER_VERSION
     pdf_parser_version = "pypdf-6.19.0+pdfplumber-0.11.10-v1"
     docx_parser_version = "python-docx-1.2.0-v1"
+    web_parser_version = WEB_PARSER_VERSION
     token_counter = FakeCounter()
     keyword_analyzer = FakeAnalyzer()
 

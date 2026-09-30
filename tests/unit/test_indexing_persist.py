@@ -24,6 +24,7 @@ from rag_backend.ingestion.parse_subprocess import (
 from rag_backend.ingestion.parsing import ParsedDocument, parse_markdown
 from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy.exc import OperationalError
 
@@ -57,6 +58,7 @@ class FakeIdentity:
     parser_version = "markdown-it-py-4.2.0-v1"
     pdf_parser_version = PDF_PARSER_VERSION
     docx_parser_version = "python-docx-1.2.0-v1"
+    web_parser_version = WEB_PARSER_VERSION
     token_counter = FakeCounter()
     keyword_analyzer = FakeAnalyzer()
 

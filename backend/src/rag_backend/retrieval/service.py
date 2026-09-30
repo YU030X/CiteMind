@@ -19,7 +19,7 @@ import sys
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from starlette.concurrency import run_in_threadpool
 
@@ -102,12 +102,15 @@ class RetrievalResult:
 
     kb_ids: tuple[uuid.UUID, ...]
     candidates: tuple[FusedCandidate, ...]
-    degraded_stages: tuple[str, ...] = ()
+    degraded_stages: tuple[RetrievalDegradedStage, ...] = ()
 
+
+# 当前检索层唯一会记录的降级阶段；与探针产物的 ``DegradedStage`` 字面量相容。
+RetrievalDegradedStage = Literal["rerank_unavailable"]
 
 # 只对融合后的前 10 个候选调用 reranker；其余保持原融合顺序跟在其后。
 RERANK_TOP_K = 10
-STAGE_RERANK_UNAVAILABLE = "rerank_unavailable"
+STAGE_RERANK_UNAVAILABLE: RetrievalDegradedStage = "rerank_unavailable"
 
 
 def resolve_retrieval_scope(
@@ -240,7 +243,7 @@ async def search_authorized_chunks(
         # 候选查询无论成功与否都结束只读事务；后续融合是纯本地计算，不持有连接。
         await _release_read_transaction(repository)
     fused = reciprocal_rank_fusion(vector_candidates, keyword_candidates)
-    degraded_stages: tuple[str, ...] = ()
+    degraded_stages: tuple[RetrievalDegradedStage, ...] = ()
     if reranker is not None and fused:
         fused, degraded_stages = await _rerank_top_candidates(
             repository,
@@ -265,7 +268,7 @@ async def _rerank_top_candidates(
     organization_id: uuid.UUID,
     query: str,
     fused: list[FusedCandidate],
-) -> tuple[list[FusedCandidate], tuple[str, ...]]:
+) -> tuple[list[FusedCandidate], tuple[RetrievalDegradedStage, ...]]:
     """对 RRF top-10 调用重排；失败整体回退，绝不伪造分数或降级为部分重排。
 
     关键顺序：先加载候选正文并 release 数据库连接，再发起模型 HTTP；模型调用期间不持有连接。
@@ -274,7 +277,6 @@ async def _rerank_top_candidates(
     """
 
     top = fused[:RERANK_TOP_K]
-    rest = fused[RERANK_TOP_K:]
     chunk_ids = [candidate.chunk_id for candidate in top]
     try:
         rows = await repository.load_evidence_chunks(

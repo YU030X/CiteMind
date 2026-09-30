@@ -35,6 +35,7 @@ from rag_backend.ingestion.embedding_client import (
 from rag_backend.ingestion.parsing import MARKDOWN_PARSER_VERSION
 from rag_backend.ingestion.pdf_parsing import PDF_PARSER_VERSION
 from rag_backend.ingestion.storage import DocumentBlobStore
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy import Engine, create_engine, text
 from test_core_migration import alembic_config, alembic_revision, business_tables
@@ -95,6 +96,7 @@ class FakeIdentity:
     parser_version: str
     pdf_parser_version: str
     docx_parser_version: str
+    web_parser_version: str
     token_counter: FakeCounter
     keyword_analyzer: FakeAnalyzer
 
@@ -422,6 +424,7 @@ def make_dependencies(
         parser_version=MARKDOWN_PARSER_VERSION,
         pdf_parser_version=PDF_PARSER_VERSION,
         docx_parser_version="python-docx-1.2.0-v1",
+        web_parser_version=WEB_PARSER_VERSION,
         token_counter=FakeCounter(),
         keyword_analyzer=FakeAnalyzer(),
     )
@@ -1234,6 +1237,7 @@ def other_identity() -> FakeIdentity:
         parser_version=MARKDOWN_PARSER_VERSION,
         pdf_parser_version=PDF_PARSER_VERSION,
         docx_parser_version="python-docx-1.2.0-v1",
+        web_parser_version=WEB_PARSER_VERSION,
         token_counter=FakeCounter(),
         keyword_analyzer=FakeAnalyzer(),
     )

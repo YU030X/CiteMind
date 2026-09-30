@@ -17,9 +17,9 @@
 不衡量改写语义是否更优，也不做 token 相似度、编辑距离、阈值、pass/fail 或质量等级。真实语义需要人工
 或另立授权成本的裁判。输出不打印任何 ``question``/``standaloneQuestion`` 原文，只打印题 id。
 
-单行示例（在仓库根目录）::
+查看命令帮助（在仓库根目录运行）::
 
-    uv run python -m rag_backend.evaluation.rewrite_inspect --dataset tests/evaluation/dev-questions.json --rewrite path/to/rewrite.json
+    uv run python -m rag_backend.evaluation.rewrite_inspect --help
 """
 
 from __future__ import annotations

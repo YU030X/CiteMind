@@ -57,7 +57,7 @@ from rag_backend.generation.deepseek_prompt import (
 from rag_backend.generation.query_rewrite import REWRITE_STAGE, REWRITE_SYSTEM_PROMPT
 from rag_backend.retrieval.fusion import FusedCandidate
 from rag_backend.retrieval.repository import ChunkSourceState, EvidenceChunkRow
-from rag_backend.retrieval.service import RetrievalResult
+from rag_backend.retrieval.service import RetrievalDegradedStage, RetrievalResult
 
 USER_ID = uuid.uuid4()
 ORG_ID = uuid.uuid4()
@@ -379,7 +379,7 @@ class FakeRetrieval:
         candidates: Sequence[Sequence[FusedCandidate]],
         *,
         kb_ids: Sequence[uuid.UUID] = (KB_ID,),
-        degraded_stages: Sequence[str] = (),
+        degraded_stages: Sequence[RetrievalDegradedStage] = (),
     ) -> None:
         self.candidates = [list(item) for item in candidates]
         self.kb_ids = tuple(kb_ids)

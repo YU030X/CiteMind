@@ -42,6 +42,7 @@ from rag_backend.ingestion.validation import (
     build_version_dedupe_key,
     build_version_dedupe_key_prefix,
 )
+from rag_backend.ingestion.web_parsing import WEB_PARSER_VERSION
 from rag_backend.models.profile_contract import IndexProfileContract
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import OperationalError
@@ -274,6 +275,7 @@ def identity_for_job(engine: Engine, job_id: uuid.UUID) -> FakeIdentity:
         parser_version=MARKDOWN_PARSER_VERSION,
         pdf_parser_version=PDF_PARSER_VERSION,
         docx_parser_version="python-docx-1.2.0-v1",
+        web_parser_version=WEB_PARSER_VERSION,
         token_counter=FakeCounter(),
         keyword_analyzer=PipelineAnalyzer(),
     )

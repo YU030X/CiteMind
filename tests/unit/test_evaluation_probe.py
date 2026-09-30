@@ -23,6 +23,7 @@ from rag_backend.evaluation.dataset import (
 )
 from rag_backend.evaluation.probe import (
     BudgetCounter,
+    CandidateFacts,
     ProbeError,
     ProbeIdentity,
     ProbeInputs,
@@ -189,7 +190,13 @@ class FakeRepository:
         self.evidence_calls = 0
         self.identity_calls: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-    async def load_kb_scope(self, *, user_id, organization_id, kb_ids):
+    async def load_kb_scope(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        kb_ids: Sequence[uuid.UUID],
+    ) -> list[KbScopeRow]:
         self.events.append("load_scope")
         self.identity_calls.append((user_id, organization_id))
         return self.rows
@@ -197,16 +204,38 @@ class FakeRepository:
     async def release(self) -> None:
         self.events.append("release")
 
-    async def fetch_vector_candidates(self, *, user_id, organization_id, kb_ids, profile_id, query_vector):
+    async def fetch_vector_candidates(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        kb_ids: Sequence[uuid.UUID],
+        profile_id: uuid.UUID,
+        query_vector: Sequence[float],
+    ) -> list[RankedChunk]:
         self.events.append("vector")
         return list(self.vector)
 
-    async def fetch_keyword_candidates(self, *, user_id, organization_id, kb_ids, profile_id, query_terms):
+    async def fetch_keyword_candidates(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        kb_ids: Sequence[uuid.UUID],
+        profile_id: uuid.UUID,
+        query_terms: str,
+    ) -> list[RankedChunk]:
         self.events.append("keyword")
         self.keyword_calls += 1
         return list(self.keyword)
 
-    async def load_evidence_chunks(self, *, user_id, organization_id, chunk_ids):
+    async def load_evidence_chunks(
+        self,
+        *,
+        user_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        chunk_ids: Sequence[uuid.UUID],
+    ) -> list[EvidenceChunkRow]:
         self.events.append("load_texts")
         self.identity_calls.append((user_id, organization_id))
         self.evidence_calls += 1
@@ -229,7 +258,11 @@ class FakeEmbedder:
 
     def embed_query(self, text: str, expected_model_revision: str) -> EmbeddedQuery:
         self.events.append("embed")
-        return EmbeddedQuery(vector=QUERY_VECTOR, token_count=1, model_revision=expected_model_revision)
+        return EmbeddedQuery(
+            vector=QUERY_VECTOR,
+            token_count=1,
+            model_revision=expected_model_revision,
+        )
 
     def close(self) -> None:
         return None
@@ -264,7 +297,10 @@ class FakeReranker:
             raise self.error
         if self.scores is not None:
             return list(self.scores)
-        return [RerankScore(candidate_id=item.candidate_id, score=float(len(item.text))) for item in candidates]
+        return [
+            RerankScore(candidate_id=item.candidate_id, score=float(len(item.text)))
+            for item in candidates
+        ]
 
     def close(self) -> None:
         return None
@@ -273,7 +309,9 @@ class FakeReranker:
 class FakeMapper:
     """从 ``EvidenceChunkRow.source_locator`` 构造真实 locator；来源标识取 LogicalRef。"""
 
-    def map(self, row: EvidenceChunkRow, facts, version_ref: LogicalRef) -> RankingCandidate:
+    def map(
+        self, row: EvidenceChunkRow, facts: CandidateFacts, version_ref: LogicalRef
+    ) -> RankingCandidate:
         return RankingCandidate(
             candidate_id=str(facts.chunk_id),
             kb_id=version_ref.kb_id,
@@ -294,7 +332,9 @@ class FakeMapper:
 class WrongSourceMapper(FakeMapper):
     """故意返回与 LogicalRef 不一致的来源，验证探针静态失败。"""
 
-    def map(self, row: EvidenceChunkRow, facts, version_ref: LogicalRef) -> RankingCandidate:
+    def map(
+        self, row: EvidenceChunkRow, facts: CandidateFacts, version_ref: LogicalRef
+    ) -> RankingCandidate:
         candidate = super().map(row, facts, version_ref)
         return candidate.model_copy(update={"kb_id": "kb-other"})
 
@@ -332,7 +372,9 @@ def build_inputs(
         mapper=mapper or FakeMapper(),
         embedder=FakeEmbedder(events),
         analyzer=FakeAnalyzer(events),
-        role_identities=role_identities if role_identities is not None else {"reader": READER_IDENTITY},
+        role_identities=(
+            role_identities if role_identities is not None else {"reader": READER_IDENTITY}
+        ),
         embedding_budget=BudgetCounter(embedding_limit, label="embedding"),
         rerank_budget=BudgetCounter(rerank_limit, label="rerank"),
         model_identities={"embedding": "rev-1", "rerank": "rev-r"},
@@ -361,10 +403,20 @@ async def test_a_does_not_call_keyword_and_b_uses_fusion() -> None:
     assert repository.keyword_calls == 1  # 只有 B 走关键词路
     a_question = outcome.a.questions[0]
     b_question = outcome.b.questions[0]
-    assert all(item.fusion_rank is None and item.keyword_rank is None for item in a_question.candidates)
-    assert [item.rank for item in a_question.candidates] == [item.vector_rank for item in a_question.candidates]
-    assert all(item.fusion_rank is not None and item.fusion_score is not None for item in b_question.candidates)
-    assert [item.rank for item in b_question.candidates] == [item.fusion_rank for item in b_question.candidates]
+    assert all(
+        item.fusion_rank is None and item.keyword_rank is None
+        for item in a_question.candidates
+    )
+    assert [item.rank for item in a_question.candidates] == [
+        item.vector_rank for item in a_question.candidates
+    ]
+    assert all(
+        item.fusion_rank is not None and item.fusion_score is not None
+        for item in b_question.candidates
+    )
+    assert [item.rank for item in b_question.candidates] == [
+        item.fusion_rank for item in b_question.candidates
+    ]
     assert all(item.rerank_score is None for item in b_question.candidates)
     # locator 只能来自授权行的真实 markdown 定位。
     assert a_question.candidates[0].locator.start_line == MARKDOWN_LOCATOR["start_line"]
@@ -377,7 +429,10 @@ async def test_c_rerank_success_reuses_b_sources_and_orders() -> None:
     vector = [ranked(CHUNK_A, VERSION_A, 0.9), ranked(CHUNK_B, VERSION_B, 0.8)]
     reranker = FakeReranker(
         events,
-        scores=[RerankScore(candidate_id=str(CHUNK_B), score=0.9), RerankScore(candidate_id=str(CHUNK_A), score=0.1)],
+        scores=[
+            RerankScore(candidate_id=str(CHUNK_B), score=0.9),
+            RerankScore(candidate_id=str(CHUNK_A), score=0.1),
+        ],
     )
     inputs, _ = build_inputs(
         make_question(),
@@ -503,10 +558,16 @@ async def test_role_identity_selected_per_question() -> None:
     hr_question = make_question(question_id="q-hr", role="hr")
     events: list[str] = []
     staff_repo = FakeRepository(
-        events=events, rows=[scope_row()], vector=[ranked(CHUNK_A, VERSION_A, 0.9)], evidence=default_evidence()
+        events=events,
+        rows=[scope_row()],
+        vector=[ranked(CHUNK_A, VERSION_A, 0.9)],
+        evidence=default_evidence(),
     )
     hr_repo = FakeRepository(
-        events=events, rows=[scope_row()], vector=[ranked(CHUNK_B, VERSION_B, 0.8)], evidence=default_evidence()
+        events=events,
+        rows=[scope_row()],
+        vector=[ranked(CHUNK_B, VERSION_B, 0.8)],
+        evidence=default_evidence(),
     )
     inputs = ProbeInputs(
         dataset=make_dataset([staff_question, hr_question]),
@@ -528,7 +589,9 @@ async def test_role_identity_selected_per_question() -> None:
 
     staff_expected = (STAFF_IDENTITY.user_id, STAFF_IDENTITY.organization_id)
     hr_expected = (HR_IDENTITY.user_id, HR_IDENTITY.organization_id)
-    assert staff_repo.identity_calls and all(call == staff_expected for call in staff_repo.identity_calls)
+    assert staff_repo.identity_calls and all(
+        call == staff_expected for call in staff_repo.identity_calls
+    )
     assert hr_repo.identity_calls and all(call == hr_expected for call in hr_repo.identity_calls)
 
 
@@ -553,7 +616,11 @@ async def test_embedding_budget_exhaustion_raises_probe_error() -> None:
     events: list[str] = []
     vector = [ranked(CHUNK_A, VERSION_A, 0.9)]
     inputs, _ = build_inputs(
-        make_question(), events=events, vector=vector, evidence=default_evidence(), embedding_limit=1
+        make_question(),
+        events=events,
+        vector=vector,
+        evidence=default_evidence(),
+        embedding_limit=1,
     )
 
     with pytest.raises(ProbeError):
@@ -564,7 +631,10 @@ async def test_embedding_budget_exhaustion_raises_probe_error() -> None:
 async def test_reranker_none_fails_at_start() -> None:
     events: list[str] = []
     inputs, _ = build_inputs(
-        make_question(), events=events, vector=[ranked(CHUNK_A, VERSION_A, 0.9)], evidence=default_evidence()
+        make_question(),
+        events=events,
+        vector=[ranked(CHUNK_A, VERSION_A, 0.9)],
+        evidence=default_evidence(),
     )
 
     with pytest.raises(ProbeError):
@@ -671,11 +741,17 @@ async def test_rerank_top_k_boundary_uses_same_evidence() -> None:
     # 构造 12 个候选，只有前 RERANK_TOP_K 个需要正文；证据映射只在 C 阶段读取 top-K。
     events: list[str] = []
     chunk_ids = [uuid.uuid4() for _ in range(RERANK_TOP_K + 2)]
-    vector = [ranked(chunk_id, VERSION_A, 1.0 - index / 100) for index, chunk_id in enumerate(chunk_ids)]
+    vector = [
+        ranked(chunk_id, VERSION_A, 1.0 - index / 100)
+        for index, chunk_id in enumerate(chunk_ids)
+    ]
     evidence = {chunk_id: evidence_row(chunk_id, VERSION_A, text="x") for chunk_id in chunk_ids}
     inputs, _ = build_inputs(make_question(), events=events, vector=vector, evidence=evidence)
 
     outcome = await run_ablation_probe(inputs)
 
     assert len(outcome.c.questions[0].candidates) == len(chunk_ids)
-    assert all(item.rerank_score is not None for item in outcome.c.questions[0].candidates[:RERANK_TOP_K])
+    assert all(
+        item.rerank_score is not None
+        for item in outcome.c.questions[0].candidates[:RERANK_TOP_K]
+    )

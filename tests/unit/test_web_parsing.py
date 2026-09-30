@@ -132,7 +132,9 @@ def test_chunks_carry_locator_version_4_with_fetch_metadata() -> None:
         assert locator["final_url"] == "https://example.com/final"
         assert locator["fetched_at"] == FETCHED_AT.isoformat()
         assert locator["parser_version"] == WEB_PARSER_VERSION
-        for segment in locator["segments"]:
+        segments = locator["segments"]
+        assert isinstance(segments, list)
+        for segment in segments:
             assert isinstance(segment["block_ordinal"], int)
             assert isinstance(segment["block_char_start"], int)
             assert isinstance(segment["block_char_end"], int)

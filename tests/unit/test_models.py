@@ -205,6 +205,7 @@ EXPECTED_INDEXES = {
         "uq_index_generation_version_id_profile_id_ready",
     },
     "chunk": {"ix_chunk_generation_id", "ix_chunk_model_input_hash", "ix_chunk_fts"},
+    "llm_usage": {"ix_llm_usage_query_run_id"},
 }
 
 
@@ -431,6 +432,7 @@ def test_llm_usage_has_only_the_frozen_columns() -> None:
 
     assert [column.name for column in table.columns] == [
         "id",
+        "query_run_id",
         "provider",
         "model",
         "stage",
@@ -455,6 +457,7 @@ def test_llm_usage_optional_columns_are_nullable() -> None:
     table = metadata.tables["llm_usage"]
 
     for name in (
+        "query_run_id",
         "error_code",
         "prompt_tokens",
         "completion_tokens",

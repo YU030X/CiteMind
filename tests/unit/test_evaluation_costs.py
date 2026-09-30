@@ -38,7 +38,8 @@ PRICE_PATH = (
 
 
 def _snapshot_payload() -> dict[str, object]:
-    return json.loads(PRICE_PATH.read_text(encoding="utf-8"))
+    payload: dict[str, object] = json.loads(PRICE_PATH.read_text(encoding="utf-8"))
+    return payload
 
 
 def _snapshot() -> PriceSnapshot:

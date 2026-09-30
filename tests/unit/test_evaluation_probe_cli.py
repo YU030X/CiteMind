@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -677,7 +678,7 @@ def test_partial_publish_failure_removes_formal_files(
     dataset = _write_dataset(tmp_path / "dataset.json")
     descriptor = _write_descriptor(tmp_path / "descriptor.json")
     asset_map = _write_asset_map(tmp_path / "assets.json")
-    real_replace = probe_cli_module.os.replace
+    real_replace = os.replace
     calls = 0
 
     def fail_second_replace(source: Path, target: Path) -> None:
@@ -687,7 +688,7 @@ def test_partial_publish_failure_removes_formal_files(
             raise OSError("synthetic publish failure")
         real_replace(source, target)
 
-    monkeypatch.setattr(probe_cli_module.os, "replace", fail_second_replace)
+    monkeypatch.setattr(os, "replace", fail_second_replace)
     rc = probe_main(
         _real_args(
             tmp_path,
