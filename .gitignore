@@ -72,3 +72,7 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 .pi/
+
+# 评估产物：只保留已审核的脱敏归档
+/tests/evaluation/results/*
+!/tests/evaluation/results/2026-09-28/
