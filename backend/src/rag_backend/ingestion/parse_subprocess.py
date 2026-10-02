@@ -1,4 +1,4 @@
-"""在独立子进程中执行 Markdown 与文本 PDF 解析，给解析阶段一个真实、有界、可终止的硬时限。
+"""在独立子进程中执行 Markdown、文本 PDF、DOCX 与网页解析，给解析阶段一个真实有界、可终止的硬时限。
 
 设计与边界（与 [文档入库](../../../docs/ingestion.md) 一致）：
 
@@ -73,7 +73,8 @@ MAX_PARSE_RESULT_BYTES: Final = 4 * MAX_DOCUMENT_BYTES
 # Linux 上测量 pdfplumber/python-docx/bs4 的虚拟内存基线与合法输入峰值余量；它只是一个有限上界，
 # 不保证覆盖所有合法最大输入，也不是 RSS、父侧缓冲或 cgroup 级隔离。Phase 4 overlay 给 worker
 # 容器的 640 MiB 是整容器内存限额（不等同进程 RSS，包含父子进程及其它 cgroup 记账内存），可能先于
-# 本上限由 cgroup OOM 杀掉 worker，而不是让 child 受控失败，二者不可互相替代。非 Linux 本实现不应用。
+# 本上限由 cgroup OOM 杀掉 worker，而不是让 child 受控失败，二者不可互相替代。
+# 非 Linux 本实现不应用。
 PARSE_MEMORY_LIMIT_BYTES: Final = 1024 * 1024 * 1024
 
 EXIT_OK: Final = 0

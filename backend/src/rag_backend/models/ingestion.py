@@ -5,9 +5,10 @@
 的不可变请求标题快照，供幂等判定与原始请求比对（``document.title`` 会随新版本切换而改变，
 不能再作为请求身份）。既有行的 ``request_title`` 保持 NULL，应用对 NULL 行回退到既有
 ``document.title`` 比较。租约由 owner/token/until 三列共同表达，三者必须同时为空
-或同时非空。新 Markdown 上传已写入 ``profile_id``，既有任务仍可为 NULL；
-worker 核对任务 profile 与目标 generation/profile 一致并限制更改的处理路径尚未接线，
-数据库也不阻止 UPDATE。
+或同时非空。新 Markdown 上传已写入 ``profile_id``，既有任务仍可为 NULL；默认关闭的真实入库管线经
+``identity_preflight`` 核对 job 的 profile、来源与 parser 身份，发布事务再核对 job 绑定的
+``generation_id``/``profile_id``，但这不是完整的 profile 一致校验，数据库本身也不阻止
+UPDATE。
 """
 
 import uuid

@@ -1,8 +1,9 @@
 """chunk 与 chunk_embedding 模型（第二切片）。
 
 ``chunk`` 是不可变的检索单元，来源字段（``organization_id``、``kb_id``、
-``document_id``、``version_id``、``generation_id``）在写入时固定；本切片尚无 worker
-写路径，跨表冗余一致性由未来的写入事务核对。``chunk_embedding`` 每个 chunk 一条
+``document_id``、``version_id``、``generation_id``）在写入时固定；默认关闭的真实入库
+管线在暂存事务中写入 chunk 与向量，发布前核对两者数量一致并校验 512 维，但数据库本身
+不强制这些来源字段与 chunk 所有权一致。``chunk_embedding`` 每个 chunk 一条
 固定 512 维向量。两者都视为不可变：worker 只有 SELECT+INSERT，没有 UPDATE/DELETE。
 """
 

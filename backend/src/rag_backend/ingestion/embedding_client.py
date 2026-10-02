@@ -1,6 +1,8 @@
-"""worker 侧受限的内部 embedding 客户端（本切片不接 Celery/DB）。
+"""worker 侧受限的内部 embedding 客户端。
 
-客户端只访问内部 inference 或测试回环地址，使用同步 ``httpx.Client`` 且
+客户端自身不接触 Celery、数据库或任务状态；它由默认关闭的真实入库管线
+``rag_backend.ingestion.indexing_worker`` 调用，只访问内部 inference 或测试回环地址，使用
+同步 ``httpx.Client`` 且
 ``trust_env=False``、``retries=0``：绝不继承宿主 ``HTTP(S)_PROXY`` 或 CA 环境，Bearer
 不会随环境代理泄漏。请求在本地完成预算校验后才发出；响应在返回给调用方前做严格契约核对，
 且用有界流式读取，成功体与错误体都不允许无上限增长。任何失败都不写数据库、不产生副作用，

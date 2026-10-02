@@ -1,24 +1,20 @@
-"""Phase 1 开发评估集的最小离线工具与可选真实 producer。
+"""评估工具：题集校验、确定性指标、纯离线分析与默认 dry-run 的真实 producer。
 
-本包提供三件事，不建评估平台、不建新数据库、不用 LLM 裁判：
+本包提供以下能力，不建评估平台、不建新数据库、不用 LLM 裁判：
 
 - ``dataset``：开发题集与自制语料清单的严格 schema、语料存在性与 gold 引用匹配校验、
-  无权限/删除场景的题集自泄漏校验。
+  无权限/删除场景的题集自泄漏校验，以及开发/留出跨集校验。
 - ``metrics``：基于**已有真实结果文件**的确定性指标计算；没有结果文件就不产生任何数字。
-- ``runner``：默认 dry-run 的最小结果 producer；只有显式 opt-in 并给出请求硬上限时才走真实 API
-  与只读数据库，把 40 题结果写到结果文件供 ``metrics`` 消费。
+- 纯离线模块：``ranking_metrics``（Recall@10/nDCG@10）、``calibration``（拒答阈值扫描）、
+  ``ablation``（A/B/C 产物 schema 与三元组校验）、``analysis``（只读题集与产物的离线入口）、
+  ``costs``（固定价目快照与 ``Decimal`` 复算）与 ``rewrite_inspect``；不联网、不调用模型，
+  也不产生真实指标数值。
+- ``runner``/``probe``/``probe_adapters``/``probe_cli``：默认 dry-run 的结果与探针 producer；
+  只有显式 opt-in 并给出请求硬上限时才走真实 API、只读数据库与内部 inference。dry-run 只校验
+  覆盖与预算，真实数据库/inference 探针尚未运行，不代表质量或性能结论。
 
 开发集（``datasetKind="dev"``）不是留出集或测试集，其结构可离线验证，但真实质量指标必须
 在留出集上按固定分母、真实模型与真实权限环境测量，不能把开发集结果当最终结论。
-
-Phase 3 第 2 片新增纯离线模块：``ranking_metrics``（固定 Recall@10/nDCG@10）、``calibration``
-（拒答阈值扫描）、``ablation``（A/B/C 产物 schema 与三元组校验）与 ``analysis``
-（``python -m rag_backend.evaluation.analysis`` 只读题集与三个产物的离线入口）。它们不联网、
-不调用模型，也不产生真实指标数值。
-
-Phase 3 第 3 片新增只读探针核心 ``probe``、真实适配器 ``probe_adapters`` 与可执行入口
-``probe_cli``（``python -m rag_backend.evaluation.probe_cli``）。入口默认 dry-run，只校验覆盖与
-预算；真实运行必须显式开启并给出硬上限，且本轮尚未对真实数据库/inference 运行。
 """
 
 from rag_backend.evaluation.dataset import (

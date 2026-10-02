@@ -2,10 +2,12 @@
 
 本模块是 worker 专用前置能力：``rag_backend.ingestion`` 包在导入期不引用它，API 镜像
 import ``rag_backend.ingestion`` 因此不会加载 ``tokenizers``；只有上游显式 import 本模块时
-才需要 worker 组依赖。当前安全接收壳允许没有 ``/models`` 的宿主以 solo 方式消费消息；若本片
+才需要 worker 组依赖。默认关闭的安全接收壳允许没有 ``/models`` 的宿主以 solo 方式消费消息；若
 在 worker 启动信令里无条件挂载资产校验，该宿主会启动即失败，且 Linux prefork 下启动失败会
-反复 fork/崩溃。因此这里**只**提供显式工厂 :func:`initialize_worker_index_identity`，不注册
-signal、不写 marker、不读 DB、不 ACK 消息；是否接线由后续切片单独决定并验收。
+反复 fork/崩溃。因此这里**只**提供显式工厂 :func:`initialize_worker_index_identity`：默认接收
+壳不调用它，只有显式开启的真实入库管线在领取任务后经
+``indexing_worker.load_ingest_identity`` 按需调用；它本身不注册 signal、不写 marker、不读 DB、
+不 ACK 消息。
 
 成功时工厂返回 :class:`WorkerIndexIdentity`：只读 :class:`IndexProfileContract`、真实
 ``parser_version``、已校验的 :class:`LocalTokenizerCounter` 与
