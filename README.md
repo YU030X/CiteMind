@@ -3,7 +3,7 @@
 CiteMind 是一个面向小团队的企业知识库应用：用自然语言提问，回答带可点击的来源引用，并能回到对应原文与版本。它同时把知识库权限、文档更新与删除贯通到检索和后续访问中——资料不足时明确拒答，被过滤文档的存在性不被泄露。
 
 > [!IMPORTANT]
-> Phase 1 的六项退出条件已达成（证据与未验边界见[评估计划](docs/evaluation.md)与[开发约定](docs/development.md)），但仓库仍处于开发阶段、并非开箱可用的成品；Phase 2 及后续仍为计划。按默认配置启动六服务后，**真实入库与问答生成都是关闭的**：上传返回 `202` 只表示文件与任务已持久化，文档尚不可检索；问答端点返回静态 `503` 且不联网。要跑通完整问答，需要显式开启入库与生成开关并提供云模型密钥，见[快速开始](#快速开始)与[个人演示流程](docs/personal-demo.md)。
+> Phase 1 的六项退出条件已达成（证据与未验边界见[评估计划](docs/evaluation.md)与[开发约定](docs/development.md)），但仓库仍处于开发阶段、并非开箱可用的成品；Phase 2/3 已有实现，Phase 2～4 仍待各自真实验收。按默认配置启动六服务后，**真实入库与问答生成都是关闭的**：上传返回 `202` 只表示文件与任务已持久化，文档尚不可检索；问答端点返回静态 `503` 且不联网。要跑通完整问答，需要显式开启入库与生成开关并提供云模型密钥，见[快速开始](#快速开始)与[个人演示流程](docs/personal-demo.md)。
 
 ## 核心能力
 
@@ -101,6 +101,7 @@ CiteMind 是一个面向小团队的企业知识库应用：用自然语言提�
 - **工程底座**：锁定依赖、FastAPI 健康检查与 OpenAPI、Vue/Vite 前端骨架、SQLAlchemy 异步会话、Alembic 的 pgvector 扩展与业务表迁移；真实 PostgreSQL 17 + pgvector 迁移在本机实测通过。
 - **六服务本地切片**：Compose 编排 postgres / redis / api / worker / inference / frontend-gateway，真实启动后六容器全部 healthy；网关同源代理、SPA fallback、安全头与 API 故障时的 `502` 均已核对。
 - **身份与 KB 授权**：登录 / 注销 / `GET /me`、Argon2 密码、Redis 跨进程登录限流、运维开户 CLI，以及 KB 成员读取与全量替换；已在真实 PostgreSQL + Redis 与经网关联的端到端流程上验收。
+- **文档级 ACL 读取收紧**：`document.acl_mode` 与 `document_acl` 已落地（迁移 `20260928_0012`），`INHERIT` 沿用 KB 成员读权限，`RESTRICTED` 只允许名单内且仍为同组织未撤销 KB 成员的用户读取；读取路径与两条候选 SQL、证据正文、来源状态、原文下载复用同一判定，已在隔离 PostgreSQL 17 上聚焦验收，尚未在真实六服务栈使用。
 - **推理**：`BAAI/bge-small-zh-v1.5` 固定 revision 烘入镜像、运行期离线加载；`kind=document` 与 `kind=query`（具名前缀契约 `bge-zh-query-v1`）编码已在真实权重与真实 HTTP 上验收。
 - **检索与问答**：授权混合检索首片（`POST /api/v1/retrieval/search`）、证据问答主流程（会话、历史、追问改写、引用、拒答）以及文档新版本与逻辑删除；已在隔离 PostgreSQL / Redis 上验收，尚未部署到当前开发栈。
 - **真实入库管线**（`rag_backend.ingestion.indexing_worker`）：实现了解析 / 切分 / 编码 / 索引发布与 READY 切换，但**默认关闭**；已在隔离 PostgreSQL 17 + Redis 与真离线模型整链上验收首次入库 READY。
@@ -108,11 +109,11 @@ CiteMind 是一个面向小团队的企业知识库应用：用自然语言提�
 - **2026-09-28 隔离六服务真实 Demo**：用真浏览器经真网关、真实本地 BGE、真实 worker/Celery 与真实 DeepSeek provider 走通上传 → 引用 → 追问 → 版本更新 → 删除闭环。该结果只覆盖这条演示路线，不代表生产部署或 Phase 1 整阶段退出。
 - **开发评估集**：40 道自制开发题、离线结构校验与最小 runner 已实现，并已在 2026-09-28 对真实隔离链路运行一次（恰好 40 题结果与五项确定性指标，精简归档见[评估计划](docs/evaluation.md)）；开发集不是留出集，`citationSourceValidity` 不等于句子级引用支持率。
 
-### 尚未实现
+### 未实现与待验收
 
-- 重排（rerank）及其降级标记（既有 `degraded_stages` 只覆盖 `unsupported_text` / `source_retry`）、相似度阈值标定、多轮检索之外的重排策略。
-- 完整文档级 ACL（当前为 KB 成员授权）、静态网页等格式、OCR、文件 GC 与 KB 配额。
-- 生产级 CI、GHCR 发布与备份恢复演练；Phase 2～4 的整体范围仍为计划，阶段划分见[技术实施顺序](docs/roadmap.md)。
+- 相似度阈值标定、多轮检索之外的重排策略；可降级重排本身已实现（见[检索](docs/retrieval.md)）但默认关闭，且未做真实模型验收。
+- OCR、文件 GC 与 KB 配额；DOCX 与 pdfplumber PDF 抽取已实现最小闭环，受限静态网页已实现，但其真实抓取与真实 PostgreSQL 端到端仍未验收（见[文档入库](docs/ingestion.md)）。
+- CI 静态检查 workflow 已实现但尚未在 GitHub 首次真实运行，GHCR 发布未实现，备份恢复工具已实现但真实演练未验收；Phase 2～4 仍待各自真实验收，阶段划分见[技术实施顺序](docs/roadmap.md)。
 
 ## 限制
 
@@ -121,7 +122,7 @@ CiteMind 是一个面向小团队的企业知识库应用：用自然语言提�
 - 单组织隔离，不具备多租户 SaaS 能力；跨租户安全尚未验收。
 - 前端不提供流式输出、PDF 阅读器、成员管理界面和任务后台；文档与会话列表无分页。
 - 删除会话只做软删、不可恢复；删除文档为逻辑删除，不物理回收共享 blob。
-- 拒答与降级状态未在界面单独标注。
+- 拒答与降级提示只在当轮回答后展示；历史消息接口不返回这两个字段，刷新或重新打开会话后不恢复。
 - 推理在 CPU 上运行，无 GPU；资源预算与性能目标尚未实测。
 - 使用云模型处理真实资料前需确认片段允许外发；仓库内样本须为自制或许可明确的无敏感内容。
 
@@ -130,6 +131,7 @@ CiteMind 是一个面向小团队的企业知识库应用：用自然语言提�
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 系统组成、进程职责、主要数据流与边界 |
+| [docs/technology-decisions.md](docs/technology-decisions.md) | 计划选型、取舍与替换条件 |
 | [docs/roadmap.md](docs/roadmap.md) | 分阶段实现范围与退出条件 |
 | [docs/development.md](docs/development.md) | 开发环境、目录、命令与已实测结果 |
 | [docs/deployment.md](docs/deployment.md) | 服务、资源配置、迁移依赖、观测与恢复 |
@@ -140,6 +142,8 @@ CiteMind 是一个面向小团队的企业知识库应用：用自然语言提�
 | [docs/security.md](docs/security.md) | 身份、授权、文件与网页输入、模型外发 |
 | [docs/evaluation.md](docs/evaluation.md) | 题集、指标、故障、性能与端到端验收 |
 | [docs/personal-demo.md](docs/personal-demo.md) | 个人工作台的手工演示流程 |
+| [docs/phase4-acceptance.md](docs/phase4-acceptance.md) | Phase 4 手动验收的命令与判据（阶段待验收） |
+| [.agents/notes/README.md](.agents/notes/README.md) | 已实施与计划决策记录（Agent Notes） |
 | [AGENTS.md](AGENTS.md) | 仓库级开发规则 |
 
 演示与测试语料位于 [`tests/evaluation/corpus/`](tests/evaluation/corpus/)，使用说明与写作规则见 [docs/AGENTS.md](docs/AGENTS.md)。
